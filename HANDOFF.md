@@ -5,20 +5,22 @@
 
 ## 一、虚拟机 / 基础设施环境（保持不变）
 
-- 宿主：Linux 主机，IP **192.168.150.105**（Docker 宿主，本机可 ping 通）
+> 凭据一律走环境变量（与 `application-dev.yml` 同口径），本文档不记录任何明文密码。
+
+- 宿主：Linux 主机（Docker 宿主，IP 见环境变量 `APP_DB_URL` / `REDIS_HOST`，不在此明文记录）
 - **MySQL 8**：Docker 容器 `da-mysql`，端口 3306，库 `data_agent`
-  - `root` / `root123`
-  - `app` / `app123`（业务账号，可读写）
-  - `bi_readonly` / `readonly123`（只读账号）
+  - `root` / `${MYSQL_ROOT_PASSWORD}`（管理员账号）
+  - `app` / `${APP_DB_PASSWORD}`（业务账号，可读写）
+  - `bi_readonly` / `${BI_READONLY_PASSWORD}`（只读账号）
 - **Redis 7**：Docker 容器 `da-redis`，端口 6379（普通版，无向量检索模块）
-- 容器启动/维护（在 192.168.150.105 上执行）：
+- 容器启动/维护（在宿主机上执行）：
   ```bash
   docker start da-mysql da-redis
   docker update --restart unless-stopped da-mysql da-redis   # 建议已配置，VM 重启自动拉起
-  docker exec -it da-mysql mysql -uroot -proot123            # 进 MySQL 命令行
+  docker exec -it da-mysql mysql -uroot -p                   # 进 MySQL 命令行（-p 交互输入密码，不回显）
   ```
-- 连接串模板：
-  `jdbc:mysql://192.168.150.105:3306/data_agent?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8`
+- 连接串模板（实际值在环境变量 `APP_DB_URL`，形如）：
+  `jdbc:mysql://<内网IP>:3306/data_agent?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8`
 
 ## 二、开发 / 运行环境（保持不变）
 
@@ -77,9 +79,9 @@
 ## 六、设置与测试验证清单
 
 ### 1. 环境准备
-1. 启动虚拟机（192.168.150.105）上的 `da-mysql`、`da-redis` 容器（重启虚拟机后需重新启动）。
+1. 启动虚拟机（宿主机，IP 见环境变量）上的 `da-mysql`、`da-redis` 容器（重启虚拟机后需重新启动）。
 2. 在 MySQL 中执行 `sql/schema_travel.sql` 建表，再执行 `sql/seed_travel.sql` 导入种子数据（如重新生成：`node sql/gen_seed.mjs > sql/seed_travel.sql`）。
-3. 确认环境变量 `QWEN_API_KEY` 已设置（不要写进代码/提交仓库；如曾泄露请到阿里云控制台吊销重建）。
+3. 确认环境变量已设置：`QWEN_API_KEY`、`APP_DB_URL`、`APP_DB_USERNAME`、`APP_DB_PASSWORD`、`REDIS_HOST`、`JWT_SECRET`（不要写进代码/提交仓库；如曾泄露请到对应控制台吊销重建）。
 4. IDEA 中打开项目，等 Maven 下载依赖后构建（命令行 `mvnw` 因本地仓库缺少依赖不可用，必须在 IDEA 里构建）。
 
 ### 2. 启动
