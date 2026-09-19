@@ -1,0 +1,81 @@
+spring:
+  datasource:
+    app:
+      jdbc-url: ${APP_DB_URL}
+      username: ${APP_DB_USERNAME}
+      password: ${APP_DB_PASSWORD}
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT:6379}
+
+llm:
+  provider: qwen
+  base-url: ${QWEN_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+  api-key: ${QWEN_API_KEY}
+  # 强制 JSON 输出（DashScope 兼容模式支持 json_object）；如接口报不支持，置空回滚
+  response-format: ${QWEN_RESPONSE_FORMAT:json_object}
+  models:
+    default: ${QWEN_MODEL_DEFAULT:qwen3.8-flash}
+    # 行程规划用高质量模型（AgentConfig 注释同口径）；qwen3.7-plus 免费额度耗尽后不再默认，可用环境变量覆盖
+    sql: ${QWEN_MODEL_SQL:qwen3.8-max}
+  # 阶段2 联网检索（enable_search）：需支持联网搜索的模型；联网搜索可能消耗付费额度
+  search-model: ${QWEN_SEARCH_MODEL:qwen3.8-max}
+  search-timeout-ms: ${QWEN_SEARCH_TIMEOUT_MS:90000}
+  # 模型计费单价（元/百万 token，输入/输出），用于用量审计台的费用估算
+  pricing:
+    qwen3.7-flash: { in: 0.225, out: 0.974 }
+    qwen3.8-flash: { in: 1.094, out: 3.427 }
+    qwen3.8-max: { in: 12, out: 36 }
+    deepseek-v4-flash-0731: { in: 1.5, out: 4.5 }
+    glm-5.2: { in: 8, out: 28 }
+    kimi-k3: { in: 20, out: 100 }
+
+# 美食候选数量（1 天 3 餐 = 1 早餐 + 2 正餐）：目标 = max(min-total, (早餐+正餐)×天数)，上限为候选池大小
+candidate:
+  food:
+    breakfast-per-day: 3
+    main-meal-per-day: 6
+    min-total: 15
+
+jwt:
+  secret: ${JWT_SECRET}
+  expiration: ${JWT_EXPIRATION:3600000}
+
+# 日志级别：控制台输出（Spring Boot 默认即输出到 Console，这里显式声明便于按需调到 DEBUG）
+logging:
+  level:
+    com.ghy.mutiagent: INFO
+    org.springframework.security: INFO
+    org.springframework.web: INFO
+
+# MyBatis-Plus SQL 日志：把每一条执行的 SQL 打到控制台（监控「运行内容」用，嫌吵可删掉）
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# S06-B：会话权威存储（db=MySQL 快照权威、Redis 仅缓存；redis=保持 S06-A 语义）与操作租约；
+# read-only 为回退演练开关（维护窗口关闭写入口，读取与归属校验保持）
+travel:
+  session:
+    authority: ${TRAVEL_SESSION_AUTHORITY:db}
+    # 断点恢复窗口：未结束会话距最近活动超过该时长即视为过期（滑动续期；已结束会话不受此影响）
+    resume-ttl-ms: ${TRAVEL_SESSION_RESUME_TTL_MS:1800000}
+  operation:
+    lease-ms: 60000
+  read-only: ${TRAVEL_READ_ONLY:false}
+# Observability 优化与运行记录中心（默认全关，安全发布；缺 obs_ 表不影响启动）
+observability:
+  enabled: ${OBS_ENABLED:false}
+  capture:
+    enabled: ${OBS_CAPTURE_ENABLED:false}
+    mode: BUFFERED
+  buffer:
+    capacity: 10000
+  batch:
+    size: 200
+    interval-ms: 1000
+  payload:
+    max-bytes: 262144
+  retention:
+    days: 30

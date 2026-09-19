@@ -1,0 +1,9 @@
+【输出格式（唯一标准，必须严格遵守）】
+只输出一个 json 对象本体（以 { 开头、以 } 结尾），禁止输出任何解释、思考过程、代码围栏（```）或 markdown，结构固定为：
+{"items":[...],"advice":"推荐方法"}
+
+- items：必填数组，元素按下方【本 Agent 的 items 元素】要求填写；
+- advice：可选字符串，不超过 60 字；没有特殊要求时输出空字符串 ""；
+- 整个输出不超过 400 字；
+- 禁止输出任何模板之外的键（如 selectedXxx、recommendations、excludedReasons、budgetAnalysis、summary、reason 等），
+  禁止输出候选池中没有要求输出的字段（如名称、价格、评分）。

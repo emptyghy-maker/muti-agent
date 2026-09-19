@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "obs-event-v1",
+  "eventId": "op-demo|OPERATION_FINISHED|seq-42",
+  "runId": "op-demo",
+  "operationId": "op-demo",
+  "spanId": "op-demo",
+  "parentSpanId": null,
+  "nodeExecutionId": "op-demo-x1",
+  "eventType": "OPERATION_FINISHED",
+  "occurredAt": 1789300000000,
+  "receivedAt": 1789300000100,
+  "producerId": "trace-service",
+  "sequence": 42,
+  "ownerScope": 1,
+  "digest": "0f3a1b9c2d4e5f60",
+  "payloadRef": null
+}

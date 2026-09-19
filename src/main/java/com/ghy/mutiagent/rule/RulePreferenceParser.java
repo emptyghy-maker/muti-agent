@@ -1,0 +1,368 @@
+package com.ghy.mutiagent.rule;
+
+import com.ghy.mutiagent.model.BudgetSpec;
+import com.ghy.mutiagent.model.ConstraintEntry;
+import com.ghy.mutiagent.model.TravelPreference;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * 偏好规则解析器：先用确定性规则抽取用户回复，命中不了再回退 PreferenceAgent（LLM）。
+ *
+ * S02 扩展：
+ * - parseResult 除字段更新外，还输出快照约束（老人背景/不能爬山/夜景/减少步行等）与明确撤销条目；
+ * - 未消费的残余原文进入 unresolvedText（不能当作没有需求）；
+ * - 预算解析顺序：人均/总额 → 区间 → 上限 → 单值，避免「预算\d+」抢先吞掉区间；
+ * - 意图区分：口语翻页（PAGING）与附带条件（CONDITION），混合意图二者并存。
+ */
+@Component
+public class RulePreferenceParser {
+
+    private static final List<String> UNSURE_WORDS = List.of(
+            "随便", "都行", "随意", "还没想好", "没想好", "不知道",
+            "你定", "你决定", "无所谓", "没有", "都听你的", "按你推荐");
+
+    /** 口语「翻页」意图词（与编排器 NO_MORE_WORDS 同步） */
+    private static final List<String> PAGING_WORDS = List.of(
+            "没有想要的", "都不喜欢", "都不满意", "还有别的", "换一批", "再看看", "都不行", "换一换");
+
+    /** 各字段选项按钮 → 结构化值（必须与编排器 QUESTION_TEMPLATES 的选项保持同步） */
+    private static final Map<String, Map<String, String>> OPTION_ANSWERS = Map.of(
+            "days", Map.of("1天", "1", "2天", "2", "3天", "3", "4天", "4", "5天及以上", "5"),
+            "totalBudget", Map.of("1500以内", "1500", "1500-3000", "2250",
+                    "3000-5000", "4000", "5000以上", "6000"),
+            "peopleCount", Map.of("1人", "1", "2人", "2", "3-4人", "4", "5人以上", "5"),
+            "attractionType", Map.of("打卡拍照", "打卡拍照", "娱乐项目", "娱乐项目",
+                    "两者都要", "混合", "按你推荐", "UNSURE"),
+            "foodTaste", Map.of("清淡", "清淡", "辣", "辣", "本地特色菜", "本地特色菜", "都行", "UNSURE"),
+            "energyLevel", Map.of("体力好", "体力好", "一般", "一般", "偏弱", "偏弱"),
+            "hotelStyle", Map.of("性价比优先", "性价比优先", "体验优先", "体验优先",
+                    "位置/交通优先", "位置优先", "没想好", "UNSURE"),
+            "specialRequests", Map.of("没有", "UNSURE")
+    );
+
+    /** 解析用户回复，返回 field → 值 的更新；值 UNSURE 表示用户没想好（兼容旧调用方） */
+    public Map<String, String> parse(String message, String currentField) {
+        return parseResult(message, currentField, null).getUpdates();
+    }
+
+    /**
+     * 解析并输出完整结果。
+     * @param context 当前偏好（人均预算换算全团口径时使用已确认人数）
+     */
+    public RuleParseResult parseResult(String message, String currentField, TravelPreference context) {
+        RuleParseResult r = new RuleParseResult();
+        if (message == null || message.isBlank()) {
+            return r;
+        }
+        String m = message.trim();
+        List<int[]> spans = new ArrayList<>();
+
+        // 意图：口语翻页
+        for (String w : PAGING_WORDS) {
+            int i = m.indexOf(w);
+            if (i >= 0) {
+                r.getIntents().add("PAGING");
+                spans.add(new int[]{i, i + w.length()});
+                break;
+            }
+        }
+
+        // 1. 精确匹配当前问题的选项按钮
+        if (currentField != null && OPTION_ANSWERS.containsKey(currentField)) {
+            String v = OPTION_ANSWERS.get(currentField).get(m);
+            if (v != null) {
+                r.getUpdates().put(currentField, v);
+                r.getIntents().add("CONDITION");
+                return r;
+            }
+        }
+
+        // 2. 短句婉拒：视为对当前问题的 UNSURE（只影响当前字段，不抹除其他约束）
+        if (m.length() <= 8 && UNSURE_WORDS.stream().anyMatch(m::contains)) {
+            if (currentField != null && !currentField.isBlank()) {
+                r.getUpdates().put(currentField, "UNSURE");
+                r.getIntents().add("CONDITION");
+            }
+            return r;
+        }
+
+        // 3. 否定纠正：「不是3天，是5天」→ 5
+        Matcher neg = Pattern.compile("不是\\s*(\\d+)\\s*天[，,、\\s]*是?\\s*(\\d+)\\s*天").matcher(m);
+        if (neg.find()) {
+            r.getUpdates().put("days", neg.group(2));
+            addSpan(spans, neg);
+        }
+
+        // 4. 关键词抽取（可一次命中多个字段）
+        Matcher dm = Pattern.compile("(?:玩|去|待|计划|玩个|待个)?(\\d+)\\s*天").matcher(m);
+        if (dm.find()) {
+            r.getUpdates().putIfAbsent("days", dm.group(1));
+            addSpan(spans, dm);
+        }
+        Integer messagePeople = null;
+        Matcher pm = Pattern.compile("(\\d+)\\s*(?:个)?人").matcher(m);
+        if (pm.find()) {
+            messagePeople = Integer.valueOf(pm.group(1));
+            r.getUpdates().put("peopleCount", pm.group(1));
+            addSpan(spans, pm);
+        }
+
+        // 5. 预算解析（顺序：人均 → 区间 → 上限 → 单值；区间不被「预算\d+」抢先吞掉）
+        extractBudget(m, context, messagePeople, r, spans);
+
+        // 6. 口味/景点类型/体力/酒店偏好（沿用旧关键词规则）
+        if (m.contains("打卡") || m.contains("拍照")) {
+            r.getUpdates().put("attractionType", "打卡拍照");
+        } else if (m.contains("娱乐") || m.contains("游乐") || m.contains("乐园") || m.contains("刺激")) {
+            r.getUpdates().put("attractionType", "娱乐项目");
+        } else if (m.contains("都要") || m.contains("混合") || m.contains("都有")) {
+            r.getUpdates().put("attractionType", "混合");
+        }
+        if (m.contains("清淡") || m.contains("不辣")) {
+            r.getUpdates().put("foodTaste", "清淡");
+        } else if (m.contains("辣")) {
+            r.getUpdates().put("foodTaste", "辣");
+        } else if (m.contains("本地") || m.contains("地道") || m.contains("特色")) {
+            r.getUpdates().put("foodTaste", "本地特色菜");
+        }
+        if (m.contains("体力好") || m.contains("身体好") || m.contains("精力好")) {
+            r.getUpdates().put("energyLevel", "体力好");
+        } else if (m.contains("偏弱") || m.contains("体力差") || m.contains("走不动")) {
+            r.getUpdates().put("energyLevel", "偏弱");
+        } else if (m.contains("体力一般") || m.contains("一般般")) {
+            r.getUpdates().put("energyLevel", "一般");
+        }
+        if (m.contains("性价比")) {
+            r.getUpdates().put("hotelStyle", "性价比优先");
+        } else if (m.contains("体验")) {
+            r.getUpdates().put("hotelStyle", "体验优先");
+        } else if (m.contains("位置") || m.contains("交通")) {
+            r.getUpdates().put("hotelStyle", "位置优先");
+        }
+
+        // 7. 快照约束抽取（含明确撤销）；约束原文同时并入 specialRequests 兼容字段
+        extractConstraints(m, r, spans);
+
+        // 8. 餐次结构（顿数/早饭午饭晚饭/小吃取舍；明确表达才生效，未命中照旧进残余）
+        extractMealPlan(m, r, spans);
+
+        // 9. 未消费残余：只去掉标点空白；有语义残余就保留，不丢弃
+        String left = remainder(m, spans);
+        if (!left.isBlank()) {
+            r.setUnresolvedText(left);
+        }
+        if (!r.getUpdates().isEmpty() || !r.getConstraints().isEmpty()
+                || r.getBudget() != null || !r.getIntents().contains("CONDITION") && r.getUnresolvedText() != null) {
+            r.getIntents().add("CONDITION");
+        }
+        return r;
+    }
+
+    // ==================== 约束抽取 ====================
+
+    private void extractConstraints(String m, RuleParseResult r, List<int[]> spans) {
+        List<String> phrases = new ArrayList<>();
+
+        // 明确撤销：只撤销目标 key
+        Matcher revElder = Pattern.compile("(不用|不要|不需要|不考虑)\\s*照顾?\\s*老人").matcher(m);
+        if (revElder.find()) {
+            r.getConstraints().add(constraint("elderBackground", "TRUE", "SOFT", "REVOKED", revElder.group()));
+            addSpan(spans, revElder);
+        }
+        // 老人背景（排除「不用照顾老人」等撤销表达，撤销在上一分支处理）
+        Matcher elder = Pattern.compile("(?<!照顾)(带|有|家里有|同行有)?老人([行动不便腿脚不]\\S{0,6})?").matcher(m);
+        if (elder.find()) {
+            phrases.add(elder.group().trim());
+            r.getConstraints().add(constraint("elderBackground", "TRUE", "SOFT", "ACTIVE", elder.group().trim()));
+            addSpan(spans, elder);
+        }
+        // 不能爬山 / 不爬山（「不爬山」是常见省略说法）
+        Matcher climb = Pattern.compile("(不能|不要|不想|别|不)\\s*(去)?爬山").matcher(m);
+        if (climb.find()) {
+            phrases.add(climb.group().trim());
+            r.getConstraints().add(constraint("avoidClimbing", "TRUE", "HARD", "ACTIVE", climb.group().trim()));
+            addSpan(spans, climb);
+        }
+        // 夜景
+        Matcher night = Pattern.compile("(还想|想|要看|看|喜欢)?夜景").matcher(m);
+        if (night.find()) {
+            phrases.add(night.group().trim());
+            r.getConstraints().add(constraint("interest", "NIGHT_VIEW", "SOFT", "ACTIVE", night.group().trim()));
+            addSpan(spans, night);
+        }
+        // 减少步行
+        Matcher walk = Pattern.compile("(减少|少走|少点|不想多)(步行|走路|走)|不想折腾").matcher(m);
+        if (walk.find()) {
+            phrases.add(walk.group().trim());
+            r.getConstraints().add(constraint("avoidActivity", "WALKING", "SOFT", "ACTIVE", walk.group().trim()));
+            addSpan(spans, walk);
+        }
+        if (!phrases.isEmpty()) {
+            r.getUpdates().put("specialRequests", String.join("，", phrases));
+        }
+    }
+
+    private ConstraintEntry constraint(String key, String value, String hardness, String status, String text) {
+        ConstraintEntry c = new ConstraintEntry();
+        c.setKey(key);
+        c.setValue(value);
+        c.setHardness(hardness);
+        c.setStatus(status);
+        c.setSource("USER");
+        c.setOriginalText(text);
+        return c;
+    }
+
+    // ==================== 餐次结构抽取 ====================
+
+    /** 餐次需求：「N顿午饭/晚饭/早饭」「不要早餐」「不要小吃」等；命中即消费原文区间 */
+    private void extractMealPlan(String m, RuleParseResult r, List<int[]> spans) {
+        Matcher bfNeg = Pattern.compile("(不要|不吃|不需要|不用|免|取消|省了)\\s*(早(饭|餐))").matcher(m);
+        if (bfNeg.find()) {
+            r.getUpdates().put("breakfastPerDay", "0");
+            addSpan(spans, bfNeg);
+        }
+        Matcher bf = Pattern.compile("(\\d+)\\s*顿?\\s*早(饭|餐)").matcher(m);
+        if (bf.find()) {
+            r.getUpdates().putIfAbsent("breakfastPerDay", bf.group(1));
+            addSpan(spans, bf);
+        }
+        Matcher lu = Pattern.compile("(\\d+)\\s*顿?\\s*(午|中)(饭|餐)").matcher(m);
+        if (lu.find()) {
+            r.getUpdates().putIfAbsent("lunchPerDay", lu.group(1));
+            addSpan(spans, lu);
+        }
+        Matcher dn = Pattern.compile("(\\d+)\\s*顿?\\s*晚(饭|餐)").matcher(m);
+        if (dn.find()) {
+            r.getUpdates().putIfAbsent("dinnerPerDay", dn.group(1));
+            addSpan(spans, dn);
+        }
+        Matcher snNeg = Pattern.compile("(不要|不吃|不需要|不用|免|取消|省了)\\s*(小吃|夜宵)").matcher(m);
+        if (snNeg.find()) {
+            r.getUpdates().put("snacksAllowed", "false");
+            addSpan(spans, snNeg);
+        }
+        // 正向表达不得与已消费的否定区间重叠（如「不要小吃」里的「要小吃」不是要小吃）
+        Matcher snPos = Pattern.compile("(要|想吃|想尝|加|来|带|留|想要)\\s*点?\\s*(小吃|夜宵)").matcher(m);
+        if (snPos.find() && !overlaps(spans, snPos.start(), snPos.end())) {
+            r.getUpdates().put("snacksAllowed", "true");
+            addSpan(spans, snPos);
+        }
+    }
+
+    private static boolean overlaps(List<int[]> spans, int start, int end) {
+        for (int[] s : spans) {
+            if (start < s[1] && end > s[0]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ==================== 预算解析 ====================
+
+    private void extractBudget(String m, TravelPreference context, Integer messagePeople,
+                               RuleParseResult r, List<int[]> spans) {
+        // 1. 人均/每人：优先于总额与区间；全团 = 人均 × 人数
+        Matcher perCapita = Pattern.compile("(人均|每人)\\s*(\\d+(?:\\.\\d+)?)").matcher(m);
+        if (perCapita.find()) {
+            BigDecimal unit = new BigDecimal(perCapita.group(2));
+            Integer people = messagePeople != null ? messagePeople
+                    : (context != null ? context.getPeopleCount() : null);
+            BigDecimal group = people == null ? unit : unit.multiply(BigDecimal.valueOf(people));
+            r.getUpdates().put("totalBudget", group.stripTrailingZeros().toPlainString());
+            BudgetSpec spec = new BudgetSpec();
+            spec.setTarget(group);
+            spec.setScope("PER_CAPITA");
+            r.setBudget(spec);
+            addSpan(spans, perCapita);
+            return;
+        }
+        // 2. 区间（预算前缀或元后缀）：min/max/target=中值；「预算\d+」不得抢先吞掉
+        Matcher range = Pattern.compile("预算\\s*(\\d+(?:\\.\\d+)?)\\s*[-—~到至]\\s*(\\d+(?:\\.\\d+)?)"
+                + "|(\\d+(?:\\.\\d+)?)\\s*[-—~到至]\\s*(\\d+(?:\\.\\d+)?)\\s*(?:元|块)").matcher(m);
+        if (range.find()) {
+            BigDecimal min = new BigDecimal(range.group(1) != null ? range.group(1) : range.group(3));
+            BigDecimal max = new BigDecimal(range.group(2) != null ? range.group(2) : range.group(4));
+            BigDecimal mid = min.add(max).divide(BigDecimal.valueOf(2), 0, java.math.RoundingMode.HALF_UP);
+            r.getUpdates().put("totalBudget", mid.toPlainString());
+            BudgetSpec spec = new BudgetSpec();
+            spec.setMin(min);
+            spec.setMax(max);
+            spec.setTarget(mid);
+            spec.setScope("GROUP_TRIP");
+            r.setBudget(spec);
+            addSpan(spans, range);
+            return;
+        }
+        // 3. 上限：不超过/以内/上限
+        Matcher cap = Pattern.compile("(预算\\s*)?(不超过|不超|上限|最多)\\s*(\\d+(?:\\.\\d+)?)"
+                + "|(\\d+(?:\\.\\d+)?)\\s*(以内|之内)").matcher(m);
+        if (cap.find()) {
+            String v = cap.group(3) != null ? cap.group(3) : cap.group(4);
+            r.getUpdates().put("totalBudget", v);
+            BudgetSpec spec = new BudgetSpec();
+            spec.setMax(new BigDecimal(v));
+            spec.setScope("GROUP_TRIP");
+            r.setBudget(spec);
+            addSpan(spans, cap);
+            return;
+        }
+        // 4. 单值：预算X
+        Matcher single = Pattern.compile("预算\\s*(\\d+(?:\\.\\d+)?)").matcher(m);
+        if (single.find()) {
+            r.getUpdates().put("totalBudget", single.group(1));
+            BudgetSpec spec = new BudgetSpec();
+            spec.setTarget(new BigDecimal(single.group(1)));
+            spec.setScope("GROUP_TRIP");
+            r.setBudget(spec);
+            addSpan(spans, single);
+            return;
+        }
+        // 5. 兜底：X元/块
+        Matcher plain = Pattern.compile("(\\d+(?:\\.\\d+)?)\\s*(?:元|块)").matcher(m);
+        if (plain.find()) {
+            r.getUpdates().put("totalBudget", plain.group(1));
+            addSpan(spans, plain);
+        }
+    }
+
+    // ==================== 跨度与残余 ====================
+
+    private static void addSpan(List<int[]> spans, Matcher m) {
+        spans.add(new int[]{m.start(), m.end()});
+    }
+
+    /** 去掉已消费区间与标点空白后的残余原文 */
+    private static String remainder(String m, List<int[]> spans) {
+        if (spans.isEmpty()) {
+            return m.trim();
+        }
+        List<int[]> s = new ArrayList<>(spans);
+        s.sort(Comparator.comparingInt(a -> a[0]));
+        StringBuilder sb = new StringBuilder();
+        int pos = 0;
+        for (int[] r : s) {
+            if (r[0] < pos) {
+                continue;
+            }
+            sb.append(m, pos, r[0]);
+            pos = Math.max(pos, r[1]);
+        }
+        sb.append(m.substring(pos));
+        return sb.toString().replaceAll("[，,。.、；;！!？?\\s]+", "")
+                .replaceFirst("^(我)?(要|想要|想|希望|请|帮我|麻烦)", "")
+                .replaceFirst("^(改成|改为|变成|换成|要改成|想改成|帮我改成|就改成)", "")
+                .replaceFirst("了$", "")
+                .trim();
+    }
+}
