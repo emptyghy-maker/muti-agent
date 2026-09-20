@@ -87,10 +87,6 @@ public class CandidateService {
     private static final int LLM_SELECT_MAX = 12;
     /** 联网检索单次最多接收条数（提示词上限 20，留余量） */
     private static final int WEB_FOOD_MAX = 24;
-    /** AI advice 中表示候选池覆盖不足的标记词：命中且精挑数量低于目标时自动触发联网检索扩充 */
-    private static final List<String> INSUFFICIENT_ADVICE_MARKERS = List.of(
-            "无法凑齐", "凑不齐", "数量不足", "覆盖不足", "建议扩大", "扩大搜索", "扩大范围",
-            "其他区域", "别的区域", "没有更多", "没有其他", "无其他", "仅找到", "只有", "较少", "有限");
     /** 分页游标失效（快照被新约束版本取代） */
     public static final String REVISION_CONFLICT = "REVISION_CONFLICT";
 
@@ -822,9 +818,9 @@ public class CandidateService {
                     // AI 表示池内无匹配（如地点限制）：保留规则池兜底展示，同时自动联网检索补候选
                     evidence.put("aiNoMatch", true);
                     triggerWebSearchOnNoMatch(state);
-                } else if (insufficientCoverage(state.getCandidateAdvice(), refined.size(), target)) {
-                    // AI 选到少量店但明示覆盖不足（如「无法凑齐N家，建议扩大搜索范围」）：
-                    // 视为需求未被满足，同样触发联网检索扩充，不再用无关店铺凑数
+                } else if (refined.size() < target) {
+                    // 确定性触发：AI 精挑数量低于目标即视为覆盖不足（如「园区仅 1 家符合选址，
+                    // 其余补位」），直接联网检索扩充——不依赖 advice 文本措辞（措辞多变会漏触发）
                     evidence.put("aiInsufficient", true);
                     triggerWebSearchOnNoMatch(state);
                 }
@@ -843,6 +839,17 @@ public class CandidateService {
                         finalEntities.add(w);
                         webAccepted.add(placeKey("FOOD", w.getId()));
                     }
+                }
+                if (!webAccepted.isEmpty()) {
+                    String adv = state.getCandidateAdvice();
+                    state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
+                            + "已联网检索扩充 " + webAccepted.size() + " 家符合要求的店铺。");
+                } else if (Boolean.TRUE.equals(evidence.get("aiInsufficient"))
+                        || Boolean.TRUE.equals(evidence.get("aiNoMatch"))) {
+                    // 触发过检索但没有新条目并入（失败或全部被校验拒绝）：如实告知，避免用户以为列表已更新
+                    String adv = state.getCandidateAdvice();
+                    state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
+                            + "（联网检索暂不可用，本次按备选池给出结果，可稍后重试）");
                 }
                 for (Restaurant r : poolEntities) {
                     if (finalEntities.size() >= target) {
@@ -1090,23 +1097,11 @@ public class CandidateService {
             return;
         }
         List<WebFoodCandidate> web = searchFoodsOnline(state);
-        state.setWebSearchKey(key);
         if (web != null && !web.isEmpty()) {
+            // 仅在成功时登记去重键：失败不登记，用户重试同需求时允许再次尝试
+            state.setWebSearchKey(key);
             state.setWebFoodCandidates(web);
         }
-    }
-
-    /** AI advice 明示候选池覆盖不足（无法凑齐/建议扩大搜索等标记词）且精挑数量低于目标 */
-    private static boolean insufficientCoverage(String advice, int refinedSize, int target) {
-        if (advice == null || advice.isBlank() || refinedSize >= target) {
-            return false;
-        }
-        for (String m : INSUFFICIENT_ADVICE_MARKERS) {
-            if (advice.contains(m)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /** 本会话已通过校验入库的网搜店（不在当前 KB 池内，避免重复并入）；source 双重过滤防异常数据混入 */
@@ -1422,6 +1417,10 @@ public class CandidateService {
         item.setAvgPrice(r.getAvgPrice());
         item.setSignatureDish(r.getSignatureDish());
         item.setTags(r.getTags());
+        item.setSource(r.getSource());
+        if ("WEB_SEARCH".equals(r.getSource()) && r.getSourceNote() != null) {
+            item.setReason(r.getSourceNote());
+        }
         if (mealTypes != null) {
             item.setMealType(mealTypes.get(r.getId()));
         }
@@ -1688,16 +1687,24 @@ public class CandidateService {
         return wrapped;
     }
 
-    /** 已选景点 + 美食的坐标几何中心 */
+    /** 已选景点 + 美食的坐标几何中心（无坐标的网搜店不计入，避免空值污染中心点） */
     private double[] centerOf(TravelState state) {
         List<double[]> points = new ArrayList<>();
         if (state.getSelectedAttractionIds() != null && !state.getSelectedAttractionIds().isEmpty()) {
             attractionMapper.selectBatchIds(state.getSelectedAttractionIds())
-                    .forEach(a -> points.add(new double[]{a.getLng(), a.getLat()}));
+                    .forEach(a -> {
+                        if (a.getLng() != null && a.getLat() != null) {
+                            points.add(new double[]{a.getLng(), a.getLat()});
+                        }
+                    });
         }
         if (state.getSelectedFoodIds() != null && !state.getSelectedFoodIds().isEmpty()) {
             restaurantMapper.selectBatchIds(state.getSelectedFoodIds())
-                    .forEach(r -> points.add(new double[]{r.getLng(), r.getLat()}));
+                    .forEach(r -> {
+                        if (r.getLng() != null && r.getLat() != null) {
+                            points.add(new double[]{r.getLng(), r.getLat()});
+                        }
+                    });
         }
         if (points.isEmpty()) {
             return new double[]{0, 0};

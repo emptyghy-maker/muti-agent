@@ -30,7 +30,6 @@ const chatHistory = ref([])
 const attractionCandidates = ref([])
 const foodCandidates = ref([])
 const hotelCandidates = ref([])
-const webFoodCandidates = ref([])
 const selectedIds = ref([])
 const itineraryId = ref(null)
 const itineraryText = ref('')
@@ -145,6 +144,9 @@ const mealPlanText = computed(() => {
   return parts.join(' · ')
 })
 
+const hasWebFood = computed(() =>
+  foodCandidates.value.some(g => g.restaurants.some(r => r.source === 'WEB_SEARCH')))
+
 function applyStep(s) {
   if (s.sessionId) {
     sessionId.value = s.sessionId
@@ -164,7 +166,6 @@ function applyStep(s) {
   attractionCandidates.value = s.attractionCandidates || []
   foodCandidates.value = s.foodCandidates || []
   hotelCandidates.value = s.hotelCandidates || []
-  webFoodCandidates.value = s.webFoodCandidates || []
   // 按当前阶段恢复服务端已勾选（同时覆盖 409 重载丢选中的场景）
   if (s.stage === 'ATTRACTIONS') selectedIds.value = [...(s.selectedAttractionIds || [])]
   else if (s.stage === 'FOODS') selectedIds.value = [...(s.selectedFoodIds || [])]
@@ -625,26 +626,17 @@ function openRoute(payload) {
       <!-- 美食：有餐次标注按餐次分组，否则按风味分组 -->
       <div v-else>
         <div class="tip" v-if="mealPlanText">已按你的餐次需求过滤候选：{{ mealPlanText }}</div>
+        <div class="tip" v-if="hasWebFood">含联网检索店铺（信息来自网络，价格仅供参考），推荐理由附在每条下方。</div>
         <div v-for="g in foodGroups" :key="g.label" class="cand-group">
           <div class="cuisine">{{ g.isMeal ? '餐次 · ' + g.label : g.label }}</div>
           <div v-for="r in g.items" :key="r.restaurantId" class="cand-row"
                :class="{ checked: selectedIds.includes(r.restaurantId) }"
                @click="toggle(r.restaurantId)">
             <div class="info">
-              <div class="name">{{ r.name }}<span class="score" v-if="r.score != null" :title="scoreTitle(r)">{{ r.score.toFixed(1) }}</span></div>
+              <div class="name">{{ r.name }}<span class="badge" v-if="r.source === 'WEB_SEARCH'">网络检索</span><span class="score" v-if="r.score != null" :title="scoreTitle(r)">{{ r.score.toFixed(1) }}</span></div>
               <div class="sub">人均 ¥{{ r.avgPrice }} · 招牌：{{ r.signatureDish || '-' }}</div>
               <div class="tags" v-if="r.tags"><span v-for="t in splitTags(r.tags)" :key="t" class="tag-chip">{{ t }}</span></div>
-            </div>
-          </div>
-        </div>
-        <!-- 阶段2：联网检索推荐（已通过校验并入候选池，可直接勾选；未通过校验的已拒绝并留审计） -->
-        <div v-if="webFoodCandidates.length" class="cand-group web-group">
-          <div class="cuisine">联网检索 · 已通过校验并入候选池（信息来自网络，价格仅供参考）</div>
-          <div v-for="w in webFoodCandidates" :key="w.name" class="cand-row web-row">
-            <div class="info">
-              <div class="name">{{ w.name }}<span class="badge">网络检索</span></div>
-              <div class="sub">人均约 ¥{{ w.avgPrice ?? '待确认' }} · {{ w.cuisine || '风味未知' }} · {{ w.address || '位置未提供' }}</div>
-              <div class="why">{{ w.why }}</div>
+              <div class="why" v-if="r.reason">推荐理由：{{ r.reason }}</div>
             </div>
           </div>
         </div>

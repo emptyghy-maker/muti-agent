@@ -23,22 +23,34 @@ public final class PlaceIndex {
     private PlaceIndex() {
     }
 
-    /** 坐标索引：景点（含休息点）/餐厅/酒店 → [lng, lat] */
+    /** 坐标索引：景点（含休息点）/餐厅/酒店 → [lng, lat]；无坐标的地点（如网搜店）跳过，排程自动按固定时长估算 */
     public static Map<PlaceKey, double[]> coords(List<Attraction> attractions,
                                                  List<Restaurant> restaurants,
                                                  List<Hotel> hotels,
                                                  List<Attraction> restSpots) {
         Map<PlaceKey, double[]> map = new HashMap<>();
-        attractions.forEach(a -> map.put(PlaceKey.of(PlaceType.ATTRACTION, a.getId()),
-                new double[]{a.getLng(), a.getLat()}));
+        attractions.forEach(a -> {
+            if (a.getLng() != null && a.getLat() != null) {
+                map.put(PlaceKey.of(PlaceType.ATTRACTION, a.getId()), new double[]{a.getLng(), a.getLat()});
+            }
+        });
         if (restSpots != null) {
-            restSpots.forEach(a -> map.put(PlaceKey.of(PlaceType.ATTRACTION, a.getId()),
-                    new double[]{a.getLng(), a.getLat()}));
+            restSpots.forEach(a -> {
+                if (a.getLng() != null && a.getLat() != null) {
+                    map.put(PlaceKey.of(PlaceType.ATTRACTION, a.getId()), new double[]{a.getLng(), a.getLat()});
+                }
+            });
         }
-        restaurants.forEach(r -> map.put(PlaceKey.of(PlaceType.RESTAURANT, r.getId()),
-                new double[]{r.getLng(), r.getLat()}));
-        hotels.forEach(h -> map.put(PlaceKey.of(PlaceType.HOTEL, h.getId()),
-                new double[]{h.getLng(), h.getLat()}));
+        restaurants.forEach(r -> {
+            if (r.getLng() != null && r.getLat() != null) {
+                map.put(PlaceKey.of(PlaceType.RESTAURANT, r.getId()), new double[]{r.getLng(), r.getLat()});
+            }
+        });
+        hotels.forEach(h -> {
+            if (h.getLng() != null && h.getLat() != null) {
+                map.put(PlaceKey.of(PlaceType.HOTEL, h.getId()), new double[]{h.getLng(), h.getLat()});
+            }
+        });
         return map;
     }
 

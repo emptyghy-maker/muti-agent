@@ -169,4 +169,57 @@ class WebFoodExpansionTest {
         assertThat(poolNames).contains("湖畔餐厅", "晚风小馆");
         assertThat(poolNames).doesNotContain("<script>alert(1)</script>", "无价餐厅");
     }
+
+    @Test
+    void regionShortfallWithoutMarkerWordsStillTriggersSearch() throws Exception {
+        // 回归：advice 不带任何「覆盖不足」标记词（如「仅1家符合选址，其余补位」），
+        // 只要 AI 精挑数量低于目标，就必须确定性触发联网检索，而不是依赖措辞
+        when(foodAgent.select(anyString(), anyString(), anyInt())).thenReturn(
+                Result.<String>builder()
+                        .content("{\"items\":[{\"restaurantId\":1},{\"restaurantId\":2}],"
+                                + "\"advice\":\"园区仅新梅华(金鸡湖店)符合选址，其余推荐观前/平江路高分本地菜以补氛围\"}")
+                        .tokenUsage(new TokenUsage(1, 1))
+                        .build());
+        when(searchClient.search(anyString(), anyString())).thenReturn(
+                new DashScopeSearchClient.SearchResult(
+                        "{\"items\":["
+                                + "{\"name\":\"湖畔餐厅\",\"cuisine\":\"本地菜\",\"avgPrice\":\"80\","
+                                + "\"address\":\"园区金鸡湖\",\"why\":\"湖边环境雅致\"}"
+                                + "]}",
+                        100, 50));
+
+        TravelState st = state();
+        svc.generateFoods(st);
+
+        // 无标记词也必须触发联网检索
+        verify(searchClient, times(1)).search(anyString(), anyString());
+        // 扩充说明追加到 advice，避免列表与说明错位
+        assertThat(st.getCandidateAdvice()).contains("已联网检索扩充 1 家");
+        // 网搜店并入候选池
+        List<String> poolNames = st.getFoodPool().stream()
+                .flatMap(g -> g.getRestaurants().stream())
+                .map(FoodCandidate.FoodItem::getName).toList();
+        assertThat(poolNames).contains("湖畔餐厅");
+    }
+
+    @Test
+    void failedSearchDoesNotBlockRetryForSameRequest() throws Exception {
+        // 回归：搜索失败（如超时）不得登记去重键，否则同需求重试永远不再尝试搜索
+        when(foodAgent.select(anyString(), anyString(), anyInt())).thenReturn(
+                Result.<String>builder()
+                        .content("{\"items\":[{\"restaurantId\":1}],\"advice\":\"仅1家符合选址\"}")
+                        .tokenUsage(new TokenUsage(1, 1))
+                        .build());
+        when(searchClient.search(anyString(), anyString()))
+                .thenThrow(new RuntimeException("HttpTimeoutException: request timed out"));
+
+        TravelState st = state();
+        svc.generateFoods(st);
+        svc.generateFoods(st);
+
+        // 两次确认同需求：两次都尝试联网检索（失败不阻断重试）
+        verify(searchClient, times(2)).search(anyString(), anyString());
+        // 失败时 advice 如实提示，不假装列表已扩充
+        assertThat(st.getCandidateAdvice()).contains("联网检索暂不可用");
+    }
 }

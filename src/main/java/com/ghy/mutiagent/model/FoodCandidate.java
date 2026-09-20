@@ -27,5 +27,9 @@ public class FoodCandidate {
         private String tags;
         /** 标签评分明细（如「+1.2 情侣/氛围 · −0.6 热闹」），前端悬浮说明 */
         private String tagNote;
+        /** 推荐理由：网搜店为检索推荐语（入库 source_note），知识库店为 null（由标签/评分说明） */
+        private String reason;
+        /** 来源：KB=知识库种子 / WEB_SEARCH=联网检索（前端徽章区分） */
+        private String source;
     }
 }
