@@ -22,9 +22,17 @@ public class Restaurant {
     private String tags;
     /** 人均（元） */
     private BigDecimal avgPrice;
+    /** 街道/商圈级位置（网搜扩充店提供；KB 种子店可为空） */
+    private String address;
     private Double lng;
     private Double lat;
     private Double rating;
     private String businessHours;
     private Integer status;
+    /** KB=知识库种子 / WEB_SEARCH=联网检索扩充（来源可追溯） */
+    private String source;
+    /** 来源会话标识（网搜店） */
+    private String sourceRef;
+    /** 来源说明（网搜匹配理由） */
+    private String sourceNote;
 }

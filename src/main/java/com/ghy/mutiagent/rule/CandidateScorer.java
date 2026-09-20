@@ -54,7 +54,9 @@ public final class CandidateScorer {
         double budget = perPersonDaily(p);
         Map<Long, Double> out = new LinkedHashMap<>();
         for (Restaurant r : pool) {
-            double path = centroid == null ? 0.5
+            // 网搜扩充店无坐标：路径分取中性 0.5（不参与距离排序）
+            double path = centroid == null || r.getLng() == null || r.getLat() == null
+                    ? 0.5
                     : 1 / (1 + GeoUtils.distanceKm(centroid[0], centroid[1], r.getLng(), r.getLat()));
             double cost = costScore(num(r.getAvgPrice()), min, max, budget);
             double food = 0.5 * ratingOf(r.getRating())

@@ -637,9 +637,9 @@ function openRoute(payload) {
             </div>
           </div>
         </div>
-        <!-- 阶段2：联网检索推荐（知识库外，仅参考展示，未经审核不入知识库、暂不加入行程） -->
+        <!-- 阶段2：联网检索推荐（已通过校验并入候选池，可直接勾选；未通过校验的已拒绝并留审计） -->
         <div v-if="webFoodCandidates.length" class="cand-group web-group">
-          <div class="cuisine">联网推荐 · 信息来自网络，仅供参考（暂不加入行程）</div>
+          <div class="cuisine">联网检索 · 已通过校验并入候选池（信息来自网络，价格仅供参考）</div>
           <div v-for="w in webFoodCandidates" :key="w.name" class="cand-row web-row">
             <div class="info">
               <div class="name">{{ w.name }}<span class="badge">网络检索</span></div>

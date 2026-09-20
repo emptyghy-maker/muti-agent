@@ -24,9 +24,11 @@ import com.ghy.mutiagent.model.WebFoodCandidate;
 import com.ghy.mutiagent.repository.entity.Attraction;
 import com.ghy.mutiagent.repository.entity.Hotel;
 import com.ghy.mutiagent.repository.entity.Restaurant;
+import com.ghy.mutiagent.repository.entity.WebFoodAudit;
 import com.ghy.mutiagent.repository.mapper.AttractionMapper;
 import com.ghy.mutiagent.repository.mapper.HotelMapper;
 import com.ghy.mutiagent.repository.mapper.RestaurantMapper;
+import com.ghy.mutiagent.repository.mapper.WebFoodAuditMapper;
 import com.ghy.mutiagent.rule.AhpWeightCalculator;
 import com.ghy.mutiagent.rule.CandidateScorer;
 import com.ghy.mutiagent.rule.HardConstraintEvaluator;
@@ -34,6 +36,7 @@ import com.ghy.mutiagent.rule.TagMatcher;
 import com.ghy.mutiagent.trace.AgentTrace;
 import com.ghy.mutiagent.trace.TraceContext;
 import com.ghy.mutiagent.trace.TraceService;
+import com.ghy.mutiagent.service.validation.WebFoodValidator;
 import dev.langchain4j.model.output.TokenUsage;
 import dev.langchain4j.service.Result;
 import org.slf4j.Logger;
@@ -82,6 +85,12 @@ public class CandidateService {
     private static final int HOTEL_POOL_FLOOR = 6;
     /** AI 重筛时最多保留数量 */
     private static final int LLM_SELECT_MAX = 12;
+    /** 联网检索单次最多接收条数（提示词上限 20，留余量） */
+    private static final int WEB_FOOD_MAX = 24;
+    /** AI advice 中表示候选池覆盖不足的标记词：命中且精挑数量低于目标时自动触发联网检索扩充 */
+    private static final List<String> INSUFFICIENT_ADVICE_MARKERS = List.of(
+            "无法凑齐", "凑不齐", "数量不足", "覆盖不足", "建议扩大", "扩大搜索", "扩大范围",
+            "其他区域", "别的区域", "没有更多", "没有其他", "无其他", "仅找到", "只有", "较少", "有限");
     /** 分页游标失效（快照被新约束版本取代） */
     public static final String REVISION_CONFLICT = "REVISION_CONFLICT";
 
@@ -313,6 +322,10 @@ public class CandidateService {
     /** 阶段2 联网检索客户端（可空：未装配/关闭时功能降级为跳过，不阻塞主流程） */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private DashScopeSearchClient dashScopeSearchClient;
+
+    /** 网搜入库审计 Mapper（可空：手动装配的测试进程为 null 时跳过审计写入） */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private WebFoodAuditMapper webFoodAuditMapper;
 
     /** 联网搜索模型（需支持 enable_search） */
     @Value("${llm.search-model:qwen3.8-max}")
@@ -809,22 +822,39 @@ public class CandidateService {
                     // AI 表示池内无匹配（如地点限制）：保留规则池兜底展示，同时自动联网检索补候选
                     evidence.put("aiNoMatch", true);
                     triggerWebSearchOnNoMatch(state);
+                } else if (insufficientCoverage(state.getCandidateAdvice(), refined.size(), target)) {
+                    // AI 选到少量店但明示覆盖不足（如「无法凑齐N家，建议扩大搜索范围」）：
+                    // 视为需求未被满足，同样触发联网检索扩充，不再用无关店铺凑数
+                    evidence.put("aiInsufficient", true);
+                    triggerWebSearchOnNoMatch(state);
                 }
-                // AI 精挑通常只有 2~3 家：不足目标数量时用规则池补足（补足项同样已经过硬过滤与小吃排除）
+                // AI 精挑通常只有 2~3 家：先并入本会话已通过校验入库的网搜店（与 KB 店同等对待），
+                // 仍不足目标数量时再用规则池补足（补足项同样已经过硬过滤与小吃排除）
                 finalEntities = new ArrayList<>(refined);
-                Set<Long> refinedIds = refined.stream().map(Restaurant::getId).collect(Collectors.toSet());
+                Set<Long> chosenIds = refined.stream().map(Restaurant::getId).collect(Collectors.toSet());
                 List<String> aiAccepted = refined.stream().map(r -> placeKey("FOOD", r.getId())).toList();
+                List<String> webAccepted = new ArrayList<>();
                 List<String> backfillAccepted = new ArrayList<>();
+                for (Restaurant w : webExpandedRestaurants(state, poolEntities)) {
+                    if (finalEntities.size() >= target) {
+                        break;
+                    }
+                    if (chosenIds.add(w.getId())) {
+                        finalEntities.add(w);
+                        webAccepted.add(placeKey("FOOD", w.getId()));
+                    }
+                }
                 for (Restaurant r : poolEntities) {
                     if (finalEntities.size() >= target) {
                         break;
                     }
-                    if (!refinedIds.contains(r.getId())) {
+                    if (!chosenIds.contains(r.getId())) {
                         finalEntities.add(r);
                         backfillAccepted.add(placeKey("FOOD", r.getId()));
                     }
                 }
                 acceptedByOrigin.put("AI", aiAccepted);
+                acceptedByOrigin.put("WEB", webAccepted);
                 acceptedByOrigin.put("BACKFILL", backfillAccepted);
             } else {
                 aiOk = false;
@@ -1001,7 +1031,7 @@ public class CandidateService {
             List<WebFoodCandidate> items = new ArrayList<>();
             for (JsonNode it : node.path("items")) {
                 String name = it.path("name").asText("").trim();
-                if (name.isBlank() || items.size() >= 6) {
+                if (name.isBlank() || items.size() >= WEB_FOOD_MAX) {
                     continue;
                 }
                 if (kbNames.stream().anyMatch(kb -> kb.contains(name) || name.contains(kb))) {
@@ -1013,24 +1043,29 @@ public class CandidateService {
                 try {
                     w.setAvgPrice(new BigDecimal(it.path("avgPrice").asText("0").trim()));
                 } catch (NumberFormatException ignored) {
-                    // 价格缺失：保留 null，前端按「价格待确认」展示
+                    // 价格缺失：保留 null，由入库校验拒绝（价格未知的店不进知识库）
                 }
                 w.setAddress(it.path("address").asText("").trim());
                 w.setWhy(it.path("why").asText("").trim());
                 items.add(w);
             }
+            // 入库前确定性校验 + 审计 + 扩充知识库：只返回通过校验并成功入库的条目
+            List<WebFoodCandidate> accepted = ingestWebFood(state, items, kbNames);
+            state.setWebFoodCandidates(accepted);
             long cost = System.currentTimeMillis() - start;
             AgentTrace sspan = AgentTrace.success("SearchAgent", cost, searchUsage);
             sspan.setAnswer(UsageService.clip(raw, 2000));
             sctx.add(sspan);
             sctx.finish("SUCCESS");
             // O1：搜索 token 与耗时如实落库（attempt 明细行），并归集到本轮（turn）
+            String remark = "n=" + accepted.size()
+                    + (accepted.size() < items.size() ? ",rejected=" + (items.size() - accepted.size()) : "");
             usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
                     "FOODS", "美食联网检索", "SearchAgent", searchUsage, cost, "SUCCESS",
-                    "n=" + items.size(), searchModel, UsageChannel.AGENT,
+                    remark, searchModel, UsageChannel.AGENT,
                     UsageService.clip(raw, 2000));
             state.addTurnUsage(searchModel, promptTokens, completionTokens, UsageChannel.AGENT);
-            return items.isEmpty() ? null : items;
+            return accepted.isEmpty() ? null : accepted;
         } catch (Exception e) {
             long cost = System.currentTimeMillis() - start;
             log.warn("美食联网检索失败（{}），降级为仅知识库推荐", e.getClass().getName());
@@ -1048,7 +1083,7 @@ public class CandidateService {
         }
     }
 
-    /** AI 明确表示池内无匹配时：自动联网检索补充候选（同一需求只搜一次，失败静默降级） */
+    /** AI 明确表示池内无匹配或覆盖不足时：自动联网检索补充候选（同一需求只搜一次，失败静默降级） */
     private void triggerWebSearchOnNoMatch(TravelState state) {
         String key = "confirm:" + (state.getExtraRequest() == null ? "" : state.getExtraRequest());
         if (key.equals(state.getWebSearchKey())) {
@@ -1059,6 +1094,128 @@ public class CandidateService {
         if (web != null && !web.isEmpty()) {
             state.setWebFoodCandidates(web);
         }
+    }
+
+    /** AI advice 明示候选池覆盖不足（无法凑齐/建议扩大搜索等标记词）且精挑数量低于目标 */
+    private static boolean insufficientCoverage(String advice, int refinedSize, int target) {
+        if (advice == null || advice.isBlank() || refinedSize >= target) {
+            return false;
+        }
+        for (String m : INSUFFICIENT_ADVICE_MARKERS) {
+            if (advice.contains(m)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 本会话已通过校验入库的网搜店（不在当前 KB 池内，避免重复并入）；source 双重过滤防异常数据混入 */
+    private List<Restaurant> webExpandedRestaurants(TravelState state, List<Restaurant> poolEntities) {
+        Set<Long> kbIds = poolEntities.stream().map(Restaurant::getId).collect(Collectors.toSet());
+        List<Restaurant> web = restaurantMapper.selectList(new LambdaQueryWrapper<Restaurant>()
+                .eq(Restaurant::getDestinationId, state.getDestinationId())
+                .eq(Restaurant::getSource, "WEB_SEARCH")
+                .eq(Restaurant::getSourceRef, state.getSessionId())
+                .eq(Restaurant::getStatus, 1));
+        return web.stream()
+                .filter(r -> "WEB_SEARCH".equals(r.getSource())
+                        && r.getId() != null && !kbIds.contains(r.getId()))
+                .toList();
+    }
+
+    /**
+     * 网搜结果入库：确定性校验 → 审计 → 扩充知识库；只返回通过校验并成功入库的条目。
+     * 防恶意写入：SQL 注入由参数化 insert 兜底，内容与语义由 WebFoodValidator 把关，
+     * 每条结果（接受/拒绝）都写 t_web_food_audit 供追溯与事后人工复核。
+     */
+    private List<WebFoodCandidate> ingestWebFood(TravelState state, List<WebFoodCandidate> items,
+                                                 Set<String> kbNames) {
+        List<WebFoodCandidate> accepted = new ArrayList<>();
+        Set<String> taken = new LinkedHashSet<>();
+        for (WebFoodCandidate w : items) {
+            String norm = normalizeName(w.getName());
+            boolean dup = !taken.add(norm) || kbNames.stream().anyMatch(k -> {
+                String kn = normalizeName(k);
+                return kn.equals(norm) || (kn.length() >= 4 && norm.length() >= 4
+                        && (kn.contains(norm) || norm.contains(kn)));
+            });
+            List<String> reasons = WebFoodValidator.validate(w);
+            if (!dup) {
+                // 与已入库的网搜店再查重（同目的地同来源同名）
+                Long same = restaurantMapper.selectCount(new LambdaQueryWrapper<Restaurant>()
+                        .eq(Restaurant::getDestinationId, state.getDestinationId())
+                        .eq(Restaurant::getSource, "WEB_SEARCH")
+                        .eq(Restaurant::getName, w.getName()));
+                if (same != null && same > 0) {
+                    dup = true;
+                    reasons = List.of("DUPLICATE_DB");
+                }
+            }
+            if (dup && reasons.isEmpty()) {
+                reasons = List.of("DUPLICATE");
+            }
+            if (!reasons.isEmpty()) {
+                auditWebFood(state, w, "REJECT", String.join(",", reasons));
+                continue;
+            }
+            Restaurant r = new Restaurant();
+            r.setDestinationId(state.getDestinationId());
+            r.setName(w.getName().trim());
+            r.setCuisine(w.getCuisine().trim());
+            r.setAvgPrice(w.getAvgPrice());
+            r.setAddress(blankToNull(w.getAddress()));
+            r.setRating(4.5);
+            r.setStatus(1);
+            r.setSource("WEB_SEARCH");
+            r.setSourceRef(state.getSessionId());
+            r.setSourceNote(UsageService.clip(w.getWhy(), 200));
+            try {
+                if (restaurantMapper.insert(r) > 0) {
+                    accepted.add(w);
+                    auditWebFood(state, w, "ACCEPT", null);
+                } else {
+                    auditWebFood(state, w, "REJECT", "INSERT_FAILED");
+                }
+            } catch (Exception e) {
+                log.warn("网搜店铺入库失败（{}）：{}", w.getName(), e.getClass().getSimpleName());
+                auditWebFood(state, w, "REJECT", "INSERT_ERROR");
+            }
+        }
+        return accepted;
+    }
+
+    /** 逐条审计：接受/拒绝都留痕（mapper 未装配时静默跳过，不影响主流程） */
+    private void auditWebFood(TravelState state, WebFoodCandidate w, String action, String rejectReason) {
+        if (webFoodAuditMapper == null) {
+            return;
+        }
+        try {
+            WebFoodAudit a = new WebFoodAudit();
+            a.setSessionId(state.getSessionId());
+            a.setDestinationId(state.getDestinationId());
+            a.setUserId(state.getUserId());
+            a.setName(UsageService.clip(w.getName(), 128));
+            a.setCuisine(UsageService.clip(w.getCuisine(), 32));
+            a.setAvgPrice(w.getAvgPrice());
+            a.setAddress(UsageService.clip(w.getAddress(), 128));
+            a.setAction(action);
+            a.setRejectReason(UsageService.clip(rejectReason, 255));
+            a.setRawPayload(UsageService.clip("name=" + w.getName() + "; why=" + w.getWhy(), 500));
+            webFoodAuditMapper.insert(a);
+        } catch (Exception e) {
+            log.warn("网搜审计写入失败：{}", e.getClass().getSimpleName());
+        }
+    }
+
+    private static String normalizeName(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replaceAll("[\\s（）()·\\-—]+", "").toLowerCase();
+    }
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
     }
 
     private String loadPrompt(String path) throws java.io.IOException {
@@ -1253,6 +1410,7 @@ public class CandidateService {
         m.put("cuisine", r.getCuisine());
         m.put("avgPrice", r.getAvgPrice());
         m.put("signatureDish", r.getSignatureDish() == null ? "" : r.getSignatureDish());
+        m.put("address", r.getAddress() == null ? "" : r.getAddress());
         m.put("rating", r.getRating());
         return m;
     }

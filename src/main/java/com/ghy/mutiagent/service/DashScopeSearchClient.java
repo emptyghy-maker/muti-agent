@@ -55,7 +55,8 @@ public class DashScopeSearchClient {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", searchModel);
         body.put("temperature", 0.2);
-        body.put("max_tokens", 2000);
+        // 扩充检索：一次尽可能多返回（提示词上限 20 条），token 预算相应放宽
+        body.put("max_tokens", 4096);
         body.put("enable_search", true);
         body.put("messages", List.of(
                 Map.of("role", "system", "content", systemPrompt),

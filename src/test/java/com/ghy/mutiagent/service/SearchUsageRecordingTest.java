@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ghy.mutiagent.config.CandidateFoodConfig;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.WebFoodCandidate;
+import com.ghy.mutiagent.repository.entity.Restaurant;
 import com.ghy.mutiagent.repository.mapper.AttractionMapper;
 import com.ghy.mutiagent.repository.mapper.HotelMapper;
 import com.ghy.mutiagent.repository.mapper.RestaurantMapper;
@@ -54,6 +55,8 @@ class SearchUsageRecordingTest {
         when(traceService.newTrace(anyString(), anyString()))
                 .thenReturn(new TraceContext("s1", "SearchAgent", TimeSource.SYSTEM));
         when(restaurantMapper.selectList(any())).thenReturn(new ArrayList<>());
+        // 网搜扩充：校验通过后入库（mock 返回 1 = 插入成功）
+        when(restaurantMapper.insert(any(Restaurant.class))).thenReturn(1);
         when(searchClient.search(anyString(), anyString())).thenReturn(
                 new DashScopeSearchClient.SearchResult(
                         "{\"items\":[{\"name\":\"网搜餐厅\",\"cuisine\":\"川菜\",\"avgPrice\":\"50\","
