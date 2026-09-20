@@ -11,11 +11,14 @@ import com.ghy.mutiagent.common.ResultCode;
 import com.ghy.mutiagent.model.AttractionCandidate;
 import com.ghy.mutiagent.model.ChatStepResult;
 import com.ghy.mutiagent.model.ConstraintEntry;
+import com.ghy.mutiagent.model.DailyPlan;
 import com.ghy.mutiagent.model.FoodCandidate;
 import com.ghy.mutiagent.model.HotelCandidate;
 import com.ghy.mutiagent.model.HistoryItem;
 import com.ghy.mutiagent.model.ItineraryDetail;
+import com.ghy.mutiagent.model.ItineraryPlan;
 import com.ghy.mutiagent.model.LockedSelection;
+import com.ghy.mutiagent.model.PlanNode;
 import com.ghy.mutiagent.model.PreferenceResult;
 import com.ghy.mutiagent.model.Question;
 import com.ghy.mutiagent.model.ResumeView;
@@ -66,6 +69,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.regex.Matcher;
@@ -1003,9 +1007,10 @@ public class TravelOrchestrator {
         TravelState state = sessionService.loadOwned(sessionId, actor.id());
         boolean regen = Boolean.TRUE.equals(regenerate);
         List<Long> ids = selectedIds == null ? List.of() : selectedIds;
+        // 用户选择也要留痕：用量记录带具体店名/景点名，后台会话审计可查
         usageService.recordOp(state.getSessionId(), state.getUserId(), state.getUsername(),
                 state.getStage().name(), (regen ? "换一批" : "确认候选") + candidateType,
-                "SUCCESS", "已勾选 " + ids.size() + " 项",
+                "SUCCESS", "已勾选 " + ids.size() + " 项" + selectedNamesSuffix(state, candidateType, ids),
                 regen ? UsageChannel.CACHE : UsageChannel.KB);
 
         switch (candidateType == null ? "" : candidateType.toUpperCase()) {
@@ -1160,20 +1165,23 @@ public class TravelOrchestrator {
         if (Boolean.TRUE.equals(state.getPendingFatigueConfirm())) {
             // B：疲劳超载草稿留存待确认——保存待确认状态，不推进 DONE、不发布
             sessionService.save(state);
-            ChatStepResult r = buildResult(state, ack + "\n\n" + fatiguePendingText(state), null);
+            ChatStepResult r = buildResult(state, ack + "\n\n" + fatiguePendingText(state)
+                    + missingSelectedNote(state), null);
             r.setStatus("NEEDS_CONFIRMATION");
             return r;
         }
         if (Boolean.TRUE.equals(state.getPendingBudgetConfirm())) {
             // 预算超支知情放行：保存待确认状态，不推进 DONE、不发布
             sessionService.save(state);
-            ChatStepResult r = buildResult(state, ack + "\n\n" + budgetPendingText(state), null);
+            ChatStepResult r = buildResult(state, ack + "\n\n" + budgetPendingText(state)
+                    + missingSelectedNote(state), null);
             r.setStatus("NEEDS_CONFIRMATION");
             return r;
         }
         state.setStage(TravelStage.DONE);
         sessionService.save(state);
-        return buildResult(state, ack + "\n\n行程已生成（含预计消费），点击地点可查看具体路径：", null);
+        return buildResult(state, ack + "\n\n行程已生成（含预计消费），点击地点可查看具体路径："
+                + missingSelectedNote(state), null);
     }
 
     /** B：疲劳超载待确认的提示文案（含最满一天的疲劳分与两个操作方向） */
@@ -1225,11 +1233,86 @@ public class TravelOrchestrator {
         }
     }
 
+    /** 已勾选项的店名/景点名（用量留痕用，截断防超长） */
+    private String selectedNamesSuffix(TravelState state, String candidateType, List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return "";
+        }
+        Map<Long, String> names = new LinkedHashMap<>();
+        switch (candidateType == null ? "" : candidateType.toUpperCase()) {
+            case "ATTRACTION" -> {
+                if (state.getAttractionPool() != null) {
+                    for (AttractionCandidate c : state.getAttractionPool()) {
+                        names.put(c.getAttractionId(), c.getName());
+                    }
+                }
+            }
+            case "FOOD" -> {
+                if (state.getFoodPool() != null) {
+                    for (FoodCandidate g : state.getFoodPool()) {
+                        for (FoodCandidate.FoodItem it : g.getRestaurants()) {
+                            names.put(it.getRestaurantId(), it.getName());
+                        }
+                    }
+                }
+            }
+            case "HOTEL" -> {
+                if (state.getHotelPool() != null) {
+                    for (HotelCandidate h : state.getHotelPool()) {
+                        names.put(h.getHotelId(), h.getName());
+                    }
+                }
+            }
+            default -> {
+            }
+        }
+        String joined = ids.stream()
+                .map(id -> names.getOrDefault(id, "ID" + id))
+                .collect(java.util.stream.Collectors.joining("、"));
+        return "：" + UsageService.clip(joined, 400);
+    }
+
+    /** 已勾选但未安排进行程的景点提示（受硬约束限制被少排时明确告知，不静默遗漏） */
+    private String missingSelectedNote(TravelState state) {
+        ItineraryPlan plan = state.getPlan();
+        if (plan == null || state.getSelectedAttractionIds() == null
+                || state.getSelectedAttractionIds().isEmpty()) {
+            return "";
+        }
+        Set<Long> planned = new LinkedHashSet<>();
+        for (DailyPlan d : plan.getDays()) {
+            if (d.getNodes() == null) {
+                continue;
+            }
+            for (PlanNode n : d.getNodes()) {
+                if ("attraction".equals(n.getType()) && n.getPlaceId() != null) {
+                    planned.add(n.getPlaceId());
+                }
+            }
+        }
+        List<Long> missing = state.getSelectedAttractionIds().stream()
+                .filter(id -> !planned.contains(id)).toList();
+        if (missing.isEmpty()) {
+            return "";
+        }
+        Map<Long, String> nameById = new LinkedHashMap<>();
+        if (state.getAttractionPool() != null) {
+            for (AttractionCandidate c : state.getAttractionPool()) {
+                nameById.put(c.getAttractionId(), c.getName());
+            }
+        }
+        String names = missing.stream()
+                .map(id -> nameById.getOrDefault(id, "景点#" + id))
+                .collect(java.util.stream.Collectors.joining("、"));
+        return "\n\n⚠️ 提示：你勾选的「" + names + "」未安排进行程"
+                + "（受开放时间/劳累度上限限制）。可返回调整或重新生成。";
+    }
+
     /** 同步生成行程（幂等：已生成则直接返回） */
     public ChatStepResult generateItinerary(AuthenticatedUser actor, String sessionId) {
         TravelState state = sessionService.loadOwned(sessionId, actor.id());
         if (state.getPlan() != null) {
-            return buildResult(state, "行程已生成：", null);
+            return buildResult(state, "行程已生成：" + missingSelectedNote(state), null);
         }
         if (state.getStage() != TravelStage.ITINERARY) {
             throw new BizException(ResultCode.PARAM_ERROR);
@@ -1251,7 +1334,7 @@ public class TravelOrchestrator {
         }
         state.setStage(TravelStage.DONE);
         sessionService.save(state);
-        return buildResult(state, "行程已生成！以下是为您规划的行程：", null);
+        return buildResult(state, "行程已生成！以下是为您规划的行程：" + missingSelectedNote(state), null);
     }
 
     /**

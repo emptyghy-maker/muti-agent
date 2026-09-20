@@ -1101,6 +1101,8 @@ public class ItineraryService {
         }
         if (Boolean.TRUE.equals(state.getNoAttractionNeeded())) {
             sb.append("- 用户不需要景点：不要安排 attraction 节点；行程以餐饮（和酒店）为主。\n");
+        } else if (state.getSelectedAttractionIds() != null && !state.getSelectedAttractionIds().isEmpty()) {
+            sb.append("- 用户已确认的景点必须全部安排进行程（缺一不可）；只有受硬约束（开放时间、劳累度上限）确实无法安排时才能少排，且必须在当天的 theme 或相应 note 中写明原因，不得静默遗漏。\n");
         }
         if (Boolean.TRUE.equals(state.getNoFoodNeeded())) {
             sb.append("- 用户不需要美食推荐：不要安排 restaurant 节点，用餐由用户自行解决、不产生餐费。\n");
@@ -1122,7 +1124,9 @@ public class ItineraryService {
         }
         if (state.getAdjustContext() != null && !state.getAdjustContext().isBlank()) {
             sb.append("\n\n【用户调整诉求与原行程】\n").append(state.getAdjustContext())
-                    .append("\n请在原行程基础上做局部调整（其余天数保持不变或仅微调），并同样遵守以上规则。");
+                    .append("\n请在原行程基础上做局部调整（其余天数保持不变或仅微调），并同样遵守以上规则。")
+                    .append("如果调整诉求改变的是时间窗口（如返程时间推迟或提前），必须综合重排当天的节点时间与停留时长：")
+                    .append("把多出的时间合理分配给各节点（延长停留、更从容的用餐），并优先补回此前未安排的已选景点；不要只改动一个节点。");
         }
         return sb.toString();
     }
