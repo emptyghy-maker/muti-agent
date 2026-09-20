@@ -55,6 +55,12 @@ class PromptExperimentTest {
             attr(38L, "十全街", "打卡拍照", 1, 2.0, 0, 7.0, ""),
             attr(24L, "平江路历史街区", "打卡拍照", 2, 3.0, 0, 6.5, ""));
 
+    /** A3 用例：两个夜景标签景点 + 问卷截止时间（夜景系数最高=26 金鸡湖景区 3+2+1） */
+    private static final List<Map<String, Object>> ATTRACTIONS_NIGHT = List.of(
+            attr(43L, "金鸡湖月光码头", "打卡拍照", 1, 1.5, 0, 8.0, "夜景,湖景,情侣,氛围"),
+            attr(26L, "金鸡湖景区", "打卡拍照", 1, 3.0, 0, 9.0, "夜景,音乐喷泉,摩天轮"),
+            attr(38L, "十全街", "打卡拍照", 1, 2.0, 0, 7.0, ""));
+
     private static final List<Map<String, Object>> RESTAURANTS = List.of(
             food(17L, "黄天源糕团(观前街店)", "本地菜", 6.0),
             food(22L, "蜀大侠火锅(观前店)", "火锅", 5.5));
@@ -166,6 +172,10 @@ class PromptExperimentTest {
                 runCase("A2", arm, bundleHash, r, stub, mainModel, sqlModel,
                         itinerary, itineraryUser("A2", rules("A2")), runs);
             }
+            if (onlyCase.equals("ALL") || onlyCase.equals("A3")) {
+                runCase("A3", arm, bundleHash, r, stub, mainModel, sqlModel,
+                        itinerary, itineraryUser("A3", rules("A3")), runs);
+            }
             if (onlyCase.equals("ALL") || onlyCase.equals("B")) {
                 runCase("B", arm, bundleHash, r, stub, candModel, flashModel,
                         common + "\n\n" + food, foodUser(), runs);
@@ -234,7 +244,7 @@ class PromptExperimentTest {
         p.setAttractionType("打卡拍照");
         p.setEnergyLevel("中等");
         String pref = JSON.writeValueAsString(p);
-        String attr = JSON.writeValueAsString(ATTRACTIONS);
+        String attr = JSON.writeValueAsString("A3".equals(caseId) ? ATTRACTIONS_NIGHT : ATTRACTIONS);
         String food = JSON.writeValueAsString(RESTAURANTS);
         String hotel = JSON.writeValueAsString(List.of());
         return "用户偏好：" + pref
@@ -267,6 +277,13 @@ class PromptExperimentTest {
         sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐），各至多 1 个、不得多排；车程中不安排用餐；同一餐厅一天最多出现 1 次（午餐用过的店不能再当晚餐）。\n");
         sb.append("- 带「夜景」标签的景点安排在 18:30 之后（晚餐后最佳），不得排到白天；确需白天安排时必须在 note 写明理由。\n");
         sb.append("- 晚餐结束后仍可安排 1-2 个夜景/娱乐节点（酒吧、夜市、夜游等）；返程 transport 必须是当天最后一个节点，时间为最后活动结束后。\n");
+        if ("A3".equals(caseId)) {
+            sb.append("- 每晚 22:00 前回到家：当天最后一个活动必须在 22:00 前结束，返程 transport 时间不得晚于 22:00。\n");
+        }
+        sb.append("- 景点时段分配：上午1个、下午1个、晚上1个\n");
+        sb.append("- 夜景时段只安排 1 个夜景景点：「")
+                .append("A3".equals(caseId) ? "金鸡湖景区" : "金鸡湖月光码头")
+                .append("」（夜景系数最高）；其余夜景标签景点白天安排或在 note 说明原因。\n");
         sb.append("- 高强度景点与低强度景点错开安排；如某天安排较满，可插入 1 个 rest 节点（候选休息点：）。\n");
         sb.append("- 全程预算约 3000 元，2 人：餐费按人均价×人数计算，餐饮+门票+交通合计不得超过预算；超预算时优先选择人均价更低的餐厅。");
         if ("A2".equals(caseId)) {
@@ -347,7 +364,10 @@ class PromptExperimentTest {
         int lunchCount = 0;
         int dinnerCount = 0;
         String nightTime = null;
+        long nightSpotId = "A3".equals(caseId) ? 26L : 43L;
         String lastTime = "";
+        int nightCount = 0;
+        List<String> allTimes = new ArrayList<>();
         if (oneDay && days.get(0).path("nodes").isArray()) {
             JsonNode nodes = days.get(0).path("nodes");
             for (int i = 0; i < nodes.size(); i++) {
@@ -355,6 +375,9 @@ class PromptExperimentTest {
                 String type = n.path("type").asText("");
                 String time = n.path("time").asText("");
                 String note = n.path("note").asText("");
+                if (!time.isEmpty()) {
+                    allTimes.add(time);
+                }
                 if (i == 0 && "transport".equals(type)) {
                     firstTransport = true;
                 }
@@ -365,8 +388,12 @@ class PromptExperimentTest {
                 if ("attraction".equals(type) && n.path("placeId").isNumber()) {
                     long pid = n.path("placeId").asLong();
                     attractionIds.add(pid);
-                    if (pid == 43L) {
+                    if (pid == nightSpotId) {
                         nightTime = time;
+                    }
+                    // A3：43/26 都带夜景标签，统计排到 18:30 后的数量（只看 1 个 → ≤1）
+                    if ((pid == 43L || pid == 26L) && time.compareTo("18:30") >= 0) {
+                        nightCount++;
                     }
                 }
                 if ("restaurant".equals(type)) {
@@ -384,13 +411,26 @@ class PromptExperimentTest {
         c.put("oneDay", oneDay);
         c.put("firstTransport", firstTransport);
         c.put("lastTransport", lastTransport);
-        c.put("allThreeAttractions", attractionIds.containsAll(List.of(43L, 38L, 24L)));
+        c.put("allThreeAttractions", attractionIds.containsAll("A3".equals(caseId)
+                ? List.of(43L, 26L, 38L) : List.of(43L, 38L, 24L)));
         c.put("lunchPresent", lunch);
         c.put("dinnerPresent", dinner);
         c.put("lunchCount", lunchCount);
         c.put("dinnerCount", dinnerCount);
-        // 夜景标签景点（43）若被安排，必须在 18:30 之后；未安排时为 null（不作判定）
-        c.put("nightTimingOk", nightTime == null ? null : nightTime.compareTo("18:30") >= 0);
+        if ("A3".equals(caseId)) {
+            // 只看 1 个夜景：夜晚（18:30 后）恰有 1 个夜景标签景点
+            c.put("nightTimingOk", nightCount == 1);
+            c.put("nightInEvening", nightCount >= 1);
+        } else {
+            // 指定夜景主角（43 月光码头）若被安排，必须在 18:30 之后；未安排时为 null（不作判定）
+            c.put("nightTimingOk", nightTime == null ? null : nightTime.compareTo("18:30") >= 0);
+        }
+        // 时间越界（26:30 类事故）：所有节点 time 必须小于 24:00
+        c.put("noTimePast2400", allTimes.stream().allMatch(t -> t.compareTo("24:00") < 0));
+        if ("A3".equals(caseId)) {
+            c.put("returnAtMost2200", lastTime.compareTo("22:00") <= 0);
+            c.put("nightCountOk", nightCount <= 1);
+        }
         if ("A2".equals(caseId)) {
             c.put("returnAtLeast2130", lastTime.compareTo("21:30") >= 0);
         }
@@ -401,7 +441,7 @@ class PromptExperimentTest {
         if ("B".equals(caseId)) {
             return "{\"items\":[{\"restaurantId\":1},{\"restaurantId\":2}],\"advice\":\"园区店有限，建议扩大范围\"}";
         }
-        String lastTime = "A2".equals(caseId) ? "21:30" : "20:00";
+        String lastTime = "A2".equals(caseId) ? "21:30" : "A3".equals(caseId) ? "22:00" : "20:00";
         return "{\"days\":[{\"dayIndex\":1,\"theme\":\"园区浪漫打卡\",\"nodes\":["
                 + "{\"type\":\"transport\",\"time\":\"09:00\",\"note\":\"抵达苏州\"},"
                 + "{\"type\":\"attraction\",\"placeId\":43,\"time\":\"09:30\",\"note\":\"湖畔打卡\"},"

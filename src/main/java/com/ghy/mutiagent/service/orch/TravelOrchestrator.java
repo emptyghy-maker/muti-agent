@@ -19,6 +19,8 @@ import com.ghy.mutiagent.model.ItineraryDetail;
 import com.ghy.mutiagent.model.ItineraryPlan;
 import com.ghy.mutiagent.model.LockedSelection;
 import com.ghy.mutiagent.model.PlanNode;
+import com.ghy.mutiagent.model.PlanQuiz;
+import com.ghy.mutiagent.model.PlanQuizRequest;
 import com.ghy.mutiagent.model.PreferenceResult;
 import com.ghy.mutiagent.model.Question;
 import com.ghy.mutiagent.model.ResumeView;
@@ -32,6 +34,7 @@ import com.ghy.mutiagent.repository.entity.Destination;
 import com.ghy.mutiagent.repository.mapper.DestinationMapper;
 import com.ghy.mutiagent.rule.DefaultsResolver;
 import com.ghy.mutiagent.rule.AhpWeightCalculator;
+import com.ghy.mutiagent.rule.NightScorer;
 import com.ghy.mutiagent.rule.PreferenceUpdater;
 import com.ghy.mutiagent.rule.RequirementApplier;
 import com.ghy.mutiagent.rule.RequirementMerger;
@@ -69,11 +72,13 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * 旅行规划编排器（状态机）：阶段 B 实现 PREFERENCE（偏好问询），后续阶段扩展候选与行程。
@@ -99,6 +104,9 @@ public class TravelOrchestrator {
 
     /** 同步生成中标记租约（与操作预算 deadline 180s 对齐）：到期未清除视为生成已失效 */
     private static final long GENERATING_LEASE_MS = 180_000L;
+
+    /** 问卷时间格式（HH:mm） */
+    private static final String TIME_PATTERN = "^([01]?\\d|2[0-3]):[0-5]\\d$";
 
     /** 候选阶段口语「翻页」触发词：直接换一批，不调 AI */
     private static final List<String> NO_MORE_WORDS = List.of(
@@ -802,6 +810,20 @@ public class TravelOrchestrator {
         parsed.setUnresolvedText(stripResidualScaffolding(parsed.getUnresolvedText()));
         // 字段级需求（含 noHotel/noFood 跳过标记）并入快照与字段备注
         applyFieldNeeds(state, parsed, fieldNeeds, null, null);
+        if (state.getStage() == TravelStage.PLAN_QUIZ) {
+            // 问卷阶段自由文本答题：能解析的问卷字段即时生效，答完自动生成
+            if (!parsed.getUpdates().isEmpty()) {
+                PreferenceUpdater.apply(state, parsed.getUpdates());
+            }
+            if (quizResolved(state)) {
+                state.setPlanQuizAnswered(true);
+                return finishWithItinerary(state, "已收到你的安排偏好，正在生成行程：");
+            }
+            sessionService.save(state);
+            ChatStepResult quizReply = buildResult(state, "好的，已记录「" + message + "」。请继续回答下面的问题：", null);
+            quizReply.setPlanQuiz(buildPlanQuiz(state));
+            return quizReply;
+        }
         boolean paging = parsed.getIntents().contains("PAGING")
                 || NO_MORE_WORDS.stream().anyMatch(message::contains);
         boolean hasCondition = !parsed.getConstraints().isEmpty() || !parsed.getUpdates().isEmpty()
@@ -1112,14 +1134,9 @@ public class TravelOrchestrator {
                         return blocked;
                     }
                     state.setSelectedHotelIds(new ArrayList<>(ordered));
-                    state.setStage(TravelStage.ITINERARY);
                     obsUserConfirmed(null, state, actor, "HOTEL", ordered.size(), 0);
-                    itineraryService.generate(state);
-                    state.setStage(TravelStage.DONE);
-                    sessionService.save(state);
-                    return buildResult(state, "已确认酒店！ItineraryAgent 已结合你的偏好、劳累度和饭点要求，"
-                            + "为你编排好" + (state.getPreference().getDays() == null ? "" : state.getPreference().getDays() + " 天")
-                            + "行程（含预计消费），点击地点可查看具体路径：", null);
+                    // 生成前问卷闸门与跳过路径共用 finishWithItineraryCore（未作答先返回 PLAN_QUIZ 问卷）
+                    return finishWithItineraryCore(state, "已确认酒店！");
                 } finally {
                     if (registry != null) {
                         registry.end(state.getSessionId());
@@ -1133,6 +1150,10 @@ public class TravelOrchestrator {
     /** S07：有序去重（未知地点已由 validateSelected 拒绝，不因用户传入自动成为可信锁定项） */
     private List<Long> orderedDistinct(List<Long> ids) {
         return new ArrayList<>(new LinkedHashSet<>(ids));
+    }
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
     }
 
     /** 跳过酒店/美食环节后直接生成行程（与确认酒店同路径：同步生成 + 生成中守卫） */
@@ -1160,6 +1181,15 @@ public class TravelOrchestrator {
 
     /** 生成行程 + 待确认分支 + 推进 DONE（不含生成租约；调用方负责占用与失败审计） */
     private ChatStepResult finishWithItineraryCore(TravelState state, String ack) {
+        if (!Boolean.TRUE.equals(state.getPlanQuizAnswered())) {
+            // 生成前问卷闸门：酒店确认与所有跳过路径统一先过问卷，未作答则进入 PLAN_QUIZ 阶段
+            state.setStage(TravelStage.PLAN_QUIZ);
+            sessionService.save(state);
+            ChatStepResult r = buildResult(state, ack
+                    + "\n\n在生成行程前，请你确认几个安排细节（选择或直接输入即可）：", null);
+            r.setPlanQuiz(buildPlanQuiz(state));
+            return r;
+        }
         state.setStage(TravelStage.ITINERARY);
         itineraryService.generate(state);
         if (Boolean.TRUE.equals(state.getPendingFatigueConfirm())) {
@@ -1182,6 +1212,89 @@ public class TravelOrchestrator {
         sessionService.save(state);
         return buildResult(state, ack + "\n\n行程已生成（含预计消费），点击地点可查看具体路径："
                 + missingSelectedNote(state), null);
+    }
+
+    /** 问卷问题集合：按会话状态判定（跳过景点→不问倾向/夜景；无夜景景点→不问夜景数量） */
+    private PlanQuiz buildPlanQuiz(TravelState state) {
+        boolean attractionsSkipped = Boolean.TRUE.equals(state.getNoAttractionNeeded())
+                || state.getSelectedAttractionIds().isEmpty();
+        List<AttractionCandidate> pool = state.getAttractionPool() == null ? List.of()
+                : state.getAttractionPool();
+        Map<Long, AttractionCandidate> byId = pool.stream().collect(Collectors.toMap(
+                AttractionCandidate::getAttractionId, c -> c, (a, b) -> a));
+        List<AttractionCandidate> nightSelected = state.getSelectedAttractionIds().stream()
+                .map(byId::get).filter(Objects::nonNull)
+                .filter(c -> NightScorer.isNight(c.getTags()))
+                .toList();
+        AttractionCandidate top = nightSelected.stream()
+                .max(Comparator.comparingInt(c -> NightScorer.score(c.getTags()))).orElse(null);
+
+        PlanQuiz quiz = new PlanQuiz();
+        quiz.setHotelSelected(!state.getSelectedHotelIds().isEmpty());
+        quiz.setHasNight(!nightSelected.isEmpty());
+        quiz.setAskActivityBias(!attractionsSkipped);
+        quiz.setAskNightPlan(!attractionsSkipped && !nightSelected.isEmpty());
+        quiz.setTopNightName(top == null ? null : top.getName());
+        return quiz;
+    }
+
+    /** 问卷是否已答完（所有按当前会话需要问的问题都有答案） */
+    private boolean quizResolved(TravelState state) {
+        PlanQuiz quiz = buildPlanQuiz(state);
+        TravelPreference p = state.getPreference();
+        if (p == null || p.getWakeTime() == null || p.getWakeTime().isBlank()
+                || p.getReturnDeadline() == null || p.getReturnDeadline().isBlank()) {
+            return false;
+        }
+        if (quiz.isAskActivityBias() && (p.getActivityBias() == null || p.getActivityBias().isBlank())) {
+            return false;
+        }
+        if (quiz.isAskNightPlan() && (p.getNightPlan() == null || p.getNightPlan().isBlank())) {
+            return false;
+        }
+        return true;
+    }
+
+    /** 问卷提交：校验合法值 → 写入偏好 → 复用生成链路（含疲劳/预算待确认分支） */
+    public ChatStepResult submitPlanQuiz(AuthenticatedUser actor, PlanQuizRequest req) {
+        TravelState state = sessionService.loadOwned(req.getSessionId(), actor.id());
+        requireStage(state, TravelStage.PLAN_QUIZ);
+        PlanQuiz quiz = buildPlanQuiz(state);
+        TravelPreference p = state.getPreference();
+        if (p == null) {
+            throw new BizException(ResultCode.STATE_CONFLICT);
+        }
+        String wake = blankToNull(req.getWakeTime());
+        String deadline = blankToNull(req.getReturnDeadline());
+        if (wake == null || !wake.matches(TIME_PATTERN) || wake.compareTo("05:00") < 0 || wake.compareTo("12:00") > 0) {
+            throw new BizException(ResultCode.PARAM_ERROR.getCode(), "起床时间需在 05:00-12:00 之间（HH:mm）");
+        }
+        if (deadline == null || (!"UNLIMITED".equals(deadline)
+                && (!deadline.matches(TIME_PATTERN) || deadline.compareTo("17:00") < 0 || deadline.compareTo("24:00") > 0))) {
+            throw new BizException(ResultCode.PARAM_ERROR.getCode(), "回家/回酒店时间需在 17:00-24:00 之间（HH:mm）或 UNLIMITED");
+        }
+        p.setWakeTime(wake);
+        p.markConfirmed("wakeTime");
+        p.setReturnDeadline(deadline);
+        p.markConfirmed("returnDeadline");
+        if (quiz.isAskActivityBias()) {
+            String bias = blankToNull(req.getActivityBias());
+            if (bias == null || !Set.of("MORNING", "BALANCED", "EVENING").contains(bias)) {
+                throw new BizException(ResultCode.PARAM_ERROR.getCode(), "活动倾向取值非法");
+            }
+            p.setActivityBias(bias);
+            p.markConfirmed("activityBias");
+        }
+        if (quiz.isAskNightPlan()) {
+            String night = blankToNull(req.getNightPlan());
+            if (night == null || !Set.of("ONE", "ALL").contains(night)) {
+                throw new BizException(ResultCode.PARAM_ERROR.getCode(), "夜景数量取值非法");
+            }
+            p.setNightPlan(night);
+            p.markConfirmed("nightPlan");
+        }
+        state.setPlanQuizAnswered(true);
+        return finishWithItinerary(state, "已收到你的安排偏好，正在生成行程：");
     }
 
     /** B：疲劳超载待确认的提示文案（含最满一天的疲劳分与两个操作方向） */
@@ -1304,8 +1417,9 @@ public class TravelOrchestrator {
         String names = missing.stream()
                 .map(id -> nameById.getOrDefault(id, "景点#" + id))
                 .collect(java.util.stream.Collectors.joining("、"));
-        return "\n\n⚠️ 提示：你勾选的「" + names + "」未安排进行程"
-                + "（受开放时间/劳累度上限限制）。可返回调整或重新生成。";
+        return "\n\n⚠️ 提示：你勾选的「" + names + "」未能排进行程"
+                + "（当天时间装不下：截止时间/开放时间受限）。可以直接说「把XX也安排进去」或「回家时间放宽到XX点」让我重排，"
+                + "我会调整顺序尽量全部保留。";
     }
 
     /** 同步生成行程（幂等：已生成则直接返回） */

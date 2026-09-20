@@ -49,11 +49,23 @@ public final class ScheduleBuilder {
     public static List<String> schedule(DailyPlan day, Map<PlaceKey, double[]> coords,
                                         Map<Long, Attraction> attById,
                                         com.ghy.mutiagent.service.route.RouteFactSnapshot facts) {
+        return schedule(day, coords, attById, facts, DAY_START_MIN);
+    }
+
+    /**
+     * S10：facts 快照非空时，相邻节点时长取共享路线事实（排程/详情/计费同源，同一 factId）；
+     * 为空时按 RouteFactEstimator 同口径确定性估算（行为与既有规则完全一致）。
+     * startMin：当天首个节点时间（问卷起床时间，默认 09:00）。
+     */
+    public static List<String> schedule(DailyPlan day, Map<PlaceKey, double[]> coords,
+                                        Map<Long, Attraction> attById,
+                                        com.ghy.mutiagent.service.route.RouteFactSnapshot facts,
+                                        int startMin) {
         List<String> warnings = new ArrayList<>();
         if (day == null || day.getNodes() == null || day.getNodes().isEmpty()) {
             return warnings;
         }
-        int cursor = DAY_START_MIN;
+        int cursor = startMin;
         double[] prevCoord = null;
         PlaceKey prevKey = null;
         List<PlanNode> nodes = day.getNodes();

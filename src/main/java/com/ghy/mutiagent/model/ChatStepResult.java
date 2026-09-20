@@ -47,4 +47,6 @@ public class ChatStepResult {
     private Boolean pendingBudgetConfirm;
     /** 预算超支待确认的超支金额（展示文案用） */
     private java.math.BigDecimal pendingBudgetOver;
+    /** 行程偏好问卷（PLAN_QUIZ 阶段；为 null 表示本步不涉及问卷） */
+    private PlanQuiz planQuiz;
 }

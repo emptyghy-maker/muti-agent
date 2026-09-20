@@ -46,6 +46,8 @@ public final class ItineraryValidator {
     public static final String HARD_CONSTRAINT_VIOLATED = "HARD_CONSTRAINT_VIOLATED";
     public static final String HARD_FATIGUE_EXCEEDED = "HARD_FATIGUE_EXCEEDED";
     public static final String STRUCTURE_INVALID = "STRUCTURE_INVALID";
+    /** 问卷选择「只看 1 个夜景」时，同一天 18:30 后出现 ≥2 个夜景标签景点 */
+    public static final String NIGHT_COUNT_EXCEEDED = "NIGHT_COUNT_EXCEEDED";
 
     /** 每日活动结束默认上限：22:00（用户夜间活动需求或夜景景点日放宽到 24:00，见 timelineChecks 调用处） */
     private static final int DAY_END_MIN = 22 * 60;
@@ -92,10 +94,24 @@ public final class ItineraryValidator {
         // 「不要 restaurant 节点」硬约束冲突，形成无法收敛的缺餐死锁
         boolean noFoodActive = activeHard(snapshot, "noFood");
         boolean nightActive = nightRequested(preference, snapshot);
+        int deadlineMin = deadlineMinutes(preference);
+        boolean nightCountCapped = preference != null && "ONE".equals(preference.getNightPlan());
         for (DailyPlan d : plan.getDays()) {
-            // 日终上限：默认 22:00；用户要求夜间活动、或当天确已安排 18:30 后的夜景标签景点时放宽到 24:00
-            int dayEndMin = (nightActive || hasNightNode(d, attById)) ? DAY_MINUTES : DAY_END_MIN;
+            // 日终上限优先级：问卷 deadline > 夜间活动放宽（24:00）> 默认 22:00
+            int dayEndMin;
+            if (deadlineMin > 0) {
+                dayEndMin = deadlineMin;
+            } else {
+                dayEndMin = (nightActive || hasNightNode(d, attById)) ? DAY_MINUTES : DAY_END_MIN;
+            }
             timelineChecks(d, openTimes, dayEndMin, violations, located);
+            if (nightCountCapped) {
+                List<String> nightRefs = nightAttractionRefs(d, attById);
+                if (nightRefs.size() > 1) {
+                    violations.add(NIGHT_COUNT_EXCEEDED);
+                    nightRefs.forEach(ref -> locate(located, NIGHT_COUNT_EXCEEDED, ref));
+                }
+            }
             if (!noFoodActive) {
                 List<String> missing = new ArrayList<>(MealTimeChecker.missingWindows(d.getNodes()));
                 // 返程早于晚餐窗口结束（19:30）的当天不强制晚餐——与注入侧跳过口径一致，
@@ -138,6 +154,41 @@ public final class ItineraryValidator {
         }
         return snapshot.getConstraints().stream().anyMatch(c ->
                 key.equals(c.getKey()) && "HARD".equals(c.getHardness()) && "ACTIVE".equals(c.getStatus()));
+    }
+
+    /** 问卷回家/回酒店截止时间（分钟）；未设置或 UNLIMITED 返回 0（走默认日终逻辑） */
+    public static int deadlineMinutes(TravelPreference preference) {
+        String s = preference == null ? null : preference.getReturnDeadline();
+        if (s == null || s.isBlank() || "UNLIMITED".equals(s)) {
+            return 0;
+        }
+        try {
+            String[] p = s.split(":");
+            return Integer.parseInt(p[0]) * 60 + Integer.parseInt(p[1]);
+        } catch (RuntimeException e) {
+            return 0;
+        }
+    }
+
+    /** 当天 18:30 后安排的夜景标签景点节点引用（夜景数量上限判定与修复定位用） */
+    private static List<String> nightAttractionRefs(DailyPlan d, Map<Long, Attraction> attById) {
+        if (d.getNodes() == null) {
+            return List.of();
+        }
+        List<String> refs = PlanNodeRef.refs(d.getNodes(), d.getDayIndex());
+        List<String> out = new ArrayList<>();
+        for (int i = 0; i < d.getNodes().size(); i++) {
+            PlanNode n = d.getNodes().get(i);
+            if (!"attraction".equals(n.getType()) || n.getPlaceId() == null
+                    || n.getTime() == null || n.getTime().compareTo("18:30") < 0) {
+                continue;
+            }
+            Attraction a = attById == null ? null : attById.get(n.getPlaceId());
+            if (a != null && a.getTags() != null && a.getTags().contains("夜景")) {
+                out.add(refs.get(i));
+            }
+        }
+        return out;
     }
 
     /** 用户是否明确要求夜间活动：需求快照 NIGHT_VIEW 兴趣，或偏好原文命中夜间关键词 */

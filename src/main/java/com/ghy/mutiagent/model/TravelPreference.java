@@ -32,6 +32,14 @@ public class TravelPreference {
     private String specialRequests;
     /** 餐次结构（用户明确提出才设置；null=按默认配置处理） */
     private MealPlan mealPlan;
+    /** 行程偏好问卷：每天起床出发时间（HH:mm，如 09:00）；null=默认 09:00 */
+    private String wakeTime;
+    /** 行程偏好问卷：每晚回酒店/回家截止时间（HH:mm，如 22:00；UNLIMITED=不限） */
+    private String returnDeadline;
+    /** 行程偏好问卷：活动安排倾向 MORNING=上午型 / BALANCED=均衡 / EVENING=下午晚上型 */
+    private String activityBias;
+    /** 行程偏好问卷：夜景策略 ONE=只看夜景系数最高 1 个 / ALL=都要；null=按默认 ONE */
+    private String nightPlan;
     /** 字段级特殊需求备注（如 hotelStyle→「近+便宜」、foodTaste→「人均50以内」），
      *  与总体 specialRequests 分开存储：最后仍会单独询问总体特殊要求 */
     private Map<String, String> fieldNotes = new LinkedHashMap<>();

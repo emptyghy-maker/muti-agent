@@ -155,6 +155,9 @@ public class RulePreferenceParser {
         // 8. 餐次结构（顿数/早饭午饭晚饭/小吃取舍；明确表达才生效，未命中照旧进残余）
         extractMealPlan(m, r, spans);
 
+        // 8.5 行程偏好问卷字段（起床/回家回酒店时间/活动倾向/夜景数量；命中即消费原文区间）
+        extractQuizAnswers(m, r, spans);
+
         // 9. 未消费残余：只去掉标点空白；有语义残余就保留，不丢弃
         String left = remainder(m, spans);
         if (!left.isBlank()) {
@@ -220,6 +223,61 @@ public class RulePreferenceParser {
         c.setSource("USER");
         c.setOriginalText(text);
         return c;
+    }
+
+    // ==================== 行程偏好问卷字段抽取（PLAN_QUIZ 聊天兜底） ====================
+
+    private void extractQuizAnswers(String m, RuleParseResult r, List<int[]> spans) {
+        // 起床时间：「9点起床」「8点半起来」「09:00 起床」
+        Matcher wake = Pattern.compile("([01]?\\d|2[0-3])[:：点时](半|([0-5]?\\d))?分?\\s*(?:就|要|想|打算)?(?:起来|起床)")
+                .matcher(m);
+        if (wake.find()) {
+            String mm = wake.group(2);
+            int min = "半".equals(mm) ? 30
+                    : (mm == null || mm.isEmpty() ? 0 : Integer.parseInt(mm));
+            String hm = toHm(Integer.parseInt(wake.group(1)), min);
+            if (hm.compareTo("05:00") >= 0 && hm.compareTo("12:00") <= 0) {
+                r.getUpdates().putIfAbsent("wakeTime", hm);
+                addSpan(spans, wake);
+            }
+        }
+        // 回家/回酒店截止：「10点前回家」「22:30 回酒店」「晚上11点回去」
+        Matcher deadline = Pattern.compile("([01]?\\d|2[0-3])[:：点时](半|([0-5]?\\d))?分?\\s*(?:之前|以前|前|以内)?"
+                        + "\\s*(?:回(?:到)?(?:酒店|家|去)?|到(?:酒店|家)|返程)")
+                .matcher(m);
+        if (deadline.find()) {
+            int hour = Integer.parseInt(deadline.group(1));
+            if (hour < 12 && !m.matches(".*(凌晨|早晨|早上).*")) {
+                hour += 12; // 「10点回家」口语即晚上 22:00
+            }
+            String mm = deadline.group(2);
+            int min = "半".equals(mm) ? 30
+                    : (mm == null || mm.isEmpty() ? 0 : Integer.parseInt(mm));
+            String hm = toHm(hour, min);
+            if (hm.compareTo("17:00") >= 0 && hm.compareTo("24:00") <= 0) {
+                r.getUpdates().putIfAbsent("returnDeadline", hm);
+                addSpan(spans, deadline);
+            }
+        }
+        // 活动倾向
+        if (m.contains("上午为主") || m.contains("上午多") || m.contains("早点出发") || m.contains("早起")) {
+            r.getUpdates().putIfAbsent("activityBias", "MORNING");
+        } else if (m.contains("下午晚上") || m.contains("晚上为主") || m.contains("晚点出发")
+                || m.contains("不想早起") || m.contains("睡个懒觉")) {
+            r.getUpdates().putIfAbsent("activityBias", "EVENING");
+        } else if (m.contains("均衡") || m.contains("正常安排")) {
+            r.getUpdates().putIfAbsent("activityBias", "BALANCED");
+        }
+        // 夜景数量：「夜景都要」→ ALL；「只看1个夜景/夜景只要一个」→ ONE
+        if (m.contains("夜景都要") || m.contains("都要夜景") || m.contains("所有夜景") || m.contains("全部夜景")) {
+            r.getUpdates().putIfAbsent("nightPlan", "ALL");
+        } else if (m.contains("只看一个夜景") || m.contains("只要一个夜景") || m.contains("一个夜景就够")) {
+            r.getUpdates().putIfAbsent("nightPlan", "ONE");
+        }
+    }
+
+    private static String toHm(int hour, int min) {
+        return String.format("%02d:%02d", Math.min(23, hour), Math.min(59, min));
     }
 
     // ==================== 餐次结构抽取 ====================

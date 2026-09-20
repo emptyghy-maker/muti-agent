@@ -106,6 +106,8 @@ public class TravelState {
     private Boolean noHotelNeeded;
     /** 用户明确不需要景点：跳过景点挑选环节，行程不安排 attraction 节点 */
     private Boolean noAttractionNeeded;
+    /** 行程偏好问卷已作答（PLAN_QUIZ 阶段后置 true，同一会话不再重复提问） */
+    private Boolean planQuizAnswered;
     /** 需求关键字（确定性规则 + RequirementAgent 输出合并）：候选匹配加权用 */
     private List<String> needTags;
     /** AHP 评分权重快照（path/cost/sightseeing/food），需求分析后计算，各阶段评分共用 */

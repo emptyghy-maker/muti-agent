@@ -120,4 +120,18 @@ class ScheduleBuilderTest {
         assertThat(d.getNodes().get(2).getTime()).isGreaterThan("13:30");
         assertThat(warnings).anySatisfy(w -> assertThat(w).contains("午餐"));
     }
+
+    /** 问卷起床时间：startMin 决定当天首个节点时间（默认 09:00，可参数化） */
+    @Test
+    void 起床时间参数化首节点() {
+        DailyPlan d = dayOf(List.of(
+                node("transport", null, null),
+                node("attraction", 2L, null)));
+        Map<PlaceKey, double[]> coords = Map.of();
+        Map<Long, Attraction> attById = Map.of(2L, attraction(2L, 1.0));
+
+        ScheduleBuilder.schedule(d, coords, attById, null, 10 * 60);
+
+        assertThat(d.getNodes().get(0).getTime()).isEqualTo("10:00");
+    }
 }

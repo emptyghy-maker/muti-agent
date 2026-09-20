@@ -16,6 +16,7 @@ import com.ghy.mutiagent.model.GenerateOpRequest;
 import com.ghy.mutiagent.model.HistoryItem;
 import com.ghy.mutiagent.model.ItineraryDetail;
 import com.ghy.mutiagent.model.ItinerarySummary;
+import com.ghy.mutiagent.model.PlanQuizRequest;
 import com.ghy.mutiagent.model.ResumeView;
 import com.ghy.mutiagent.model.RouteResult;
 import com.ghy.mutiagent.repository.entity.Destination;
@@ -270,6 +271,15 @@ public class TravelController {
         requireWritable();
         return Result.ok(orchestrator.confirmFatigue(requireActor(), sessionId,
                 Boolean.TRUE.equals(request.getConfirm())));
+    }
+
+    /** 行程偏好问卷提交（PLAN_QUIZ 阶段）：回答起床/回家时间/活动倾向/夜景数量后生成行程 */
+    @PostMapping("/session/{sessionId}/quiz-answer")
+    public Result<ChatStepResult> submitPlanQuiz(@PathVariable("sessionId") String sessionId,
+                                                 @RequestBody PlanQuizRequest request) {
+        requireWritable();
+        request.setSessionId(sessionId);
+        return Result.ok(orchestrator.submitPlanQuiz(requireActor(), request));
     }
 
     /** 预算超支知情放行裁决（confirm=true 超支自付发布 / false 返回美食调整） */

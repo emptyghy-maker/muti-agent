@@ -178,6 +178,35 @@ public final class PreferenceUpdater {
                         p.markConfirmed("mealPlan");
                     }
                 }
+                case "wakeTime" -> {
+                    // 问卷起床时间：HH:mm，05:00-12:00（聊天兜底解析已归一）
+                    if (value.matches("^([01]?\\d|2[0-3]):[0-5]\\d$")
+                            && value.compareTo("05:00") >= 0 && value.compareTo("12:00") <= 0) {
+                        p.setWakeTime(value);
+                        p.markConfirmed("wakeTime");
+                    }
+                }
+                case "returnDeadline" -> {
+                    // 问卷回家/回酒店截止：HH:mm（17:00-24:00）或 UNLIMITED
+                    if ("UNLIMITED".equalsIgnoreCase(value)
+                            || (value.matches("^([01]?\\d|2[0-3]):[0-5]\\d$")
+                            && value.compareTo("17:00") >= 0 && value.compareTo("24:00") <= 0)) {
+                        p.setReturnDeadline("UNLIMITED".equalsIgnoreCase(value) ? "UNLIMITED" : value);
+                        p.markConfirmed("returnDeadline");
+                    }
+                }
+                case "activityBias" -> {
+                    if ("MORNING".equals(value) || "BALANCED".equals(value) || "EVENING".equals(value)) {
+                        p.setActivityBias(value);
+                        p.markConfirmed("activityBias");
+                    }
+                }
+                case "nightPlan" -> {
+                    if ("ONE".equals(value) || "ALL".equals(value)) {
+                        p.setNightPlan(value);
+                        p.markConfirmed("nightPlan");
+                    }
+                }
                 default -> log.debug("[TravelAgent] 忽略未知偏好字段: {}", field);
             }
             state.getAskedFields().add(field);

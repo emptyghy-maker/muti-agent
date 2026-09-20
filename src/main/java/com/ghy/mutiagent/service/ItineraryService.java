@@ -40,6 +40,7 @@ import com.ghy.mutiagent.rule.BudgetCalculator;
 import com.ghy.mutiagent.rule.FatigueScorer;
 import com.ghy.mutiagent.rule.ItineraryTextRenderer;
 import com.ghy.mutiagent.rule.MealTimeChecker;
+import com.ghy.mutiagent.rule.NightScorer;
 import com.ghy.mutiagent.rule.PlaceIndex;
 import com.ghy.mutiagent.rule.PlaceKeyResolver;
 import com.ghy.mutiagent.rule.PlanNodeRef;
@@ -190,7 +191,7 @@ public class ItineraryService {
                     .map(h -> Map.of("id", h.getId(), "name", h.getName(), "price", h.getPricePerNight(),
                             "score", scoreById.getOrDefault(PlaceKey.of(PlaceType.HOTEL, h.getId()), 0.0)))
                     .toList());
-            String rules = buildRules(state, restSpots);
+            String rules = buildRules(state, restSpots, attractions);
 
             Integer prefDays = state.getPreference().getDays();
             if (repairEngine == null) {
@@ -399,14 +400,16 @@ public class ItineraryService {
                         state.getSessionId(), fatigueScore);
                 return evidence;
             }
-            if (codes.contains(ItineraryValidator.BUDGET_EXCEEDED)) {
+            if (codes.contains(ItineraryValidator.BUDGET_EXCEEDED) && repairableViolations.isEmpty()) {
                 // 预算超限走确定性换店修复（修复约束禁止引入新地点，模型对预算违规无杠杆）
                 if (budgetSwap(draft, restaurants, state.getPreference())) {
                     log.info("[Itinerary][sessionId={}] 预算超限：已用更便宜的已选餐厅确定性替换，进入下一轮重验",
                             state.getSessionId());
                     continue;
                 }
-                // 已选餐厅内无法压到预算内：留存草稿进入待确认（知情放行/返回调整），不进模型修复
+                // 已选餐厅内无法压到预算内：留存草稿进入待确认（知情放行/返回调整），不进模型修复。
+                // 前提：预算超支必须是当前唯一违规——若同时存在时间越界等其他违规（如排过 24:00），
+                // 不能带病停车（用户确认后直接发布，会绕过修复），必须继续走下面的修复/终止逻辑
                 BigDecimal over = budgetOverAmount(draft);
                 state.setPendingPlan(draft);
                 state.setPendingBudgetConfirm(true);
@@ -1090,7 +1093,7 @@ public class ItineraryService {
                 .toList();
     }
 
-    private String buildRules(TravelState state, List<Attraction> restSpots) {
+    private String buildRules(TravelState state, List<Attraction> restSpots, List<Attraction> attractions) {
         int days = state.getPreference().getDays() == null ? 3 : state.getPreference().getDays();
         String restNames = restSpots.stream().map(Attraction::getName).collect(Collectors.joining("、"));
         StringBuilder sb = new StringBuilder();
@@ -1112,7 +1115,36 @@ public class ItineraryService {
         }
         sb.append("- 带「夜景」标签的景点安排在 18:30 之后（晚餐后最佳），不得排到白天；确需白天安排时必须在 note 写明理由。\n");
         sb.append("- 晚餐结束后仍可安排 1-2 个夜景/娱乐节点（酒吧、夜市、夜游等）；返程 transport 必须是当天最后一个节点，时间为最后活动结束后。\n");
-        boolean nightRequested = ItineraryValidator.nightRequested(state.getPreference(), state.getRequirementSnapshot());
+        TravelPreference pref = state.getPreference();
+        String wake = pref == null ? null : pref.getWakeTime();
+        if (wake != null && !wake.isBlank()) {
+            sb.append("- 每天 ").append(wake).append(" 起床出发：首节点（抵达/首个景点）时间不早于 ")
+                    .append(wake).append("。\n");
+        }
+        String deadline = pref == null ? null : pref.getReturnDeadline();
+        if (deadline != null && !"UNLIMITED".equals(deadline)) {
+            sb.append("- 每晚 ").append(deadline).append(" 前回到")
+                    .append(state.getSelectedHotelIds().isEmpty() ? "家" : "酒店")
+                    .append("：当天最后一个活动必须在 ").append(deadline)
+                    .append(" 前结束，返程 transport 时间不得晚于 ").append(deadline).append("。\n");
+        }
+        if (!attractions.isEmpty()) {
+            sb.append("- 景点时段分配：").append(allocationTemplate(pref, attractions.size())).append("\n");
+            List<Attraction> nights = attractions.stream()
+                    .filter(a -> NightScorer.isNight(a.getTags())).toList();
+            if (!nights.isEmpty()) {
+                Attraction top = nights.stream()
+                        .max(Comparator.comparingInt(a -> NightScorer.score(a.getTags())))
+                        .orElse(nights.get(0));
+                if ("ALL".equals(pref == null ? null : pref.getNightPlan())) {
+                    sb.append("- 夜景标签景点可都安排在晚上，但必须在返程截止时间前结束。\n");
+                } else {
+                    sb.append("- 夜景时段只安排 1 个夜景景点：「").append(top.getName())
+                            .append("」（夜景系数最高）；其余夜景标签景点白天安排或在 note 说明原因。\n");
+                }
+            }
+        }
+        boolean nightRequested = ItineraryValidator.nightRequested(pref, state.getRequirementSnapshot());
         if (nightRequested) {
             sb.append("- 用户要求夜间活动：当天行程可延伸至 23:00 以后，返程时间以最后活动结束为准。\n");
         }
@@ -1139,6 +1171,33 @@ public class ItineraryService {
                     .append("\n请在原行程基础上做局部调整（其余天数保持不变或仅微调），并同样遵守以上规则。")
                     .append("如果调整诉求改变的是时间窗口（如返程时间推迟或提前），必须综合重排当天的节点时间与停留时长：")
                     .append("把多出的时间合理分配给各节点（延长停留、更从容的用餐），并优先补回此前未安排的已选景点；不要只改动一个节点。");
+        }
+        return sb.toString();
+    }
+
+    /** 景点时段分配模板：按已选景点数与活动倾向给出「上午/下午/晚上」分配建议（每行规则文本） */
+    private String allocationTemplate(TravelPreference pref, int count) {
+        String bias = pref == null ? null : pref.getActivityBias();
+        String morning = "MORNING".equals(bias) ? "上午型偏好：上午尽量多排" : "";
+        String evening = "EVENING".equals(bias) ? "下午晚上型偏好：晚上尽量多排" : "";
+        String pattern;
+        switch (count) {
+            case 1 -> pattern = "1 个景点安排在白天（若是夜景景点则安排晚上）";
+            case 2 -> pattern = "MORNING".equals(bias) ? "上午2个"
+                    : "EVENING".equals(bias) ? "下午1个、晚上1个" : "上午1个、下午1个";
+            case 3 -> pattern = "MORNING".equals(bias) ? "上午2个、下午1个"
+                    : "EVENING".equals(bias) ? "下午1个、晚上2个" : "上午1个、下午1个、晚上1个";
+            case 4 -> pattern = "MORNING".equals(bias) ? "上午2个、下午1个、晚上1个"
+                    : "EVENING".equals(bias) ? "上午1个、下午1个、晚上2个" : "上午1个、下午2个、晚上1个";
+            default -> pattern = "MORNING".equals(bias) ? "每天上午2个、下午1个、晚上1个，多余景点安排到后续天"
+                    : "EVENING".equals(bias) ? "每天上午1个、下午1个、晚上2个，多余景点安排到后续天"
+                    : "每天上午1个、下午2个、晚上1个，多余景点安排到后续天";
+        }
+        StringBuilder sb = new StringBuilder(pattern);
+        if (!morning.isEmpty()) {
+            sb.append("（").append(morning).append("）");
+        } else if (!evening.isEmpty()) {
+            sb.append("（").append(evening).append("）");
         }
         return sb.toString();
     }
@@ -1224,9 +1283,11 @@ public class ItineraryService {
             PlanNode lastBefore = d.getNodes().isEmpty() ? null : d.getNodes().get(d.getNodes().size() - 1);
             String returnAnchor = lastBefore != null && "transport".equals(lastBefore.getType())
                     ? lastBefore.getTime() : null;
-            ScheduleBuilder.schedule(d, coords, attById, facts)
+            ScheduleBuilder.schedule(d, coords, attById, facts, wakeStartMin(state.getPreference()))
                     .forEach(w -> log.warn("[Itinerary] 第{}天时间告警：{}", d.getDayIndex(), w));
-            int maxAnchorMin = ItineraryValidator.nightRequested(state.getPreference(), state.getRequirementSnapshot())
+            int deadlineMin = ItineraryValidator.deadlineMinutes(state.getPreference());
+            int maxAnchorMin = deadlineMin > 0 ? deadlineMin
+                    : ItineraryValidator.nightRequested(state.getPreference(), state.getRequirementSnapshot())
                     ? 24 * 60 : 22 * 60;
             anchorReturnTime(d, returnAnchor, maxAnchorMin);
             List<String> missing = MealTimeChecker.missingWindows(d.getNodes());
@@ -1316,6 +1377,21 @@ public class ItineraryService {
                     n.setNodeId(PlanNodeRef.ref(d.getDayIndex(), type, ordinal));
                 }
             }
+        }
+    }
+
+    /** 当天首个节点时间（分钟）：问卷起床时间，缺省 09:00，钳制在 05:00-12:00 */
+    private static int wakeStartMin(TravelPreference pref) {
+        String w = pref == null ? null : pref.getWakeTime();
+        if (w == null || w.isBlank()) {
+            return 9 * 60;
+        }
+        try {
+            String[] p = w.split(":");
+            int m = Integer.parseInt(p[0]) * 60 + Integer.parseInt(p[1]);
+            return Math.max(5 * 60, Math.min(12 * 60, m));
+        } catch (RuntimeException e) {
+            return 9 * 60;
         }
     }
 
@@ -1616,6 +1692,33 @@ public class ItineraryService {
         ItineraryPlan draft = state.getPendingPlan();
         if (draft == null) {
             throw new BizException(ResultCode.STATE_CONFLICT);
+        }
+        // 发布前复验（26:30 事故根修）：待确认草稿可能带病（如排过 24:00 的时间越界），
+        // 用户确认不得绕过发布检查。已由用户明确知情的两项违规（预算超支/疲劳超载）除外。
+        List<Attraction> attractions = state.getSelectedAttractionIds().isEmpty() ? List.of()
+                : attractionMapper.selectBatchIds(state.getSelectedAttractionIds());
+        List<Restaurant> restaurants = state.getSelectedFoodIds().isEmpty() ? List.of()
+                : restaurantMapper.selectBatchIds(state.getSelectedFoodIds());
+        List<Hotel> hotels = state.getSelectedHotelIds().isEmpty() ? List.of()
+                : hotelMapper.selectBatchIds(state.getSelectedHotelIds());
+        List<Attraction> restSpots = loadRestSpots(state);
+        Map<PlaceKey, double[]> coords = PlaceIndex.coords(attractions, restaurants, hotels, restSpots);
+        com.ghy.mutiagent.service.route.RouteFactSnapshot facts = routeFactService == null ? null
+                : new com.ghy.mutiagent.service.route.RouteFactSnapshot(routeFactService,
+                        java.time.LocalDate.now().toString(), state.getConstraintRevision());
+        int expectedDays = state.getPreference().getDays() == null
+                ? draft.getDays().size() : state.getPreference().getDays();
+        List<String> codes = validateWhole(state, draft, expectedDays, attractions, restaurants,
+                hotels, restSpots, coords, facts).stream()
+                .map(ItineraryRepairEngine.RepairViolation::code)
+                .filter(c -> !ItineraryValidator.BUDGET_EXCEEDED.equals(c)
+                        && !ItineraryValidator.HARD_FATIGUE_EXCEEDED.equals(c))
+                .toList();
+        if (!codes.isEmpty()) {
+            log.warn("[Itinerary][sessionId={}] 待确认草稿复验未通过：{}（拒绝发布）",
+                    state.getSessionId(), codes);
+            throw new BizException(ResultCode.PLAN_INVALID.getCode(),
+                    "行程草稿未通过发布检查：" + String.join("；", codes) + "，请返回调整后重试");
         }
         state.setPlan(draft);
         state.setItineraryText(ItineraryTextRenderer.render(draft));

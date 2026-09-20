@@ -19,6 +19,7 @@ const STEPS = [
   { key: 'ATTRACTIONS', label: '选择景点' },
   { key: 'FOODS', label: '选择美食' },
   { key: 'HOTELS', label: '选择酒店' },
+  { key: 'PLAN_QUIZ', label: '行程偏好' },
   { key: 'DONE', label: '生成行程' }
 ]
 
@@ -53,6 +54,17 @@ const fatigueScore = ref(null)
 // 预算超支知情放行（快照 pendingBudgetConfirm 驱动放行卡片）
 const pendingBudget = ref(false)
 const budgetOver = ref(null)
+// 行程偏好问卷（PLAN_QUIZ 阶段，服务端判定问题集合）
+const planQuiz = ref(null)
+const quizWake = ref('09:00')
+const quizDeadline = ref('22:00')
+const quizBias = ref('BALANCED')
+const quizNight = ref('ONE')
+const quizCustomWake = ref('')
+const quizCustomDeadline = ref('')
+const quizSubmitting = ref(false)
+const WAKES = ['07:00', '08:00', '09:00', '10:00']
+const DEADLINES = ['20:00', '21:00', '22:00', '23:00']
 
 // 新消息到达后自动滚动到对话底部
 watch(() => chatHistory.value.length, async () => {
@@ -75,13 +87,14 @@ function scoreTitle(c) {
   return base
 }
 
-const showInput = computed(() => stage.value === 'PREFERENCE' || !!candidateType.value || isDone.value)
+const showInput = computed(() => stage.value === 'PREFERENCE' || !!candidateType.value || stage.value === 'PLAN_QUIZ' || isDone.value)
 
 const inputPlaceholder = computed(() => {
   if (stage.value === 'PREFERENCE') return '可以直接输入想法，如：3天，预算3000元，2个人'
   if (candidateType.value === 'ATTRACTION') return '比如：想找能看夜景的景点，不要太累'
   if (candidateType.value === 'FOOD') return '比如：人均50以内，想吃面食；想要情侣氛围的餐厅'
   if (candidateType.value === 'HOTEL') return '比如：离地铁站近一点、安静一些'
+  if (stage.value === 'PLAN_QUIZ') return '也可以直接打字回答，如：9点起床，晚上10点前回家'
   if (isDone.value) return '对行程不满意？直接说：第二天太赶，删一个景点'
   return '说说你的想法'
 })
@@ -184,6 +197,11 @@ function applyStep(s) {
   if (s.pendingBudgetConfirm !== undefined) {
     pendingBudget.value = !!s.pendingBudgetConfirm
     budgetOver.value = s.pendingBudgetOver ?? null
+  }
+  // 行程偏好问卷：PLAN_QUIZ 阶段携带，其余阶段清空；夜景默认只看 1 个
+  planQuiz.value = s.planQuiz || null
+  if (planQuiz.value) {
+    quizNight.value = 'ONE'
   }
 }
 
@@ -481,6 +499,32 @@ async function confirmBudget(confirm) {
   }
 }
 
+/** 行程偏好问卷提交：回答后服务端直接生成行程（返回阶段 ITINERARY 则轮询） */
+async function submitQuiz() {
+  const q = planQuiz.value
+  if (!q) return
+  quizSubmitting.value = true
+  error.value = ''
+  const wake = quizWake.value === '自定义' ? quizCustomWake.value.trim() : quizWake.value
+  const deadline = quizDeadline.value === '自定义' ? quizCustomDeadline.value.trim()
+    : (quizDeadline.value === '不限' ? 'UNLIMITED' : quizDeadline.value)
+  try {
+    const resp = await api.post('/travel/session/' + sessionId.value + '/quiz-answer', {
+      sessionId: sessionId.value,
+      wakeTime: wake,
+      returnDeadline: deadline,
+      activityBias: q.askActivityBias ? quizBias.value : null,
+      nightPlan: q.askNightPlan ? quizNight.value : null
+    })
+    applyStep(resp)
+    if (resp.stage === 'ITINERARY') await pollGenerationUntilDone()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    quizSubmitting.value = false
+  }
+}
+
 async function regenerateItinerary() {
   loading.value = true
   error.value = ''
@@ -647,6 +691,55 @@ function openRoute(payload) {
           确认选择（{{ selectedIds.length }}）
         </button>
         <button class="btn ghost" :disabled="loading" @click="confirmSelection(true)">换一批（秒出）</button>
+      </div>
+    </div>
+
+    <!-- 行程偏好问卷（生成前：起床/回家时间/活动倾向/夜景数量，按服务端判定问题集合渲染） -->
+    <div class="card" v-if="stage === 'PLAN_QUIZ' && planQuiz">
+      <h3>生成前的几个小问题</h3>
+      <p class="tip">为了把行程排得更合你心意，请确认以下安排（也可以直接打字回答，如「9点起床，晚上10点前回家」）：</p>
+
+      <div class="quiz-q">
+        <div class="quiz-label">早上几点起床出发？</div>
+        <div class="quiz-opts">
+          <button v-for="w in [...WAKES, '自定义']" :key="w" class="chip"
+                  :class="{ on: quizWake === w }" @click="quizWake = w">{{ w }}</button>
+        </div>
+        <input v-if="quizWake === '自定义'" v-model="quizCustomWake" class="quiz-input"
+               placeholder="如 08:30（05:00-12:00）" />
+      </div>
+
+      <div class="quiz-q">
+        <div class="quiz-label">每晚几点前回到{{ planQuiz.hotelSelected ? '酒店' : '家' }}？
+          <span v-if="planQuiz.hasNight">（夜景会安排在此前）</span></div>
+        <div class="quiz-opts">
+          <button v-for="d in [...DEADLINES, '不限', '自定义']" :key="d" class="chip"
+                  :class="{ on: quizDeadline === d }" @click="quizDeadline = d">{{ d }}</button>
+        </div>
+        <input v-if="quizDeadline === '自定义'" v-model="quizCustomDeadline" class="quiz-input"
+               placeholder="如 21:30（17:00-24:00）" />
+      </div>
+
+      <div class="quiz-q" v-if="planQuiz.askActivityBias">
+        <div class="quiz-label">活动安排倾向？</div>
+        <div class="quiz-opts">
+          <button class="chip" :class="{ on: quizBias === 'MORNING' }" @click="quizBias = 'MORNING'">上午型（早起多玩）</button>
+          <button class="chip" :class="{ on: quizBias === 'BALANCED' }" @click="quizBias = 'BALANCED'">均衡（上午下午晚上各半）</button>
+          <button class="chip" :class="{ on: quizBias === 'EVENING' }" @click="quizBias = 'EVENING'">下午晚上型（不赶早）</button>
+        </div>
+      </div>
+
+      <div class="quiz-q" v-if="planQuiz.askNightPlan">
+        <div class="quiz-label">夜景景点怎么安排？</div>
+        <div class="quiz-opts">
+          <button class="chip" :class="{ on: quizNight === 'ONE' }" @click="quizNight = 'ONE'">
+            只看 1 个{{ planQuiz.topNightName ? '（' + planQuiz.topNightName + ' 夜景系数最高）' : '' }}</button>
+          <button class="chip" :class="{ on: quizNight === 'ALL' }" @click="quizNight = 'ALL'">都要</button>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button class="btn" :disabled="quizSubmitting" @click="submitQuiz">提交并生成行程</button>
       </div>
     </div>
 

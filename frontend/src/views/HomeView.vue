@@ -12,6 +12,7 @@ const STAGE_LABEL = {
   ATTRACTIONS: '选择景点',
   FOODS: '选择美食',
   HOTELS: '选择酒店',
+  PLAN_QUIZ: '行程偏好',
   ITINERARY: '生成行程中',
   CONFLICT: '待确认冲突',
   ADJUST: '调整行程中'

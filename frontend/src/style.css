@@ -257,3 +257,10 @@ h3 { font-size: 15px; margin: 0 0 8px; }
 .resume-card h3 { color: #0958d9; }
 .resume-card .intro { font-size: 13px; color: #444; min-height: auto; margin-bottom: 4px; }
 .resume-meta { color: #888; font-size: 12px; margin-bottom: 10px; }
+
+/* 行程偏好问卷（PLAN_QUIZ） */
+.quiz-q { margin: 14px 0; }
+.quiz-label { font-size: 13px; color: #333; margin-bottom: 6px; font-weight: 600; }
+.quiz-label span { color: #999; font-weight: 400; }
+.quiz-opts { display: flex; flex-wrap: wrap; gap: 8px; }
+.quiz-input { width: 220px; padding: 6px 10px; border: 1px solid #d9d9d9; border-radius: 6px; font-size: 13px; margin-top: 6px; }

@@ -141,4 +141,25 @@ class RulePreferenceParserTest {
                 "lunchPerDay", "dinnerPerDay", "breakfastPerDay", "snacksAllowed");
         assertThat(r.getUnresolvedText()).contains("火锅");
     }
+
+    @Test
+    void 问卷起床时间解析() {
+        assertThat(parser.parse("9点起床", null)).containsEntry("wakeTime", "09:00");
+        assertThat(parser.parse("8点半起来", null)).containsEntry("wakeTime", "08:30");
+    }
+
+    @Test
+    void 问卷回家截止时间解析() {
+        // 口语「10点回家」= 晚上 22:00
+        assertThat(parser.parse("晚上10点前回家", null)).containsEntry("returnDeadline", "22:00");
+        assertThat(parser.parse("21:30 回酒店", null)).containsEntry("returnDeadline", "21:30");
+    }
+
+    @Test
+    void 问卷活动倾向与夜景数量解析() {
+        assertThat(parser.parse("想早点出发", null)).containsEntry("activityBias", "MORNING");
+        assertThat(parser.parse("晚上为主", null)).containsEntry("activityBias", "EVENING");
+        assertThat(parser.parse("夜景都要", null)).containsEntry("nightPlan", "ALL");
+        assertThat(parser.parse("只看一个夜景", null)).containsEntry("nightPlan", "ONE");
+    }
 }

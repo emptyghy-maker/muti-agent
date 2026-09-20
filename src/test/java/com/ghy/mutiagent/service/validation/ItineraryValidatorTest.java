@@ -138,6 +138,65 @@ class ItineraryValidatorTest {
     }
 
     @Test
+    void 问卷截止时间优先于夜景放宽() {
+        // 有夜景节点（可放宽到 24:00），但问卷截止 22:00：22:30 结束仍违规
+        TravelPreference p = pref();
+        p.setReturnDeadline("22:00");
+        Attraction night = attraction("休闲");
+        night.setTags("夜景,湖景");
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan3(day(1, node("attraction", 1L, "20:00", 90),
+                        node("attraction", 2L, "22:30", 60))),
+                p, null, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, night, 2L, attraction("休闲")), false);
+        assertThat(r.violations()).contains(ItineraryValidator.DAY_END_EXCEEDED);
+    }
+
+    @Test
+    void 问卷截止时间内不违规() {
+        TravelPreference p = pref();
+        p.setReturnDeadline("23:00");
+        Attraction night = attraction("休闲");
+        night.setTags("夜景,湖景");
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan3(day(1, node("attraction", 1L, "20:00", 90),
+                        node("attraction", 2L, "22:00", 60))),
+                p, null, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, night, 2L, attraction("休闲")), false);
+        assertThat(r.violations()).doesNotContain(ItineraryValidator.DAY_END_EXCEEDED);
+    }
+
+    @Test
+    void 只看一个夜景时多个夜景节点违规() {
+        TravelPreference p = pref();
+        p.setNightPlan("ONE");
+        Attraction a = attraction("休闲");
+        a.setTags("夜景,湖景");
+        Attraction b = attraction("休闲");
+        b.setTags("夜景,音乐喷泉");
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan3(day(1, node("attraction", 1L, "20:00", 60),
+                        node("attraction", 2L, "21:30", 60))),
+                p, null, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, a, 2L, b), false);
+        assertThat(r.violations()).contains(ItineraryValidator.NIGHT_COUNT_EXCEEDED);
+    }
+
+    @Test
+    void 只看一个夜景时单个夜景节点不违规() {
+        TravelPreference p = pref();
+        p.setNightPlan("ONE");
+        Attraction a = attraction("休闲");
+        a.setTags("夜景,湖景");
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan3(day(1, node("attraction", 1L, "20:00", 60),
+                        node("attraction", 2L, "14:00", 60))),
+                p, null, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, a, 2L, attraction("休闲")), false);
+        assertThat(r.violations()).doesNotContain(ItineraryValidator.NIGHT_COUNT_EXCEEDED);
+    }
+
+    @Test
     void 返程后仍有活动不发布() {
         ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
                 plan3(day(1, node("hotel", 1L, "09:00", 0), node("transport", null, "18:00", 0),
