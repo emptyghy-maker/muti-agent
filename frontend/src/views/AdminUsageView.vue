@@ -82,6 +82,27 @@ const trend = ref([])
 const slowCalls = ref([])
 const slowSessionSec = ref(0)
 const slowCallSec = ref(60)
+const showResolvedSlow = ref(false)
+
+async function resolveSlow(r) {
+  const raw = window.prompt('解决说明（可留空）：', '')
+  if (raw === null) return
+  try {
+    await api.post('/usage/admin/slow/' + r.id + '/resolve?note=' + encodeURIComponent(raw), {})
+    await loadSlow()
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function reopenSlow(r) {
+  try {
+    await api.post('/usage/admin/slow/' + r.id + '/reopen', {})
+    await loadSlow()
+  } catch (e) {
+    error.value = e.message
+  }
+}
 
 // 大段内容弹窗
 const modal = ref(null)
@@ -152,7 +173,7 @@ async function loadSlow() {
   try {
     slowCalls.value = await api.get('/usage/admin/slow?sessionTotalSec=' + (slowSessionSec.value || 0)
       + '&callSec=' + (slowCallSec.value == null || slowCallSec.value === '' ? 0 : slowCallSec.value)
-      + '&limit=20')
+      + '&limit=20&showResolved=' + (showResolvedSlow.value || false))
   } catch (e) {
     error.value = e.message
   }
@@ -323,11 +344,14 @@ onMounted(async () => {
         <label class="tip">会话 AI 总耗时 ≥ <input v-model.number="slowSessionSec" type="number" min="0" style="width:80px" /> 秒</label>
         <label class="tip">单次调用 ≥ <input v-model.number="slowCallSec" type="number" min="0" style="width:80px" /> 秒</label>
         <button class="btn small" @click="loadSlow">查询</button>
-        <span class="tip">两个条件同时满足才展示；填 0 表示不过滤该维度。</span>
+        <label class="tip" style="margin-left:8px">
+          <input type="checkbox" v-model="showResolvedSlow" @change="loadSlow" /> 显示已解决
+        </label>
+        <span class="tip">两个条件同时满足才展示；填 0 表示不过滤该维度。处理完的慢调用点「标记已解决」后默认不再出现。</span>
       </div>
       <table class="tb" v-if="slowCalls.length">
         <thead>
-          <tr><th>时间</th><th>会话</th><th>阶段</th><th>动作</th><th>模型</th><th>耗时</th><th>状态</th><th>备注</th></tr>
+          <tr><th>时间</th><th>会话</th><th>阶段</th><th>动作</th><th>模型</th><th>耗时</th><th>状态</th><th>备注</th><th>操作</th></tr>
         </thead>
         <tbody>
           <tr v-for="r in slowCalls" :key="'sl' + r.id">
@@ -337,8 +361,18 @@ onMounted(async () => {
             <td>{{ r.action }}</td>
             <td>{{ r.model || '-' }}</td>
             <td>{{ fmtMs(r.durationMs) }}{{ timeHint(r.model, r.durationMs) }}</td>
-            <td><span class="badge" :class="r.status === 'SUCCESS' ? 'ok' : 'bad'">{{ r.status }}</span></td>
-            <td class="qa-cell">{{ r.remark || '-' }}</td>
+            <td>
+              <span class="badge" :class="r.status === 'SUCCESS' ? 'ok' : 'bad'">{{ r.status }}</span>
+              <span v-if="r.resolved" class="badge warn">已解决</span>
+            </td>
+            <td class="qa-cell">
+              {{ r.remark || '-' }}
+              <template v-if="r.resolved"> · 解决说明：{{ r.resolvedNote || '（无）' }}（{{ r.resolvedBy || '管理员' }}）</template>
+            </td>
+            <td>
+              <button v-if="!r.resolved" class="btn small" @click="resolveSlow(r)">标记已解决</button>
+              <button v-else class="btn small ghost" @click="reopenSlow(r)">恢复未解决</button>
+            </td>
           </tr>
         </tbody>
       </table>

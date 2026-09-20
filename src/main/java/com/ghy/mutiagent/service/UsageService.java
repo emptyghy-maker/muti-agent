@@ -12,8 +12,10 @@ import com.ghy.mutiagent.model.UsagePageResult;
 import com.ghy.mutiagent.model.UsageSummary;
 import com.ghy.mutiagent.model.UsageTrendPoint;
 import com.ghy.mutiagent.model.UsageUserSummary;
+import com.ghy.mutiagent.repository.entity.SlowResolved;
 import com.ghy.mutiagent.repository.entity.TravelSessionState;
 import com.ghy.mutiagent.repository.entity.UsageRecord;
+import com.ghy.mutiagent.repository.mapper.SlowResolvedMapper;
 import com.ghy.mutiagent.repository.mapper.TravelSessionStateMapper;
 import com.ghy.mutiagent.repository.mapper.UsageRecordMapper;
 import dev.langchain4j.model.output.TokenUsage;
@@ -69,6 +71,10 @@ public class UsageService {
     public UsageService(UsageRecordMapper usageRecordMapper, ModelPricing modelPricing) {
         this(usageRecordMapper, modelPricing, null, null);
     }
+
+    /** 慢调用已解决标记 Mapper（可空：手动装配的测试进程为 null 时降级为不过滤） */
+    @Autowired(required = false)
+    private SlowResolvedMapper slowResolvedMapper;
 
     // ==================== 记录 ====================
 
@@ -454,7 +460,7 @@ public class UsageService {
      * 慢调用排行：双阈值筛选——单次 Agent 调用 ≥ callSec 秒，且所属会话的 AI 调用总耗时 ≥ sessionTotalSec 秒
      * （两者为 0 时不过滤对应维度），按单次耗时倒序取前 N 条。
      */
-    public List<UsageRecord> slow(int sessionTotalSec, int callSec, int limit) {
+    public List<UsageRecord> slow(int sessionTotalSec, int callSec, int limit, boolean showResolved) {
         int lim = Math.max(1, Math.min(limit, 50));
         List<UsageRecord> rows = usageRecordMapper.selectList(new LambdaQueryWrapper<UsageRecord>()
                 .isNotNull(UsageRecord::getModel)
@@ -465,17 +471,76 @@ public class UsageService {
             String key = r.getSessionId() == null ? "（无会话）" : r.getSessionId();
             totalBySession.merge(key, r.getDurationMs() == null ? 0L : r.getDurationMs(), Long::sum);
         }
+        // 已解决标记：默认列表隐藏已解决；showResolved 时保留并回填操作人与说明
+        Map<Long, SlowResolved> resolvedById = resolvedMarks(rows);
         List<UsageRecord> out = rows.stream()
                 .filter(r -> callSec <= 0 || (r.getDurationMs() != null && r.getDurationMs() >= callSec * 1000L))
                 .filter(r -> sessionTotalSec <= 0 || totalBySession.getOrDefault(
                         r.getSessionId() == null ? "（无会话）" : r.getSessionId(), 0L)
                         >= sessionTotalSec * 1000L)
+                .filter(r -> showResolved || !resolvedById.containsKey(r.getId()))
                 .sorted(Comparator.comparing(UsageRecord::getDurationMs,
                         Comparator.nullsLast(Comparator.reverseOrder())))
                 .limit(lim)
                 .toList();
-        out.forEach(this::fillCost);
+        out.forEach(r -> {
+            this.fillCost(r);
+            SlowResolved mark = resolvedById.get(r.getId());
+            if (mark != null) {
+                r.setResolved(true);
+                r.setResolvedBy(mark.getResolvedBy());
+                r.setResolvedNote(mark.getNote());
+            }
+        });
         return out;
+    }
+
+    /** 已解决标记查询：只取列表内行的标记（空实现时返回空表，不过滤） */
+    private Map<Long, SlowResolved> resolvedMarks(List<UsageRecord> rows) {
+        if (slowResolvedMapper == null || rows.isEmpty()) {
+            return Map.of();
+        }
+        List<Long> ids = rows.stream().map(UsageRecord::getId).filter(java.util.Objects::nonNull).toList();
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
+        List<SlowResolved> marks = slowResolvedMapper.selectList(new LambdaQueryWrapper<SlowResolved>()
+                .in(SlowResolved::getUsageRecordId, ids));
+        Map<Long, SlowResolved> byId = new LinkedHashMap<>();
+        for (SlowResolved m : marks) {
+            byId.put(m.getUsageRecordId(), m);
+        }
+        return byId;
+    }
+
+    /** 标记慢调用为已解决（幂等：重复标记更新操作人与说明） */
+    public void resolveSlow(long usageRecordId, String resolvedBy, String note) {
+        if (slowResolvedMapper == null) {
+            return;
+        }
+        SlowResolved exist = slowResolvedMapper.selectOne(new LambdaQueryWrapper<SlowResolved>()
+                .eq(SlowResolved::getUsageRecordId, usageRecordId)
+                .last("LIMIT 1"));
+        if (exist != null) {
+            exist.setResolvedBy(resolvedBy);
+            exist.setNote(clip(note, 255));
+            slowResolvedMapper.updateById(exist);
+            return;
+        }
+        SlowResolved m = new SlowResolved();
+        m.setUsageRecordId(usageRecordId);
+        m.setResolvedBy(resolvedBy);
+        m.setNote(clip(note, 255));
+        slowResolvedMapper.insert(m);
+    }
+
+    /** 撤销已解决标记（恢复展示） */
+    public void reopenSlow(long usageRecordId) {
+        if (slowResolvedMapper == null) {
+            return;
+        }
+        slowResolvedMapper.delete(new LambdaQueryWrapper<SlowResolved>()
+                .eq(SlowResolved::getUsageRecordId, usageRecordId));
     }
 
     /** 失败告警：窗口内有 FAILED 记录的会话（按会话聚合失败次数与最近失败详情） */

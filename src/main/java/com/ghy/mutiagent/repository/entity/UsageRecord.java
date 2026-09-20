@@ -45,4 +45,11 @@ public class UsageRecord {
     /** 行级预估费用（查询时计算，不落库） */
     @TableField(exist = false)
     private BigDecimal cost;
+    /** 慢调用「已解决」标记（查询时关联 t_slow_resolved 回填，不落库） */
+    @TableField(exist = false)
+    private Boolean resolved;
+    @TableField(exist = false)
+    private String resolvedBy;
+    @TableField(exist = false)
+    private String resolvedNote;
 }

@@ -16,6 +16,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -108,13 +109,31 @@ public class UsageController {
         return Result.ok(usageService.trend(days));
     }
 
-    /** 慢调用排行（双阈值：单次调用 ≥ callSec 秒、会话总耗时 ≥ sessionTotalSec 秒，0 为不过滤） */
+    /** 慢调用排行（双阈值：单次调用 ≥ callSec 秒、会话总耗时 ≥ sessionTotalSec 秒，0 为不过滤；
+     *  showResolved=true 时展示已标记解决的调用并回填操作人/说明，默认只展示未解决） */
     @GetMapping("/admin/slow")
     public Result<List<UsageRecord>> adminSlow(
             @RequestParam(defaultValue = "0") int sessionTotalSec,
             @RequestParam(defaultValue = "60") int callSec,
-            @RequestParam(defaultValue = "20") int limit) {
-        return Result.ok(usageService.slow(sessionTotalSec, callSec, limit));
+            @RequestParam(defaultValue = "20") int limit,
+            @RequestParam(defaultValue = "false") boolean showResolved) {
+        return Result.ok(usageService.slow(sessionTotalSec, callSec, limit, showResolved));
+    }
+
+    /** 标记慢调用为已解决（可附解决说明；幂等） */
+    @PostMapping("/admin/slow/{recordId}/resolve")
+    public Result<Void> adminSlowResolve(@PathVariable("recordId") long recordId,
+                                         @RequestParam(defaultValue = "") String note) {
+        AuthenticatedUser u = currentUser();
+        usageService.resolveSlow(recordId, u == null ? null : u.username(), note);
+        return Result.ok(null);
+    }
+
+    /** 撤销已解决标记（恢复展示） */
+    @PostMapping("/admin/slow/{recordId}/reopen")
+    public Result<Void> adminSlowReopen(@PathVariable("recordId") long recordId) {
+        usageService.reopenSlow(recordId);
+        return Result.ok(null);
     }
 
     /** 失败告警（默认近 24 小时有失败记录的会话，前 10 条） */
