@@ -19,8 +19,9 @@ llm:
     default: ${QWEN_MODEL_DEFAULT:qwen3.8-flash}
     # 行程规划用高质量模型（AgentConfig 注释同口径）；qwen3.7-plus 免费额度耗尽后不再默认，可用环境变量覆盖
     sql: ${QWEN_MODEL_SQL:qwen3.8-max}
-  # 阶段2 联网检索（enable_search）：需支持联网搜索的模型；联网搜索可能消耗付费额度
-  search-model: ${QWEN_SEARCH_MODEL:qwen3.8-max}
+  # 阶段2 联网检索（enable_search）：qwen3.7-flash 已实测支持联网+关思考（约12s 返回），
+  # 原默认 qwen3.8-max 开启思考时实测稳定超时（90s 无产出）
+  search-model: ${QWEN_SEARCH_MODEL:qwen3.7-flash}
   search-timeout-ms: ${QWEN_SEARCH_TIMEOUT_MS:90000}
   # 模型计费单价（元/百万 token，输入/输出），用于用量审计台的费用估算
   pricing:

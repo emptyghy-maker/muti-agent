@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS t_web_food_audit (
   action VARCHAR(16) NOT NULL COMMENT 'ACCEPT=已校验入库 / REJECT=拒绝',
   reject_reason VARCHAR(255) NULL COMMENT '拒绝原因（校验码，逗号分隔）',
   raw_payload VARCHAR(500) NULL COMMENT '原始返回摘要（脱敏后）',
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '审计时间（毫秒精度）',
   KEY idx_session (session_id),
   KEY idx_dest (destination_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

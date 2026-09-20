@@ -6,6 +6,6 @@ CREATE TABLE IF NOT EXISTS t_slow_resolved (
   usage_record_id BIGINT NOT NULL COMMENT 't_usage_record.id（被标记的慢调用行）',
   resolved_by VARCHAR(64) NULL COMMENT '操作人',
   note VARCHAR(255) NULL COMMENT '解决说明',
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '标记时间（毫秒精度）',
   UNIQUE KEY uk_record (usage_record_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

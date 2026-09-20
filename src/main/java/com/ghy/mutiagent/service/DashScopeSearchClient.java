@@ -58,6 +58,9 @@ public class DashScopeSearchClient {
         // 扩充检索：一次尽可能多返回（提示词上限 20 条），token 预算相应放宽
         body.put("max_tokens", 4096);
         body.put("enable_search", true);
+        // O7 核实：max_tokens 不限制思考 token，开启思考时本调用实测稳定超时（90s 无产出）；
+        // 结构化抽取任务不需要慢思考，显式关闭（原始 API 实测 -64% 耗时）
+        body.put("enable_thinking", false);
         body.put("messages", List.of(
                 Map.of("role", "system", "content", systemPrompt),
                 Map.of("role", "user", "content", userPrompt)));
