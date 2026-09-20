@@ -28,7 +28,7 @@ import java.util.Optional;
  * - OPENING_HOURS_CONFLICT：已知开放时间无法覆盖整段游览；
  * - BUDGET_EXCEEDED：已知费用超过明确预算上限；
  * - MEAL_WINDOW_UNSATISFIABLE：有效时段内缺午餐/晚餐；
- * - DAY_END_EXCEEDED：每日活动结束超过 22:00 上限（含排过 24:00）；
+ * - DAY_END_EXCEEDED：每日活动结束超过日终上限（默认 22:00；用户要求夜间活动或当天含 18:30 后夜景标签景点时放宽到 24:00；排过 24:00 始终违规）；
  * - DEPARTURE_ORDER：返程 transport 之后仍有活动；
  * - HARD_CONSTRAINT_VIOLATED：明确硬限制被违反；
  * - HARD_FATIGUE_EXCEEDED：明确轻松限制下注入休息后仍超载；
@@ -47,7 +47,7 @@ public final class ItineraryValidator {
     public static final String HARD_FATIGUE_EXCEEDED = "HARD_FATIGUE_EXCEEDED";
     public static final String STRUCTURE_INVALID = "STRUCTURE_INVALID";
 
-    /** 每日活动结束上限：22:00 */
+    /** 每日活动结束默认上限：22:00（用户夜间活动需求或夜景景点日放宽到 24:00，见 timelineChecks 调用处） */
     private static final int DAY_END_MIN = 22 * 60;
     private static final int DAY_MINUTES = 24 * 60;
 
@@ -91,8 +91,11 @@ public final class ItineraryValidator {
         // 用户明确不需要美食（noFood 硬约束）：用餐由用户自行解决，不强制饭点窗口——否则与
         // 「不要 restaurant 节点」硬约束冲突，形成无法收敛的缺餐死锁
         boolean noFoodActive = activeHard(snapshot, "noFood");
+        boolean nightActive = nightRequested(preference, snapshot);
         for (DailyPlan d : plan.getDays()) {
-            timelineChecks(d, openTimes, violations, located);
+            // 日终上限：默认 22:00；用户要求夜间活动、或当天确已安排 18:30 后的夜景标签景点时放宽到 24:00
+            int dayEndMin = (nightActive || hasNightNode(d, attById)) ? DAY_MINUTES : DAY_END_MIN;
+            timelineChecks(d, openTimes, dayEndMin, violations, located);
             if (!noFoodActive) {
                 List<String> missing = new ArrayList<>(MealTimeChecker.missingWindows(d.getNodes()));
                 // 返程早于晚餐窗口结束（19:30）的当天不强制晚餐——与注入侧跳过口径一致，
@@ -137,8 +140,45 @@ public final class ItineraryValidator {
                 key.equals(c.getKey()) && "HARD".equals(c.getHardness()) && "ACTIVE".equals(c.getStatus()));
     }
 
+    /** 用户是否明确要求夜间活动：需求快照 NIGHT_VIEW 兴趣，或偏好原文命中夜间关键词 */
+    public static boolean nightRequested(TravelPreference preference, RequirementSnapshot snapshot) {
+        if (snapshot != null && snapshot.getConstraints() != null) {
+            boolean interestNight = snapshot.getConstraints().stream().anyMatch(c ->
+                    "interest".equals(c.getKey()) && "NIGHT_VIEW".equals(c.getValue())
+                            && "ACTIVE".equals(c.getStatus()));
+            if (interestNight) {
+                return true;
+            }
+        }
+        String text = preference == null ? null : preference.getSpecialRequests();
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        for (String kw : new String[]{"夜景", "夜游", "夜生活", "酒吧", "夜市", "夜宵", "夜场", "夜店"}) {
+            if (text.contains(kw)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 当天是否确有 18:30 之后安排的夜景标签景点（夜景体验时段，允许日终放宽的依据） */
+    private static boolean hasNightNode(DailyPlan d, Map<Long, Attraction> attById) {
+        if (d.getNodes() == null) {
+            return false;
+        }
+        return d.getNodes().stream().anyMatch(n -> {
+            if (!"attraction".equals(n.getType()) || n.getPlaceId() == null
+                    || n.getTime() == null || n.getTime().compareTo("18:30") < 0) {
+                return false;
+            }
+            Attraction a = attById == null ? null : attById.get(n.getPlaceId());
+            return a != null && a.getTags() != null && a.getTags().contains("夜景");
+        });
+    }
+
     /** 时间轴检查：重叠、跨夜、结束上限、返程顺序、开放时间 */
-    private static void timelineChecks(DailyPlan d, Map<PlaceKey, String> openTimes,
+    private static void timelineChecks(DailyPlan d, Map<PlaceKey, String> openTimes, int dayEndMin,
                                        List<String> violations, Map<String, List<String>> located) {
         List<PlanNode> nodes = d.getNodes();
         if (nodes == null || nodes.isEmpty()) {
@@ -160,7 +200,7 @@ public final class ItineraryValidator {
                 continue;
             }
             int end = arrival + dur;
-            if (end > DAY_END_MIN) {
+            if (end > dayEndMin) {
                 violations.add(DAY_END_EXCEEDED);
                 locate(located, DAY_END_EXCEEDED, ref);
             }

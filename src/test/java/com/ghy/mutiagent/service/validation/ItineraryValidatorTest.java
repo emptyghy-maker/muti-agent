@@ -72,6 +72,72 @@ class ItineraryValidatorTest {
     }
 
     @Test
+    void 夜景标签景点晚上安排不触发日终上限() {
+        Attraction night = attraction("休闲");
+        night.setTags("夜景,湖景,情侣");
+        TravelPreference p1 = pref();
+        p1.setDays(1);
+        ItineraryPlan plan = new ItineraryPlan();
+        plan.setDays(new ArrayList<>(List.of(day(1,
+                node("transport", null, "09:00", 0),
+                node("attraction", 1L, "09:30", 90),
+                node("restaurant", 10L, "12:00", 90),
+                node("attraction", 2L, "14:00", 120),
+                node("restaurant", 10L, "18:00", 90),
+                node("attraction", 1L, "20:00", 90),
+                node("transport", null, "22:30", 0)))));
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan, p1, null, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, night, 2L, attraction("休闲")), false);
+        assertThat(r.violations()).doesNotContain(ItineraryValidator.DAY_END_EXCEEDED);
+        assertThat(r.publishable()).isTrue();
+    }
+
+    @Test
+    void 夜间需求快照放宽日终上限() {
+        RequirementSnapshot snap = new RequirementSnapshot();
+        ConstraintEntry night = new ConstraintEntry();
+        night.setKey("interest");
+        night.setValue("NIGHT_VIEW");
+        night.setHardness("SOFT");
+        night.setStatus("ACTIVE");
+        snap.setConstraints(new ArrayList<>(List.of(night)));
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan3(day(1, node("transport", null, "09:00", 0),
+                        node("attraction", 1L, "23:00", 60),
+                        node("transport", null, "23:30", 0))),
+                pref(), snap, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, attraction("休闲")), false);
+        assertThat(r.violations()).doesNotContain(ItineraryValidator.DAY_END_EXCEEDED);
+    }
+
+    @Test
+    void 偏好原文含酒吧同样放宽日终上限() {
+        TravelPreference p = pref();
+        p.setSpecialRequests("晚上想去酒吧坐坐");
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan3(day(1, node("transport", null, "09:00", 0),
+                        node("attraction", 1L, "23:00", 60),
+                        node("transport", null, "23:30", 0))),
+                p, null, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, attraction("休闲")), false);
+        assertThat(r.violations()).doesNotContain(ItineraryValidator.DAY_END_EXCEEDED);
+    }
+
+    @Test
+    void 夜景标签景点排白天不触发放宽() {
+        Attraction night = attraction("休闲");
+        night.setTags("夜景,湖景");
+        // 夜景标签景点排在 14:00（白天）不构成夜间节点：晚场普通节点 23:00 结束仍超 22:00 上限
+        ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
+                plan3(day(1, node("attraction", 1L, "14:00", 60),
+                        node("attraction", 2L, "23:00", 60))),
+                pref(), null, new BigDecimal("5000"), BigDecimal.ZERO, Map.of(),
+                Map.of(1L, night, 2L, attraction("休闲")), false);
+        assertThat(r.violations()).contains(ItineraryValidator.DAY_END_EXCEEDED);
+    }
+
+    @Test
     void 返程后仍有活动不发布() {
         ItineraryValidator.ValidationResult r = ItineraryValidator.validate(
                 plan3(day(1, node("hotel", 1L, "09:00", 0), node("transport", null, "18:00", 0),

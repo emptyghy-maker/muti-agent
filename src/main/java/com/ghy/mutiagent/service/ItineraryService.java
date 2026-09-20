@@ -179,6 +179,7 @@ public class ItineraryService {
             String prefJson = objectMapper.writeValueAsString(state.getPreference());
             String attrJson = objectMapper.writeValueAsString(attractions.stream()
                     .map(a -> Map.of("id", a.getId(), "name", a.getName(), "category", a.getCategory(),
+                            "tags", a.getTags() == null ? "" : a.getTags(),
                             "intensity", a.getIntensity(), "hours", a.getSuggestHours(), "price", a.getTicketPrice(),
                             "score", scoreById.getOrDefault(PlaceKey.of(PlaceType.ATTRACTION, a.getId()), 0.0)))
                     .toList());            String foodJson = objectMapper.writeValueAsString(restaurants.stream()
@@ -1107,7 +1108,13 @@ public class ItineraryService {
         if (Boolean.TRUE.equals(state.getNoFoodNeeded())) {
             sb.append("- 用户不需要美食推荐：不要安排 restaurant 节点，用餐由用户自行解决、不产生餐费。\n");
         } else {
-            sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐）；车程中不安排用餐。\n");
+            sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐），各至多 1 个、不得多排；车程中不安排用餐；同一餐厅一天最多出现 1 次（午餐用过的店不能再当晚餐）。\n");
+        }
+        sb.append("- 带「夜景」标签的景点安排在 18:30 之后（晚餐后最佳），不得排到白天；确需白天安排时必须在 note 写明理由。\n");
+        sb.append("- 晚餐结束后仍可安排 1-2 个夜景/娱乐节点（酒吧、夜市、夜游等）；返程 transport 必须是当天最后一个节点，时间为最后活动结束后。\n");
+        boolean nightRequested = ItineraryValidator.nightRequested(state.getPreference(), state.getRequirementSnapshot());
+        if (nightRequested) {
+            sb.append("- 用户要求夜间活动：当天行程可延伸至 23:00 以后，返程时间以最后活动结束为准。\n");
         }
         if (restSpots.isEmpty()) {
             sb.append("- 高强度景点与低强度景点错开安排；无候选休息点，不插入 rest 节点。\n");
@@ -1219,7 +1226,9 @@ public class ItineraryService {
                     ? lastBefore.getTime() : null;
             ScheduleBuilder.schedule(d, coords, attById, facts)
                     .forEach(w -> log.warn("[Itinerary] 第{}天时间告警：{}", d.getDayIndex(), w));
-            anchorReturnTime(d, returnAnchor);
+            int maxAnchorMin = ItineraryValidator.nightRequested(state.getPreference(), state.getRequirementSnapshot())
+                    ? 24 * 60 : 22 * 60;
+            anchorReturnTime(d, returnAnchor, maxAnchorMin);
             List<String> missing = MealTimeChecker.missingWindows(d.getNodes());
             if (!missing.isEmpty()) {
                 log.warn("[Itinerary] 第{}天重算后仍缺饭点：{}", d.getDayIndex(), String.join("、", missing));
@@ -1251,9 +1260,10 @@ public class ItineraryService {
 
     /**
      * 返程时间锚点：把末节点（返程 transport）对齐到 LLM 明确给出的时间（用户「X点回去」诉求的落点）。
-     * 只允许比确定性重算更晚（更早的诉求涉及删减节点，另走调整流程），且不晚于 22:00 上限。
+     * 只允许比确定性重算更晚（更早的诉求涉及删减节点，另走调整流程）；
+     * 上限默认 22:00，用户有夜间活动需求（夜景/酒吧等）时放宽到 24:00。
      */
-    private static void anchorReturnTime(DailyPlan d, String returnAnchor) {
+    private static void anchorReturnTime(DailyPlan d, String returnAnchor, int maxAnchorMin) {
         if (returnAnchor == null || d.getNodes() == null || d.getNodes().isEmpty()) {
             return;
         }
@@ -1269,7 +1279,7 @@ public class ItineraryService {
         } catch (RuntimeException e) {
             return; // 非法时间不采用锚点
         }
-        anchor = Math.min(anchor, 22 * 60);
+        anchor = Math.min(anchor, maxAnchorMin);
         if (anchor <= computed) {
             return;
         }
@@ -1451,6 +1461,11 @@ public class ItineraryService {
             if ("晚餐".equals(window) && departBeforeDinner) {
                 continue;
             }
+            // 已有同餐次节点（哪怕时间在窗口外，如夜宵时段）时不再注入，避免一天出现两个晚餐；
+            // 窗口时间违规由验证/修复流程处理，注入只负责「完全没有这一餐」的情况
+            if (hasMealNode(d.getNodes(), window)) {
+                continue;
+            }
             Restaurant nearest = nearestRestaurant(d, foods, coords);
             if (nearest == null) {
                 continue;
@@ -1471,12 +1486,21 @@ public class ItineraryService {
         PlanNode anchor = d.getNodes().isEmpty() ? null : d.getNodes().get(0);
         double[] ac = anchor == null ? null
                 : PlaceKeyResolver.fromNode(anchor).map(coords::get).orElse(null);
+        // 无坐标的网搜店不参与距离比较（无法度量远近）；全部无坐标时取第一个
+        List<Restaurant> withCoords = foods.stream()
+                .filter(r -> r.getLng() != null && r.getLat() != null).toList();
         if (ac == null) {
-            return foods.get(0);
+            return withCoords.isEmpty() ? foods.get(0) : withCoords.get(0);
         }
-        return foods.stream()
+        return withCoords.stream()
                 .min(Comparator.comparingDouble(r -> GeoUtils.distanceKm(ac[0], ac[1], r.getLng(), r.getLat())))
-                .orElse(null);
+                .orElse(foods.get(0));
+    }
+
+    /** 当天是否已有标注该餐次的餐厅节点（note 含「午餐」/「晚餐」即可，不要求落在标准窗口内） */
+    private static boolean hasMealNode(List<PlanNode> nodes, String window) {
+        return nodes.stream().anyMatch(n -> "restaurant".equals(n.getType())
+                && n.getNote() != null && n.getNote().contains(window));
     }
 
     private void injectRest(DailyPlan d, Attraction restSpot) {
@@ -1492,8 +1516,8 @@ public class ItineraryService {
     }
 
     /**
-     * 跨天去重（硬约束兜底，不依赖 LLM 自觉）：同一景点/餐厅/休息点全行程只出现一次。
-     * 酒店是每天驻地、交通节点是行程骨架，不受此限；同一天内允许重复。
+     * 跨天/同天去重（硬约束兜底，不依赖 LLM 自觉）：同一景点/餐厅/休息点全行程只出现一次
+     * （同一天的午餐与晚餐用同一家餐厅也算重复）。酒店是每天驻地、交通节点是行程骨架，不受此限。
      * 备选处理：先替换为池中未用地点；无备选时休息点直接移除（软性节点），
      * 餐厅（饭点硬约束）与景点（避免行程过空）保留并告警。
      */

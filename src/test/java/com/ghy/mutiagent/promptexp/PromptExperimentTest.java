@@ -51,9 +51,9 @@ class PromptExperimentTest {
 
     /** 实验固定输入（与生产真实会话 77be898945684da7 同构，脱敏合成） */
     private static final List<Map<String, Object>> ATTRACTIONS = List.of(
-            attr(43L, "金鸡湖月光码头", "打卡拍照", 1, 1.5, 0, 8.0),
-            attr(38L, "十全街", "打卡拍照", 1, 2.0, 0, 7.0),
-            attr(24L, "平江路历史街区", "打卡拍照", 2, 3.0, 0, 6.5));
+            attr(43L, "金鸡湖月光码头", "打卡拍照", 1, 1.5, 0, 8.0, "夜景,湖景,情侣,氛围"),
+            attr(38L, "十全街", "打卡拍照", 1, 2.0, 0, 7.0, ""),
+            attr(24L, "平江路历史街区", "打卡拍照", 2, 3.0, 0, 6.5, ""));
 
     private static final List<Map<String, Object>> RESTAURANTS = List.of(
             food(17L, "黄天源糕团(观前街店)", "本地菜", 6.0),
@@ -70,11 +70,12 @@ class PromptExperimentTest {
             poolItem(8L, "得月楼(观前店)", "本地菜", "100", "观前街", 4.8));
 
     private static Map<String, Object> attr(long id, String name, String category,
-                                            int intensity, double hours, int price, double score) {
+                                            int intensity, double hours, int price, double score, String tags) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", id);
         m.put("name", name);
         m.put("category", category);
+        m.put("tags", tags);
         m.put("intensity", intensity);
         m.put("hours", hours);
         m.put("price", price);
@@ -263,7 +264,9 @@ class PromptExperimentTest {
         sb.append("- 共 1 天；首日以 transport 节点启程（抵达），末日以 transport 节点返程。\n");
         sb.append("- 用户不需要酒店：不要安排 hotel 节点，住宿费用按 0 计；每天以当日首个景点为起点和终点。\n");
         sb.append("- 用户已确认的景点必须全部安排进行程（缺一不可）；只有受硬约束（开放时间、劳累度上限）确实无法安排时才能少排，且必须在当天的 theme 或相应 note 中写明原因，不得静默遗漏。\n");
-        sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐）；车程中不安排用餐。\n");
+        sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐），各至多 1 个、不得多排；车程中不安排用餐；同一餐厅一天最多出现 1 次（午餐用过的店不能再当晚餐）。\n");
+        sb.append("- 带「夜景」标签的景点安排在 18:30 之后（晚餐后最佳），不得排到白天；确需白天安排时必须在 note 写明理由。\n");
+        sb.append("- 晚餐结束后仍可安排 1-2 个夜景/娱乐节点（酒吧、夜市、夜游等）；返程 transport 必须是当天最后一个节点，时间为最后活动结束后。\n");
         sb.append("- 高强度景点与低强度景点错开安排；如某天安排较满，可插入 1 个 rest 节点（候选休息点：）。\n");
         sb.append("- 全程预算约 3000 元，2 人：餐费按人均价×人数计算，餐饮+门票+交通合计不得超过预算；超预算时优先选择人均价更低的餐厅。");
         if ("A2".equals(caseId)) {
@@ -341,6 +344,9 @@ class PromptExperimentTest {
         boolean lastTransport = false;
         boolean lunch = false;
         boolean dinner = false;
+        int lunchCount = 0;
+        int dinnerCount = 0;
+        String nightTime = null;
         String lastTime = "";
         if (oneDay && days.get(0).path("nodes").isArray()) {
             JsonNode nodes = days.get(0).path("nodes");
@@ -357,14 +363,20 @@ class PromptExperimentTest {
                     lastTime = time;
                 }
                 if ("attraction".equals(type) && n.path("placeId").isNumber()) {
-                    attractionIds.add(n.path("placeId").asLong());
+                    long pid = n.path("placeId").asLong();
+                    attractionIds.add(pid);
+                    if (pid == 43L) {
+                        nightTime = time;
+                    }
                 }
                 if ("restaurant".equals(type)) {
                     if (note.contains("午餐")) {
                         lunch = true;
+                        lunchCount++;
                     }
                     if (note.contains("晚餐")) {
                         dinner = true;
+                        dinnerCount++;
                     }
                 }
             }
@@ -375,6 +387,10 @@ class PromptExperimentTest {
         c.put("allThreeAttractions", attractionIds.containsAll(List.of(43L, 38L, 24L)));
         c.put("lunchPresent", lunch);
         c.put("dinnerPresent", dinner);
+        c.put("lunchCount", lunchCount);
+        c.put("dinnerCount", dinnerCount);
+        // 夜景标签景点（43）若被安排，必须在 18:30 之后；未安排时为 null（不作判定）
+        c.put("nightTimingOk", nightTime == null ? null : nightTime.compareTo("18:30") >= 0);
         if ("A2".equals(caseId)) {
             c.put("returnAtLeast2130", lastTime.compareTo("21:30") >= 0);
         }
