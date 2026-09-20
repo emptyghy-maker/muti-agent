@@ -1109,8 +1109,13 @@ public class ItineraryService {
         } else {
             sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐）；车程中不安排用餐。\n");
         }
-        sb.append("- 高强度景点与低强度景点错开安排；如某天安排较满，可插入 1 个 rest 节点（候选休息点：").append(restNames).append("）。\n")
-                .append("- 全程预算约 ").append(state.getPreference().getTotalBudget()).append(" 元，")
+        if (restSpots.isEmpty()) {
+            sb.append("- 高强度景点与低强度景点错开安排；无候选休息点，不插入 rest 节点。\n");
+        } else {
+            sb.append("- 高强度景点与低强度景点错开安排；如某天安排较满，可插入 1 个 rest 节点（候选休息点：")
+                    .append(restNames).append("）。\n");
+        }
+        sb.append("- 全程预算约 ").append(state.getPreference().getTotalBudget()).append(" 元，")
                 .append(state.getPreference().getPeopleCount() == null ? 2 : state.getPreference().getPeopleCount())
                 .append(" 人：餐费按人均价×人数计算，餐饮+门票+交通合计不得超过预算；超预算时优先选择人均价更低的餐厅。");
         if (state.getPreference().getSpecialRequests() != null
