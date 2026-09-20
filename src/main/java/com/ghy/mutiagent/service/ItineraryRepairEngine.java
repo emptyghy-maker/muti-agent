@@ -176,6 +176,11 @@ public class ItineraryRepairEngine {
             requirements.put("totalBudget", state.getPreference().getTotalBudget());
             requirements.put("specialRequests", state.getPreference().getSpecialRequests());
         }
+        // 用户已确认的景点/餐厅（修复时一个都不能移除，只能重排顺序/时间）
+        requirements.put("selectedAttractionIds",
+                state.getSelectedAttractionIds() == null ? List.of() : state.getSelectedAttractionIds());
+        requirements.put("selectedFoodIds",
+                state.getSelectedFoodIds() == null ? List.of() : state.getSelectedFoodIds());
         requirements.put("extraRequest", state.getExtraRequest());
         requirements.put("hardConstraints", hardConstraintSummary(state));
         ctx.put("requirements", requirements);

@@ -17,8 +17,9 @@ llm:
   response-format: ${QWEN_RESPONSE_FORMAT:json_object}
   models:
     default: ${QWEN_MODEL_DEFAULT:qwen3.8-flash}
-    # 行程规划用高质量模型（AgentConfig 注释同口径）；qwen3.7-plus 免费额度耗尽后不再默认，可用环境变量覆盖
-    sql: ${QWEN_MODEL_SQL:qwen3.8-max}
+    # 行程规划模型：qwen3.8-max 开启思考时实测 300s 超时（O7 核实），默认降级为 qwen3.7-flash；
+    # 需要高质量时可环境变量 QWEN_MODEL_SQL=qwen3.8-max 覆盖
+    sql: ${QWEN_MODEL_SQL:qwen3.7-flash}
   # 阶段2 联网检索（enable_search）：qwen3.7-flash 已实测支持联网+关思考（约12s 返回），
   # 原默认 qwen3.8-max 开启思考时实测稳定超时（90s 无产出）
   search-model: ${QWEN_SEARCH_MODEL:qwen3.7-flash}
