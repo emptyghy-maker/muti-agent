@@ -29,6 +29,10 @@ public final class ScheduleBuilder {
     private static final int REST_MIN = 60;
     /** 景点最短停留，分钟 */
     private static final int MIN_ATTRACTION_MIN = 60;
+    /** 夜景时段起点（18:30），分钟 */
+    private static final int NIGHT_START_MIN = 18 * 60 + 30;
+    /** 夜景时段游览时长上限（2 小时），分钟 */
+    private static final int NIGHT_VISIT_MAX_MIN = 120;
 
     private ScheduleBuilder() {
     }
@@ -75,9 +79,9 @@ public final class ScheduleBuilder {
                     .map(k -> coords == null ? null : coords.get(k))
                     .orElse(null);
             PlaceKey key = PlaceKeyResolver.fromNode(n).orElse(null);
-            int dur = durationOf(n, attById);
             if (i == 0) {
                 // 首节点（抵达交通/起点酒店）：09:00 开始，无出发信息；停留时长同样推进 cursor
+                int dur = durationOf(n, attById, cursor);
                 n.setTime(toHm(cursor));
                 n.setDepartTime(null);
                 n.setTravelMinutes(null);
@@ -107,6 +111,7 @@ public final class ScheduleBuilder {
                                 + winFrom + "-" + winTo + "（" + n.getName() + "）");
                     }
                 }
+                int dur = durationOf(n, attById, arrival);
                 n.setTravelMinutes(travel);
                 n.setDepartTime(toHm(arrival - travel));
                 n.setTime(toHm(arrival));
@@ -119,13 +124,18 @@ public final class ScheduleBuilder {
         return warnings;
     }
 
-    /** 节点停留分钟：景点按建议时长（最少 1 小时）、餐厅 90、休息点 60、交通/酒店 0 */
-    private static int durationOf(PlanNode n, Map<Long, Attraction> attById) {
+    /** 节点停留分钟：景点按建议时长（最少 1 小时）、餐厅 90、休息点 60、交通/酒店 0。
+     * 夜景时段（18:30 后到访的夜景标签景点）游览按 2 小时封顶（用户口径：晚餐后约 20:00-22:00 夜景）。 */
+    private static int durationOf(PlanNode n, Map<Long, Attraction> attById, int arrivalMin) {
         return switch (n.getType() == null ? "" : n.getType()) {
             case "attraction" -> {
                 Attraction a = attById == null ? null : attById.get(n.getPlaceId());
                 double hours = a == null || a.getSuggestHours() == null ? 2.0 : a.getSuggestHours();
-                yield Math.max(MIN_ATTRACTION_MIN, (int) Math.round(hours * 60));
+                int dur = Math.max(MIN_ATTRACTION_MIN, (int) Math.round(hours * 60));
+                if (arrivalMin >= NIGHT_START_MIN && a != null && NightScorer.isNight(a.getTags())) {
+                    dur = Math.min(dur, NIGHT_VISIT_MAX_MIN);
+                }
+                yield dur;
             }
             case "restaurant" -> MEAL_MIN;
             case "rest" -> REST_MIN;

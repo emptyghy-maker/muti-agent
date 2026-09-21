@@ -134,4 +134,24 @@ class ScheduleBuilderTest {
 
         assertThat(d.getNodes().get(0).getTime()).isEqualTo("10:00");
     }
+
+    /** 夜景时段（18:30 后）到访的夜景标签景点按 2 小时封顶（用户口径：晚餐后约 20:00-22:00 夜景） */
+    @Test
+    void 夜景时段到访的夜景景点时长两小时封顶() {
+        Attraction dayLong = attraction(21L, 8.5); // 白天景点撑到 18:00，保证夜景景点 18:30 后到访
+        Attraction night = attraction(26L, 3.0);
+        night.setTags("自然风光,湖景,夜景,音乐喷泉");
+        Map<Long, Attraction> attById = Map.of(21L, dayLong, 26L, night);
+        DailyPlan d = dayOf(List.of(
+                node("transport", null, null),
+                node("attraction", 21L, null),
+                node("attraction", 26L, null),
+                node("transport", null, null)));
+
+        ScheduleBuilder.schedule(d, Map.of(), attById, null, 9 * 60);
+
+        assertThat(d.getNodes().get(1).getDurationMinutes()).isEqualTo(510); // 白天到访不封顶
+        assertThat(d.getNodes().get(2).getTime()).isEqualTo("18:30");
+        assertThat(d.getNodes().get(2).getDurationMinutes()).isEqualTo(120); // 3h 建议时长 → 夜景时段封顶 2h
+    }
 }

@@ -34,6 +34,7 @@ import com.ghy.mutiagent.repository.entity.Destination;
 import com.ghy.mutiagent.repository.mapper.DestinationMapper;
 import com.ghy.mutiagent.rule.DefaultsResolver;
 import com.ghy.mutiagent.rule.AhpWeightCalculator;
+import com.ghy.mutiagent.rule.ChannelRouter;
 import com.ghy.mutiagent.rule.NightScorer;
 import com.ghy.mutiagent.rule.PreferenceUpdater;
 import com.ghy.mutiagent.rule.RequirementApplier;
@@ -43,7 +44,9 @@ import com.ghy.mutiagent.security.AuthenticatedUser;
 import org.springframework.beans.factory.annotation.Autowired;
 import com.ghy.mutiagent.service.AgentOutputParser;
 import com.ghy.mutiagent.service.CancelRegistry;
+import com.ghy.mutiagent.service.CandidateChannelCoordinator;
 import com.ghy.mutiagent.service.CandidateService;
+import com.ghy.mutiagent.service.FoodPromotionService;
 import com.ghy.mutiagent.service.GenerationRegistry;
 import com.ghy.mutiagent.service.ItineraryService;
 import com.ghy.mutiagent.service.validation.ItineraryValidator;
@@ -223,6 +226,22 @@ public class TravelOrchestrator {
     private final TraceService traceService;
     private final ObjectMapper objectMapper;
     private final TaskExecutor taskExecutor;
+
+    /** POI 推荐计数与晋升组件（可空：未装配时保持既有行为，功能隔离；勾选确认时记录 SELECT 事件） */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private FoodPromotionService promotion;
+
+    /**
+     * 候选通道并行预热（功能隔离 + 可回退）：开启后美食/酒店通道与景点重筛并行生成，
+     * 结果与就绪标记写 Redis；未开启（默认/手动装配/门禁）时保持既有串行懒加载行为。
+     * 回退方式：环境变量 TRAVEL_PARALLEL_CANDIDATES=false（或去掉 dev 配置中的开关）。
+     */
+    @Value("${travel.parallel-candidates:false}")
+    private Boolean parallelCandidates;
+
+    /** 通道协调器（可空：手动装配进程为 null → 缓存未命中 → 自动回退同步懒加载） */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private CandidateChannelCoordinator channelCoordinator;
     /** S12 追踪版本标识：操作启动时绑定（提示词/模型版本随配置）；可直接装配的测试/网关环境用 setter 注入 */
     @Value("${travel.trace.prompt-version:prompt-v1}")
     private String tracePromptVersion = "prompt-v1";
@@ -499,6 +518,11 @@ public class TravelOrchestrator {
                     + "（每批 8 家，换一批秒出且不重复）：" + llmNote(foodOk) + foodWebNote(state), null);
         }
         boolean aiOk = candidateService.generateAttractions(state);
+        if (parallelOn()) {
+            // 候选通道并行预热：美食/酒店与景点重筛同时进行（景点通道本就在首屏契约内，
+            // 美食/酒店后台生成、写缓存，用户勾选景点期间完成，走到对应环节零等待）
+            prewarmFoodAndHotel(state);
+        }
         sessionService.save(state);
         log.info("[TravelAgent][stage=PREFERENCE][sessionId={}] 偏好收集完成：{}", state.getSessionId(), state.getPreference());
         String conflictNote = state.getConflict() == null || state.getConflict().isBlank()
@@ -512,8 +536,106 @@ public class TravelOrchestrator {
                 + "也可以直接打字提出想法（如「想看夜景、不要太累」），我会带你的要求重新分析。", null);
     }
 
+    /** 候选通道并行预热开关（开关关闭/协调器未装配/手动构造进程时全部回退同步懒加载） */
+    private boolean parallelOn() {
+        return Boolean.TRUE.equals(parallelCandidates) && channelCoordinator != null && taskExecutor != null;
+    }
+
+    /** 美食/酒店通道后台预热：克隆会话状态 → 各自生成候选池 → 结果与就绪标记写 Redis（不碰会话状态，无并发覆盖） */
+    private void prewarmFoodAndHotel(TravelState state) {
+        channelCoordinator.markReady(state.getSessionId(),
+                CandidateChannelCoordinator.CHANNEL_ATTRACTION, "READY");
+        taskExecutor.execute(() -> prewarmFood(state));
+        taskExecutor.execute(() -> prewarmHotel(state));
+    }
+
+    private void prewarmFood(TravelState origin) {
+        try {
+            TravelState copy = cloneState(origin);
+            candidateService.generateFoods(copy);
+            channelCoordinator.putResult(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_FOOD,
+                    new CandidateChannelCoordinator.FoodChannelResult(copy.getFoodPool(),
+                            copy.getFoodCursor(), copy.getCandidateAdvice(),
+                            copy.getWebFoodCandidates(), copy.candidateSnapshots()));
+            channelCoordinator.markReady(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_FOOD, "READY");
+        } catch (Exception e) {
+            log.warn("[PreWarm][sessionId={}] 美食通道预热失败，回退同步懒加载: {}",
+                    origin.getSessionId(), e.getMessage());
+        }
+    }
+
+    private void prewarmHotel(TravelState origin) {
+        try {
+            TravelState copy = cloneState(origin);
+            candidateService.generateHotels(copy);
+            channelCoordinator.putResult(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL,
+                    new CandidateChannelCoordinator.HotelChannelResult(copy.getHotelPool(),
+                            copy.getHotelCursor(), copy.getCandidateAdvice(), copy.candidateSnapshots()));
+            channelCoordinator.markReady(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL, "READY");
+        } catch (Exception e) {
+            log.warn("[PreWarm][sessionId={}] 酒店通道预热失败，回退同步懒加载: {}",
+                    origin.getSessionId(), e.getMessage());
+        }
+    }
+
+    /** 美食候选池准备：并行预热缓存命中 → 应用缓存；未命中 → 同步生成（既有行为） */
+    private boolean prepareFoodPool(TravelState state) {
+        CandidateChannelCoordinator.FoodChannelResult cached = parallelOn() ? channelCoordinator
+                .getResult(state.getSessionId(), CandidateChannelCoordinator.CHANNEL_FOOD,
+                        CandidateChannelCoordinator.FoodChannelResult.class) : null;
+        if (cached == null) {
+            return candidateService.generateFoods(state);
+        }
+        state.setFoodPool(new ArrayList<>(cached.foodPool()));
+        state.setFoodCursor(cached.foodCursor());
+        if (cached.advice() != null) {
+            state.setCandidateAdvice(cached.advice());
+        }
+        if (cached.webFoodCandidates() != null) {
+            state.setWebFoodCandidates(new ArrayList<>(cached.webFoodCandidates()));
+        }
+        if (cached.snapshots() != null) {
+            state.candidateSnapshots().putAll(cached.snapshots());
+        }
+        // 缓存不含展示批次：按当前游标重建（已勾选置顶），否则前端拿到的 foodCandidates 为空
+        candidateService.nextFoodBatch(state);
+        return true;
+    }
+
+    /** 酒店候选池准备：并行预热缓存命中 → 应用缓存；未命中 → 同步生成（既有行为） */
+    private boolean prepareHotelPool(TravelState state) {
+        CandidateChannelCoordinator.HotelChannelResult cached = parallelOn() ? channelCoordinator
+                .getResult(state.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL,
+                        CandidateChannelCoordinator.HotelChannelResult.class) : null;
+        if (cached == null) {
+            return candidateService.generateHotels(state);
+        }
+        state.setHotelPool(new ArrayList<>(cached.hotelPool()));
+        state.setHotelCursor(cached.hotelCursor());
+        if (cached.advice() != null) {
+            state.setCandidateAdvice(cached.advice());
+        }
+        if (cached.snapshots() != null) {
+            state.candidateSnapshots().putAll(cached.snapshots());
+        }
+        // 缓存不含展示批次：按当前游标重建（已勾选置顶），否则前端拿到的 hotelCandidates 为空
+        candidateService.nextHotelBatch(state);
+        return true;
+    }
+
+    private TravelState cloneState(TravelState state) {
+        try {
+            return objectMapper.readValue(objectMapper.writeValueAsString(state), TravelState.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("会话状态克隆失败", e);
+        }
+    }
+
     /** 偏好问询重置：清空已收集的偏好与需求快照，回到第一个问题（重新来） */
     private ChatStepResult restartPreference(TravelState state) {
+        if (parallelOn()) {
+            channelCoordinator.clear(state.getSessionId());
+        }
         TravelPreference p = state.getPreference();
         p.setDays(null);
         p.setTotalBudget(null);
@@ -528,6 +650,7 @@ public class TravelOrchestrator {
         state.getAskedFields().clear();
         state.setConflict(null);
         state.setExtraRequest(null);
+        state.clearChannelRequests();
         state.setRequirementSnapshot(null);
         state.setWeights(null);
         Question first = nextQuestion(state);
@@ -566,7 +689,8 @@ public class TravelOrchestrator {
     }
 
     /** 是否触发美食联网检索：美食阶段 + 已有特殊需求 + 触发词命中 + 同一句话不重复检索 */
-    private static boolean shouldWebSearch(TravelState state, String message) {        if (state == null || state.getStage() != TravelStage.FOODS || message == null) {
+    private static boolean shouldWebSearch(TravelState state, String message, boolean foodChannel) {
+        if (state == null || !foodChannel || message == null) {
             return false;
         }
         String extra = state.getExtraRequest();
@@ -902,15 +1026,46 @@ public class TravelOrchestrator {
             return finishWithItinerary(state, "好的，按你的要求跳过酒店，直接为你生成行程：");
         }
 
-        boolean aiOk = switch (state.getStage()) {
-            case ATTRACTIONS -> candidateService.generateAttractions(state);
-            case FOODS -> candidateService.generateFoods(state);
+        // 三通道独立对话路由：候选阶段的自由文本可能指向任意通道（如美食环节说「酒店要便宜的」）——
+        // 命中单一通道 → 该通道单独重筛（latest-wins，其余通道保留并行预热/既有结果）；
+        // 零命中/多通道命中 → 沿用当前环节（旧行为）。被明确跳过的通道不再重筛。
+        String routedChannel = ChannelRouter.route(message);
+        if (routedChannel != null && isChannelSkipped(state, routedChannel)) {
+            routedChannel = null;
+        }
+        String currentChannel = switch (state.getStage()) {
+            case ATTRACTIONS -> CandidateChannelCoordinator.CHANNEL_ATTRACTION;
+            case FOODS -> CandidateChannelCoordinator.CHANNEL_FOOD;
+            default -> CandidateChannelCoordinator.CHANNEL_HOTEL;
+        };
+        String effectiveChannel = routedChannel == null ? currentChannel : routedChannel;
+        // 登记该通道本次请求快照：此后该通道重筛只看自己的快照（各通道互不污染，latest-wins）
+        state.putChannelRequest(effectiveChannel, state.getExtraRequest());
+
+        boolean aiOk = switch (effectiveChannel) {
+            case CandidateChannelCoordinator.CHANNEL_ATTRACTION -> candidateService.generateAttractions(state);
+            case CandidateChannelCoordinator.CHANNEL_FOOD -> candidateService.generateFoods(state);
             default -> candidateService.generateHotels(state);
         };
+        // 同步重筛结果写回该通道缓存：确认环节命中缓存时拿到本次最新结果
+        //（覆盖并行预热旧结果；缓存不可用时 putResult 静默降级，不影响状态本身）
+        if (parallelOn()) {
+            if (CandidateChannelCoordinator.CHANNEL_FOOD.equals(effectiveChannel)) {
+                channelCoordinator.putResult(state.getSessionId(), CandidateChannelCoordinator.CHANNEL_FOOD,
+                        new CandidateChannelCoordinator.FoodChannelResult(state.getFoodPool(),
+                                state.getFoodCursor(), state.getCandidateAdvice(),
+                                state.getWebFoodCandidates(), state.candidateSnapshots()));
+            } else if (CandidateChannelCoordinator.CHANNEL_HOTEL.equals(effectiveChannel)) {
+                channelCoordinator.putResult(state.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL,
+                        new CandidateChannelCoordinator.HotelChannelResult(state.getHotelPool(),
+                                state.getHotelCursor(), state.getCandidateAdvice(), state.candidateSnapshots()));
+            }
+        }
         // 阶段2：知识库无法满足（明示没找到合适的/要求搜索）时联网检索，整理为参考候选
         boolean webSearched = false;
         int webFound = 0;
-        if (state.getStage() == TravelStage.FOODS && shouldWebSearch(state, message)) {
+        if (CandidateChannelCoordinator.CHANNEL_FOOD.equals(effectiveChannel)
+                && shouldWebSearch(state, message, true)) {
             List<WebFoodCandidate> foundList = candidateService.searchFoodsOnline(state);
             state.setWebSearchKey(message.trim());
             if (foundList != null && !foundList.isEmpty()) {
@@ -920,11 +1075,15 @@ public class TravelOrchestrator {
             }
         }
         sessionService.save(state);
-        String stageName = switch (state.getStage()) {
-            case ATTRACTIONS -> "景点"; case FOODS -> "美食"; default -> "酒店";
+        String stageName = switch (effectiveChannel) {
+            case CandidateChannelCoordinator.CHANNEL_ATTRACTION -> "景点";
+            case CandidateChannelCoordinator.CHANNEL_FOOD -> "美食";
+            default -> "酒店";
         };
-        String agentName = switch (state.getStage()) {
-            case ATTRACTIONS -> "AttractionAgent"; case FOODS -> "FoodAgent"; default -> "HotelAgent";
+        String agentName = switch (effectiveChannel) {
+            case CandidateChannelCoordinator.CHANNEL_ATTRACTION -> "AttractionAgent";
+            case CandidateChannelCoordinator.CHANNEL_FOOD -> "FoodAgent";
+            default -> "HotelAgent";
         };
         String prefix = paging
                 ? "已翻页并把你的条件「" + message + "」一起考虑："
@@ -933,9 +1092,26 @@ public class TravelOrchestrator {
                 ? "\n\n同时我在网上为你搜了搜（信息来自网络，仅供参考，未经审核暂不加入行程）：找到 "
                 + webFound + " 家可能符合「" + message + "」的店，展示在下方「联网推荐」区。"
                 : "";
+        String crossNote = routedChannel != null && !routedChannel.equals(currentChannel)
+                ? "\n\n" + stageName + "备选池已按你的新要求单独更新，等你确认到" + stageName
+                + "环节时会直接展示；当前环节的选择不受影响。"
+                : "";
         return buildResult(state, prefix + (paging ? "" : agentName) + (paging ? "" : "，它带着这个要求重新分析了")
                 + stageName + "备选池（已勾选的会保留置顶）："
-                + llmNote(aiOk) + webNote + "\n\n请勾选心仪的选项，或继续说你的想法。", null);
+                + llmNote(aiOk) + webNote + crossNote + "\n\n请勾选心仪的选项，或继续说你的想法。", null);
+    }
+
+    /** 通道是否已被用户明确跳过（无需再为该通道单独重筛） */
+    private static boolean isChannelSkipped(TravelState state, String channel) {
+        return switch (channel) {
+            case CandidateChannelCoordinator.CHANNEL_ATTRACTION ->
+                    Boolean.TRUE.equals(state.getNoAttractionNeeded());
+            case CandidateChannelCoordinator.CHANNEL_FOOD ->
+                    Boolean.TRUE.equals(state.getNoFoodNeeded());
+            case CandidateChannelCoordinator.CHANNEL_HOTEL ->
+                    Boolean.TRUE.equals(state.getNoHotelNeeded());
+            default -> false;
+        };
     }
 
     /** DONE 阶段对话：上游条件变化先作废旧行程，其余视为行程调整诉求 */
@@ -1056,6 +1232,18 @@ public class TravelOrchestrator {
                     return blocked;
                 }
                 state.setSelectedAttractionIds(new ArrayList<>(ordered));
+                if (promotion != null) {
+                    // POI 晋升（三通道对称）：景点勾选事件计数（同一会话同一景点幂等，未装配时无此行为）；
+                    // 计数是旁路功能，任何异常都不阻断确认主流程
+                    try {
+                        for (Long id : ordered) {
+                            promotion.recordSelect(FoodPromotionService.TYPE_ATTRACTION,
+                                    state.getSessionId(), id, state.getDestinationId());
+                        }
+                    } catch (Exception e) {
+                        log.warn("景点勾选计数失败（{}），已降级跳过", e.getClass().getSimpleName());
+                    }
+                }
                 obsUserConfirmed(null, state, actor, "ATTRACTION", ordered.size(), 0);
                 if (Boolean.TRUE.equals(state.getNoFoodNeeded())) {
                     // 用户不需要美食：跳过美食挑选，直接进入酒店环节（酒店也不需要则直接生成行程）
@@ -1070,7 +1258,7 @@ public class TravelOrchestrator {
                 }
                 state.setStage(TravelStage.FOODS);
                 obsUserConfirmed(null, state, actor, "ATTRACTION", ordered.size(), 0);
-                boolean aiOk = candidateService.generateFoods(state);
+                boolean aiOk = prepareFoodPool(state);
                 sessionService.save(state);
                 return buildResult(state, "已确认景点！美食备选池已按你的口味与预算生成"
                         + "（每批 8 家，换一批秒出且不重复）：" + llmNote(aiOk) + foodWebNote(state), null);
@@ -1095,6 +1283,17 @@ public class TravelOrchestrator {
                     return blocked;
                 }
                 state.setSelectedFoodIds(new ArrayList<>(ordered));
+                if (promotion != null) {
+                    // POI 晋升：勾选事件计数（同一会话同一店幂等，未装配时无此行为）；
+                    // 计数是旁路功能，任何异常都不阻断确认主流程
+                    try {
+                        for (Long id : ordered) {
+                            promotion.recordSelect(state.getSessionId(), id, state.getDestinationId());
+                        }
+                    } catch (Exception e) {
+                        log.warn("美食勾选计数失败（{}），已降级跳过", e.getClass().getSimpleName());
+                    }
+                }
                 obsUserConfirmed(null, state, actor, "FOOD", ordered.size(), 0);
                 if (Boolean.TRUE.equals(state.getNoHotelNeeded())) {
                     // 用户不需要酒店：跳过酒店挑选，直接生成行程
@@ -1103,7 +1302,7 @@ public class TravelOrchestrator {
                 }
                 state.setStage(TravelStage.HOTELS);
                 obsUserConfirmed(null, state, actor, "FOOD", ordered.size(), 0);
-                boolean aiOk = candidateService.generateHotels(state);
+                boolean aiOk = prepareHotelPool(state);
                 sessionService.save(state);
                 return buildResult(state, "已确认美食！酒店备选池以你选的景点和餐厅为中心生成"
                         + "（每批 5 家，换一批秒出且不重复）：" + llmNote(aiOk), null);
@@ -1134,6 +1333,18 @@ public class TravelOrchestrator {
                         return blocked;
                     }
                     state.setSelectedHotelIds(new ArrayList<>(ordered));
+                    if (promotion != null) {
+                        // POI 晋升（三通道对称）：酒店勾选事件计数（同一会话同一酒店幂等，未装配时无此行为）；
+                        // 计数是旁路功能，任何异常都不阻断确认主流程
+                        try {
+                            for (Long id : ordered) {
+                                promotion.recordSelect(FoodPromotionService.TYPE_HOTEL,
+                                        state.getSessionId(), id, state.getDestinationId());
+                            }
+                        } catch (Exception e) {
+                            log.warn("酒店勾选计数失败（{}），已降级跳过", e.getClass().getSimpleName());
+                        }
+                    }
                     obsUserConfirmed(null, state, actor, "HOTEL", ordered.size(), 0);
                     // 生成前问卷闸门与跳过路径共用 finishWithItineraryCore（未作答先返回 PLAN_QUIZ 问卷）
                     return finishWithItineraryCore(state, "已确认酒店！");
@@ -1294,6 +1505,10 @@ public class TravelOrchestrator {
             p.markConfirmed("nightPlan");
         }
         state.setPlanQuizAnswered(true);
+        // 问卷答案先生效落库：生成失败（如时间越界拒绝）也不丢答案，
+        // 用户随后可直接用「回家时间放宽到XX点」等自由文本触发重排，而不是回到问卷重答
+        state.setStage(TravelStage.ITINERARY);
+        sessionService.save(state);
         return finishWithItinerary(state, "已收到你的安排偏好，正在生成行程：");
     }
 
@@ -1617,7 +1832,11 @@ public class TravelOrchestrator {
     public ChatStepResult currentSession(AuthenticatedUser actor, String sessionId) {
         TravelState state = sessionService.loadOwned(sessionId, actor.id());
         Question q = state.getStage() == TravelStage.PREFERENCE ? nextQuestion(state) : null;
-        return buildResult(state, "已同步最新会话状态。", q);
+        ChatStepResult r = buildResult(state, "已同步最新会话状态。", q);
+        if (parallelOn()) {
+            r.setChannelStatus(channelCoordinator.ready(state.getSessionId()));
+        }
+        return r;
     }
 
     /** 断点恢复：当前用户最近一条可恢复的未结束会话；无/过期返回 null（首页卡片据此显示） */
@@ -2315,6 +2534,10 @@ public class TravelOrchestrator {
         r.setPendingFatigueScore(state.getPendingFatigueScore());
         r.setPendingBudgetConfirm(state.getPendingBudgetConfirm());
         r.setPendingBudgetOver(state.getPendingBudgetOver());
+        if (parallelOn()) {
+            // 候选通道就绪状态（前端据此展示「美食待选框已好」等提示）
+            r.setChannelStatus(channelCoordinator.ready(state.getSessionId()));
+        }
         return r;
     }
 

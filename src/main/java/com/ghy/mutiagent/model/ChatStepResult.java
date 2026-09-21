@@ -49,4 +49,6 @@ public class ChatStepResult {
     private java.math.BigDecimal pendingBudgetOver;
     /** 行程偏好问卷（PLAN_QUIZ 阶段；为 null 表示本步不涉及问卷） */
     private PlanQuiz planQuiz;
+    /** 候选通道就绪状态（并行预热）：channel → READY/RUNNING（未开启并行时为 null，前端忽略） */
+    private java.util.Map<String, String> channelStatus;
 }

@@ -57,7 +57,8 @@ mybatis-plus:
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
 
 # S06-B：会话权威存储（db=MySQL 快照权威、Redis 仅缓存；redis=保持 S06-A 语义）与操作租约；
-# read-only 为回退演练开关（维护窗口关闭写入口，读取与归属校验保持）
+# read-only 为回退演练开关（维护窗口关闭写入口，读取与归属校验保持）；
+# parallel-candidates 为候选通道并行预热开关（回退：设 TRAVEL_PARALLEL_CANDIDATES=false 恢复旧串行懒加载）
 travel:
   session:
     authority: ${TRAVEL_SESSION_AUTHORITY:db}
@@ -66,6 +67,7 @@ travel:
   operation:
     lease-ms: 60000
   read-only: ${TRAVEL_READ_ONLY:false}
+  parallel-candidates: ${TRAVEL_PARALLEL_CANDIDATES:true}
 # Observability 优化与运行记录中心（默认全关，安全发布；缺 obs_ 表不影响启动）
 observability:
   enabled: ${OBS_ENABLED:false}
@@ -81,3 +83,11 @@ observability:
     max-bytes: 262144
   retention:
     days: 30
+
+# POI 推荐计数与自动晋升（网搜店 → 知识库）：
+# 推荐=被纳入候选池展示、勾选=用户确认选择，均按不同会话数计；达到任一阈值且质量门槛通过 → KB_PROMOTED。
+food-promotion:
+  recommend-threshold: 3
+  select-threshold: 2
+  reuse-freshness-days: 90
+

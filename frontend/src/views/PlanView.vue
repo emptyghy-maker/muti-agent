@@ -58,6 +58,9 @@ const budgetOver = ref(null)
 const planQuiz = ref(null)
 const quizWake = ref('09:00')
 const quizDeadline = ref('22:00')
+// 三通道并行预热：候选通道就绪状态（后端 channelStatus：channel → READY；未开启并行时为 null/空，徽标整体不展示）
+const channelStatus = ref({})
+let channelPolling = false
 const quizBias = ref('BALANCED')
 const quizNight = ref('ONE')
 const quizCustomWake = ref('')
@@ -160,12 +163,55 @@ const mealPlanText = computed(() => {
 const hasWebFood = computed(() =>
   foodCandidates.value.some(g => g.restaurants.some(r => r.source === 'WEB_SEARCH')))
 
+// 三通道并行预热就绪提示：当前通道之外，谁先好先展示「已好」，未好的显示「生成中」
+// （仅景点环节展示生成中状态：预热从景点环节开始；后端未开启并行时 channelStatus 为空，整体不展示）
+const CHANNEL_LABELS = { FOOD: '美食待选框', HOTEL: '酒店待选框', ATTRACTION: '景点待选框' }
+const channelReadyChips = computed(() => {
+  const st = channelStatus.value || {}
+  const current = candidateType.value
+  if (!current || !Object.keys(st).length) return []
+  const chips = []
+  for (const ch of ['FOOD', 'HOTEL', 'ATTRACTION']) {
+    if (ch === current) continue
+    if (st[ch] === 'READY') {
+      chips.push({ text: CHANNEL_LABELS[ch] + '已好', ready: true })
+    } else if (stage.value === 'ATTRACTIONS') {
+      chips.push({ text: CHANNEL_LABELS[ch] + '生成中…', ready: false })
+    }
+  }
+  return chips
+})
+
+/** 景点环节就绪轮询：预热完成后徽标从「生成中」翻转为「已好」（谁先好先展示） */
+async function ensureChannelPolling() {
+  if (channelPolling || stage.value !== 'ATTRACTIONS' || !sessionId.value) return
+  if (!Object.keys(channelStatus.value).length) return // 后端未开启并行：无就绪标记可轮询
+  const need = ['FOOD', 'HOTEL'].some(ch => channelStatus.value[ch] !== 'READY')
+  if (!need) return
+  channelPolling = true
+  try {
+    for (let i = 0; i < 45 && stage.value === 'ATTRACTIONS'; i++) {
+      await new Promise((w) => setTimeout(w, 2000))
+      if (stage.value !== 'ATTRACTIONS') break
+      const s = await api.get('/travel/session/' + sessionId.value)
+      // 快照同步文案不进聊天历史（与标签页切回同步同口径）
+      if (s && s.message === '已同步最新会话状态。') delete s.message
+      if (s) applyStep(s)
+      if (['FOOD', 'HOTEL'].every(ch => (channelStatus.value || {})[ch] === 'READY')) break
+    }
+  } catch (e) { /* 轮询失败不阻塞：徽标停留在最近一次快照 */ } finally {
+    channelPolling = false
+  }
+}
+
 function applyStep(s) {
   if (s.sessionId) {
     sessionId.value = s.sessionId
     sessionStorage.setItem(ACTIVE_SESSION_KEY, s.sessionId)
   }
   stage.value = s.stage || stage.value
+  // 三通道并行预热：候选通道就绪状态（后端开启并行时随步进结果/快照下发）
+  if (s.channelStatus) channelStatus.value = { ...s.channelStatus }
   // 幂等同步：同一条助手消息不重复渲染（快照恢复/页面切回会反复调用 applyStep）
   if (s.message) {
     const last = chatHistory.value[chatHistory.value.length - 1]
@@ -203,6 +249,8 @@ function applyStep(s) {
   if (planQuiz.value) {
     quizNight.value = 'ONE'
   }
+  // 景点环节落地即开始就绪轮询（预热徽标「生成中 → 已好」，谁先好先展示）
+  if (stage.value === 'ATTRACTIONS') ensureChannelPolling()
 }
 
 onMounted(async () => {
@@ -652,6 +700,12 @@ function openRoute(payload) {
       <p class="tip">{{ agentLabel }} 已从 {{ destinationName }} 知识库中筛出{{ agentTopic }}备选池（每批展示一部分）；
         勾选心仪的选项（可多选），「换一批」只翻页不重新分析、秒出且不重复，已勾选的会保留置顶；
         直接打字提要求时才会让 AI 重新分析。</p>
+      <!-- 三通道并行预热：其余通道就绪提示（谁先好先展示；后端未开启并行时不展示） -->
+      <div class="channel-ready" v-if="channelReadyChips.length">
+        <span v-for="(c, i) in channelReadyChips" :key="i" class="channel-chip" :class="{ ok: c.ready }">
+          {{ c.ready ? '✅' : '⏳' }} {{ c.text }}
+        </span>
+      </div>
       <div class="ai-advice" v-if="aiAdvice">💡 AI 推荐方法：{{ aiAdvice }}</div>
 
       <!-- 景点 / 酒店：卡片 -->

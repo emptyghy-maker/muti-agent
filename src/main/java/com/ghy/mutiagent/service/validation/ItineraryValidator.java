@@ -93,17 +93,9 @@ public final class ItineraryValidator {
         // 用户明确不需要美食（noFood 硬约束）：用餐由用户自行解决，不强制饭点窗口——否则与
         // 「不要 restaurant 节点」硬约束冲突，形成无法收敛的缺餐死锁
         boolean noFoodActive = activeHard(snapshot, "noFood");
-        boolean nightActive = nightRequested(preference, snapshot);
-        int deadlineMin = deadlineMinutes(preference);
         boolean nightCountCapped = preference != null && "ONE".equals(preference.getNightPlan());
         for (DailyPlan d : plan.getDays()) {
-            // 日终上限优先级：问卷 deadline > 夜间活动放宽（24:00）> 默认 22:00
-            int dayEndMin;
-            if (deadlineMin > 0) {
-                dayEndMin = deadlineMin;
-            } else {
-                dayEndMin = (nightActive || hasNightNode(d, attById)) ? DAY_MINUTES : DAY_END_MIN;
-            }
+            int dayEndMin = dayEndMin(d, preference, snapshot, attById);
             timelineChecks(d, openTimes, dayEndMin, violations, located);
             if (nightCountCapped) {
                 List<String> nightRefs = nightAttractionRefs(d, attById);
@@ -168,6 +160,16 @@ public final class ItineraryValidator {
         } catch (RuntimeException e) {
             return 0;
         }
+    }
+
+    /** 日终上限（分钟），优先级：问卷 deadline > 夜间活动放宽（24:00）> 默认 22:00 */
+    public static int dayEndMin(DailyPlan d, TravelPreference preference, RequirementSnapshot snapshot,
+                                Map<Long, Attraction> attById) {
+        int deadlineMin = deadlineMinutes(preference);
+        if (deadlineMin > 0) {
+            return deadlineMin;
+        }
+        return (nightRequested(preference, snapshot) || hasNightNode(d, attById)) ? DAY_MINUTES : DAY_END_MIN;
     }
 
     /** 当天 18:30 后安排的夜景标签景点节点引用（夜景数量上限判定与修复定位用） */

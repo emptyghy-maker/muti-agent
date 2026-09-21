@@ -149,6 +149,30 @@ class TravelOrchestratorPlanQuizTest {
     }
 
     @Test
+    void submitQuizPersistsAnswersBeforeGenerationFails() {
+        // 事故复盘：生成 422 时问卷答案随保存跳过而丢失，用户回到问卷重答；
+        // 答案必须在调用生成前落库（stage 推进 ITINERARY），失败后可用自由文本直接重排
+        TravelState s = quizState();
+        when(sessionService.loadOwned("s1", 1L)).thenReturn(s);
+        org.mockito.Mockito.doThrow(new BizException(5002, "行程生成未通过发布检查"))
+                .when(itineraryService).generate(s);
+        PlanQuizRequest req = new PlanQuizRequest();
+        req.setSessionId("s1");
+        req.setWakeTime("09:00");
+        req.setReturnDeadline("22:00");
+        req.setActivityBias("BALANCED");
+        req.setNightPlan("ONE");
+
+        assertThatThrownBy(() -> orchestrator.submitPlanQuiz(actor, req))
+                .isInstanceOf(BizException.class);
+
+        assertThat(s.getPlanQuizAnswered()).isTrue();
+        assertThat(s.getPreference().getWakeTime()).isEqualTo("09:00");
+        assertThat(s.getStage()).isEqualTo(TravelStage.ITINERARY);
+        verify(sessionService, times(1)).save(s);
+    }
+
+    @Test
     void submitQuizRejectsInvalidWakeTime() {
         TravelState s = quizState();
         when(sessionService.loadOwned("s1", 1L)).thenReturn(s);

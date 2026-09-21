@@ -91,15 +91,30 @@ public class TravelState {
 
     /** 用户在候选阶段的自由表达（注入候选重筛，Agent 感来源；S02 后为快照渲染摘要） */
     private String extraRequest;
+    /**
+     * 三通道独立对话的通道请求快照（channel → 该通道最近一次重筛时生效的额外要求渲染）。
+     * 各通道生成只读自己的快照（latest-wins），互不污染；无快照的通道沿用全局 extraRequest（旧行为）。
+     */
+    private Map<String, String> channelRequests;
     /** S02 跨轮需求快照：有效约束/撤销记录/预算口径/未解析残余，每轮合并同一份 */
     private RequirementSnapshot requirementSnapshot;
     /** Agent 针对特殊要求给出的「推荐方法」建议文本（展示在前端候选区） */
     private String candidateAdvice;
     /** 阶段2：联网检索的美食候选（知识库外，仅参考展示，未经审核不入知识库、暂不进行程） */
     private List<WebFoodCandidate> webFoodCandidates;
+    /** 联网检索的景点候选（知识库外补充；经校验入库后进入备选池） */
+    private List<WebAttractionCandidate> webAttractionCandidates;
+    /** 联网检索的酒店候选（知识库外补充；经校验入库后进入备选池） */
+    private List<WebHotelCandidate> webHotelCandidates;
     /** 最近一次触发联网检索的原始消息（防同一句话重复检索；仅内存，不序列化） */
     @JsonIgnore
     private String webSearchKey;
+    /** 景点通道最近一次触发联网检索的原始消息（会话内去重；仅内存，不序列化） */
+    @JsonIgnore
+    private String webAttractionSearchKey;
+    /** 酒店通道最近一次触发联网检索的原始消息（会话内去重；仅内存，不序列化） */
+    @JsonIgnore
+    private String webHotelSearchKey;
     /** 用户明确不需要美食：跳过美食挑选环节，行程不安排 restaurant 节点 */
     private Boolean noFoodNeeded;
     /** 用户明确不需要酒店：跳过酒店挑选环节，行程不安排 hotel 节点、住宿费用为 0 */
@@ -166,5 +181,25 @@ public class TravelState {
             turnModels.add(model);
         }
         turnChannel = UsageChannel.merge(turnChannel, channel);
+    }
+
+    /** 通道独立对话：读取某通道最近一次重筛时生效的额外要求快照（无快照返回 null） */
+    public String channelRequestOf(String channel) {
+        return channelRequests == null ? null : channelRequests.get(channel);
+    }
+
+    /** 通道独立对话：登记某通道的请求快照（latest-wins：同通道再次登记即覆盖） */
+    public void putChannelRequest(String channel, String request) {
+        if (channelRequests == null) {
+            channelRequests = new LinkedHashMap<>();
+        }
+        channelRequests.put(channel, request);
+    }
+
+    /** 清空全部通道请求快照（偏好重置时调用，随需求快照一起作废） */
+    public void clearChannelRequests() {
+        if (channelRequests != null) {
+            channelRequests.clear();
+        }
     }
 }

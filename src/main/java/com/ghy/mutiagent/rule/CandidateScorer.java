@@ -76,7 +76,9 @@ public final class CandidateScorer {
         double budget = perPersonDaily(p);
         Map<Long, Double> out = new LinkedHashMap<>();
         for (Hotel h : pool) {
-            double path = centroid == null ? 0.5
+            // 网搜扩充酒店无坐标：路径分取中性 0.5（不参与距离排序）
+            double path = centroid == null || h.getLng() == null || h.getLat() == null
+                    ? 0.5
                     : 1 / (1 + GeoUtils.distanceKm(centroid[0], centroid[1], h.getLng(), h.getLat()));
             double cost = costScore(num(h.getPricePerNight()), min, max, budget);
             double sight = 0.5 * ratingOf(h.getRating())
@@ -129,6 +131,10 @@ public final class CandidateScorer {
         int n = 0;
         for (Attraction o : pool) {
             if (o.getId() != null && o.getId().equals(a.getId())) {
+                continue;
+            }
+            // 网搜扩充景点无坐标：跳过该对，不参与距离均值
+            if (a.getLng() == null || a.getLat() == null || o.getLng() == null || o.getLat() == null) {
                 continue;
             }
             sumKm += GeoUtils.distanceKm(a.getLng(), a.getLat(), o.getLng(), o.getLat());

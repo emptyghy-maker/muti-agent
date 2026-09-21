@@ -109,6 +109,14 @@ h3 { font-size: 15px; margin: 0 0 8px; }
   background: #f6f8fa; color: #5a6b7b; border: 1px solid #e3e8ee;
 }
 
+/* 三通道并行预热：其余通道就绪提示（谁先好先展示） */
+.channel-ready { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.channel-chip {
+  display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; line-height: 20px;
+  background: #fffbe6; color: #7a5c00; border: 1px solid #ffe58f;
+}
+.channel-chip.ok { background: #f0fff4; color: #237804; border: 1px solid #b7eb8f; }
+
 /* 阶段2：联网检索推荐（知识库外参考展示） */
 .web-group { border-top: 1px dashed #d9d9d9; padding-top: 10px; }
 .web-group .cuisine { color: #2b6cb0; }

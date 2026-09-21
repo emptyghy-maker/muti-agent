@@ -26,15 +26,24 @@ CREATE TABLE IF NOT EXISTS t_attraction (
   name VARCHAR(128) NOT NULL,
   category VARCHAR(32) NOT NULL,
   features VARCHAR(255),
+  tags VARCHAR(255) NULL COMMENT '结构化标签（受控词表，逗号分隔）',
   intensity TINYINT NOT NULL DEFAULT 3,
   suggest_hours DECIMAL(3,1) NOT NULL DEFAULT 2.0,
   ticket_price DECIMAL(10,2) NOT NULL DEFAULT 0,
-  lng DECIMAL(10,6) NOT NULL,
-  lat DECIMAL(10,6) NOT NULL,
+  address VARCHAR(128) NULL COMMENT '街道/商圈级位置（网搜景点）',
+  lng DECIMAL(10,6) NULL COMMENT '经度（网搜景点允许为空）',
+  lat DECIMAL(10,6) NULL COMMENT '纬度（网搜景点允许为空）',
   rating DECIMAL(2,1) NOT NULL DEFAULT 4.5,
   open_time VARCHAR(64),
   indoor TINYINT NOT NULL DEFAULT 0,
   status TINYINT NOT NULL DEFAULT 1,
+  source VARCHAR(16) NOT NULL DEFAULT 'KB' COMMENT 'KB=知识库种子 / WEB_SEARCH=联网检索扩充',
+  source_ref VARCHAR(64) NULL COMMENT '来源会话标识',
+  source_note VARCHAR(255) NULL COMMENT '来源说明（检索匹配理由）',
+  recommend_count INT NOT NULL DEFAULT 0 COMMENT '被推荐展示的不同会话数（晋升口径）',
+  select_count INT NOT NULL DEFAULT 0 COMMENT '被用户勾选的不同会话数（晋升口径）',
+  last_recommended_at DATETIME(3) NULL COMMENT '最近一次被推荐时间（跨会话复用新鲜度锚点）',
+  promoted_at DATETIME(3) NULL COMMENT '晋升 KB_PROMOTED 的时间',
   KEY idx_dest (destination_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -51,8 +60,25 @@ CREATE TABLE IF NOT EXISTS t_restaurant (
   rating DECIMAL(2,1) NOT NULL DEFAULT 4.5,
   business_hours VARCHAR(64),
   status TINYINT NOT NULL DEFAULT 1,
+  recommend_count INT NOT NULL DEFAULT 0 COMMENT '被推荐展示的不同会话数（晋升口径）',
+  select_count INT NOT NULL DEFAULT 0 COMMENT '被用户勾选的不同会话数（晋升口径）',
+  last_recommended_at DATETIME(3) NULL COMMENT '最近一次被推荐时间（跨会话复用新鲜度锚点）',
+  promoted_at DATETIME(3) NULL COMMENT '晋升 KB_PROMOTED 的时间',
   KEY idx_dest (destination_id),
   KEY idx_cuisine (cuisine)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- POI 推荐事件（网搜店 → 知识库 的计数依据；place_type + 唯一键去重防刷）
+CREATE TABLE IF NOT EXISTS t_poi_recommend_event (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  restaurant_id BIGINT NOT NULL,
+  place_type VARCHAR(16) NOT NULL DEFAULT 'FOOD' COMMENT 'FOOD / ATTRACTION / HOTEL',
+  destination_id BIGINT NOT NULL,
+  event_type VARCHAR(16) NOT NULL,
+  session_id VARCHAR(64) NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_event_dedup (place_type, restaurant_id, event_type, session_id),
+  KEY idx_dest (destination_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 酒店
@@ -61,12 +87,21 @@ CREATE TABLE IF NOT EXISTS t_hotel (
   destination_id BIGINT NOT NULL,
   name VARCHAR(128) NOT NULL,
   price_per_night DECIMAL(10,2) NOT NULL,
+  address VARCHAR(128) NULL COMMENT '街道/商圈级位置（网搜酒店）',
   rating DECIMAL(2,1) NOT NULL DEFAULT 4.5,
   level VARCHAR(16) NOT NULL DEFAULT '舒适',
-  lng DECIMAL(10,6) NOT NULL,
-  lat DECIMAL(10,6) NOT NULL,
+  lng DECIMAL(10,6) NULL COMMENT '经度（网搜酒店允许为空）',
+  lat DECIMAL(10,6) NULL COMMENT '纬度（网搜酒店允许为空）',
   features VARCHAR(255),
+  tags VARCHAR(255) NULL COMMENT '结构化标签（受控词表，逗号分隔）',
   status TINYINT NOT NULL DEFAULT 1,
+  source VARCHAR(16) NOT NULL DEFAULT 'KB' COMMENT 'KB=知识库种子 / WEB_SEARCH=联网检索扩充',
+  source_ref VARCHAR(64) NULL COMMENT '来源会话标识',
+  source_note VARCHAR(255) NULL COMMENT '来源说明（检索匹配理由）',
+  recommend_count INT NOT NULL DEFAULT 0 COMMENT '被推荐展示的不同会话数（晋升口径）',
+  select_count INT NOT NULL DEFAULT 0 COMMENT '被用户勾选的不同会话数（晋升口径）',
+  last_recommended_at DATETIME(3) NULL COMMENT '最近一次被推荐时间（跨会话复用新鲜度锚点）',
+  promoted_at DATETIME(3) NULL COMMENT '晋升 KB_PROMOTED 的时间',
   KEY idx_dest (destination_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

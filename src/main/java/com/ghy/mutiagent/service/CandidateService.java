@@ -20,7 +20,9 @@ import com.ghy.mutiagent.model.RequirementSnapshot;
 import com.ghy.mutiagent.model.TravelPreference;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.UsageChannel;
+import com.ghy.mutiagent.model.WebAttractionCandidate;
 import com.ghy.mutiagent.model.WebFoodCandidate;
+import com.ghy.mutiagent.model.WebHotelCandidate;
 import com.ghy.mutiagent.repository.entity.Attraction;
 import com.ghy.mutiagent.repository.entity.Hotel;
 import com.ghy.mutiagent.repository.entity.Restaurant;
@@ -36,7 +38,9 @@ import com.ghy.mutiagent.rule.TagMatcher;
 import com.ghy.mutiagent.trace.AgentTrace;
 import com.ghy.mutiagent.trace.TraceContext;
 import com.ghy.mutiagent.trace.TraceService;
+import com.ghy.mutiagent.service.validation.WebAttractionValidator;
 import com.ghy.mutiagent.service.validation.WebFoodValidator;
+import com.ghy.mutiagent.service.validation.WebHotelValidator;
 import dev.langchain4j.model.output.TokenUsage;
 import dev.langchain4j.service.Result;
 import org.slf4j.Logger;
@@ -83,10 +87,15 @@ public class CandidateService {
     private static final int HOTEL_BATCH = 5;
     /** AI 重筛后酒店池低于该数量时用规则池补足（AI 精挑常只有 3 家，太少用户没法选） */
     private static final int HOTEL_POOL_FLOOR = 6;
+    /** AI 重筛后景点池低于该数量时触发联网检索/规则补足（对称于酒店 HOTEL_POOL_FLOOR） */
+    private static final int ATTRACTION_SEARCH_FLOOR = 8;
     /** AI 重筛时最多保留数量 */
     private static final int LLM_SELECT_MAX = 12;
     /** 联网检索单次最多接收条数（提示词上限 20，留余量） */
     private static final int WEB_FOOD_MAX = 24;
+    /** 景点/酒店联网检索单次最多接收条数（与美食同口径） */
+    private static final int WEB_ATTRACTION_MAX = 24;
+    private static final int WEB_HOTEL_MAX = 24;
     /** 分页游标失效（快照被新约束版本取代） */
     public static final String REVISION_CONFLICT = "REVISION_CONFLICT";
 
@@ -95,6 +104,15 @@ public class CandidateService {
     /** 类型化地点键：ATTRACTION:1 与 FOOD:1 严格区分 */
     public static String placeKey(String type, long id) {
         return type + ":" + id;
+    }
+
+    /**
+     * 通道独立请求解析：通道有专属快照时用快照（三通道并行对话，单通道重筛 latest-wins，
+     * 互不污染），无快照的通道沿用全局额外要求（旧行为）。
+     */
+    private static String channelRequest(TravelState state, String channel) {
+        String own = state.channelRequestOf(channel);
+        return own != null && !own.isBlank() ? own : state.getExtraRequest();
     }
 
     /** 分页结果：status=OK 或 REVISION_CONFLICT；pageKeys 为快照 orderedKeys 的纯切片 */
@@ -323,6 +341,10 @@ public class CandidateService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private WebFoodAuditMapper webFoodAuditMapper;
 
+    /** POI 推荐计数与晋升组件（可空：未装配时保持既有行为——无跨会话复用/计数/晋升，功能隔离） */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private FoodPromotionService promotion;
+
     /** 联网搜索模型（需支持 enable_search） */
     @Value("${llm.search-model:qwen3.8-max}")
     private String searchModel;
@@ -435,12 +457,12 @@ public class CandidateService {
         }
     }
 
-    /** 偏好 JSON + 用户在候选阶段的自由表达（额外要求注入 AI 重筛） */
-    private String prefJson(TravelState state) throws Exception {
+    /** 偏好 JSON + 该通道的额外要求（通道独立请求优先，AI 重筛注入用） */
+    private String prefJson(TravelState state, String request) throws Exception {
         String json = objectMapper.writeValueAsString(state.getPreference());
         StringBuilder extra = new StringBuilder();
-        if (state.getExtraRequest() != null && !state.getExtraRequest().isBlank()) {
-            extra.append("\n\n用户额外要求：").append(state.getExtraRequest());
+        if (request != null && !request.isBlank()) {
+            extra.append("\n\n用户额外要求：").append(request);
         }
         if (state.getNeedTags() != null && !state.getNeedTags().isEmpty()) {
             extra.append("\n\n需求匹配关键字：").append(String.join("、", state.getNeedTags()))
@@ -554,12 +576,97 @@ public class CandidateService {
 
         boolean aiOk = true;
         List<Attraction> finalEntities = poolEntities;
-        if (state.getExtraRequest() != null && !state.getExtraRequest().isBlank()) {
-            List<Attraction> refined = refineAttractionsByAi(state, poolEntities, pool);
+        String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_ATTRACTION);
+        if (req != null && !req.isBlank()) {
+            List<Attraction> refined = refineAttractionsByAi(state, poolEntities, pool, req);
             if (refined != null) {
-                finalEntities = refined;
-                acceptedByOrigin.put("AI", finalEntities.stream()
-                        .map(a -> placeKey("ATTRACTION", a.getId())).toList());
+                boolean suppressed = false;
+                if (refined.isEmpty()) {
+                    // AI 表示池内无匹配（如地点限制）：保留规则池兜底展示，同时自动联网检索补候选
+                    evidence.put("aiNoMatch", true);
+                    suppressed = triggerWebSearchForAttractions(state);
+                } else if (refined.size() < ATTRACTION_SEARCH_FLOOR) {
+                    // 确定性触发：AI 精挑数量低于下限即视为覆盖不足，直接联网检索扩充——
+                    // 不依赖 advice 文本措辞（措辞多变会漏触发）
+                    evidence.put("aiInsufficient", true);
+                    suppressed = triggerWebSearchForAttractions(state);
+                }
+                // AI 精挑通常只有几家：先并入本会话已通过校验入库的网搜景点（与 KB 景点同等对待），
+                // 仍不足下限时再用规则池补足（补足项同样已经过硬过滤）
+                finalEntities = new ArrayList<>(refined);
+                Set<Long> chosenIds = refined.stream().map(Attraction::getId).collect(Collectors.toSet());
+                List<String> aiAccepted = refined.stream()
+                        .map(a -> placeKey("ATTRACTION", a.getId())).toList();
+                List<String> webAccepted = new ArrayList<>();
+                List<String> backfillAccepted = new ArrayList<>();
+                List<AttractionCandidate> extraPool = new ArrayList<>();
+                // 网搜补充池：本会话新搜结果在前；跨会话复用（历史验证过的网搜景点）在后（功能隔离：未装配时只有前者）
+                List<Attraction> webPool = new ArrayList<>(webExpandedAttractions(state, poolEntities));
+                Set<Long> webPoolIds = webPool.stream().map(Attraction::getId).collect(Collectors.toSet());
+                if (promotion != null) {
+                    for (Attraction w : promotion.reusableWebAttractions(state.getDestinationId(),
+                            java.time.LocalDateTime.now())) {
+                        if (webPoolIds.add(w.getId())) {
+                            webPool.add(w);
+                        }
+                    }
+                }
+                for (Attraction w : webPool) {
+                    if (finalEntities.size() >= ATTRACTION_SEARCH_FLOOR) {
+                        break;
+                    }
+                    if (chosenIds.add(w.getId())) {
+                        finalEntities.add(w);
+                        extraPool.add(attractionOf(w, "联网检索补充"));
+                        webAccepted.add(placeKey("ATTRACTION", w.getId()));
+                        if (promotion != null) {
+                            // 晋升计数是旁路功能：任何异常都不阻断候选主流程
+                            try {
+                                promotion.recordRecommend(FoodPromotionService.TYPE_ATTRACTION,
+                                        state.getSessionId(), w.getId(), state.getDestinationId());
+                            } catch (Exception e) {
+                                log.warn("网搜景点推荐计数失败（{}），已降级跳过", e.getClass().getSimpleName());
+                            }
+                        }
+                    }
+                }
+                if (!webAccepted.isEmpty()) {
+                    String adv = state.getCandidateAdvice();
+                    state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
+                            + (suppressed
+                                ? "已复用历史网搜结果补充 " + webAccepted.size() + " 个符合要求的景点。"
+                                : "已联网检索扩充 " + webAccepted.size() + " 个符合要求的景点。"));
+                } else if (Boolean.TRUE.equals(evidence.get("aiInsufficient"))
+                        || Boolean.TRUE.equals(evidence.get("aiNoMatch"))) {
+                    // 触发过检索但没有新条目并入（失败或全部被校验拒绝）：保持既有文案；
+                    // 仅当检索被「历史复用抑制」跳过时使用新文案，两种场景都如实告知
+                    String adv = state.getCandidateAdvice();
+                    state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
+                            + (suppressed
+                                ? "（本次未获取到新的联网结果，已按备选池给出结果，可稍后重试）"
+                                : "（联网检索暂不可用，本次按备选池给出结果，可稍后重试）"));
+                }
+                for (Attraction a : poolEntities) {
+                    if (finalEntities.size() >= ATTRACTION_SEARCH_FLOOR) {
+                        break;
+                    }
+                    if (chosenIds.add(a.getId())) {
+                        finalEntities.add(a);
+                        extraPool.add(attractionOf(a, "综合推荐"));
+                        backfillAccepted.add(placeKey("ATTRACTION", a.getId()));
+                    }
+                }
+                acceptedByOrigin.put("AI", aiAccepted);
+                acceptedByOrigin.put("WEB", webAccepted);
+                acceptedByOrigin.put("BACKFILL", backfillAccepted);
+                // 以最终实体重建展示池（保留 AI 精选项的 why 文案，网搜/补足项按最终顺序并入）
+                Map<Long, AttractionCandidate> whyById = new LinkedHashMap<>();
+                pool.forEach(c -> whyById.putIfAbsent(c.getAttractionId(), c));
+                extraPool.forEach(c -> whyById.putIfAbsent(c.getAttractionId(), c));
+                pool.clear();
+                for (Attraction a : finalEntities) {
+                    pool.add(whyById.getOrDefault(a.getId(), attractionOf(a, "综合推荐")));
+                }
             } else {
                 aiOk = false;
                 acceptedByOrigin.put("BACKFILL", sqlAccepted);
@@ -604,13 +711,13 @@ public class CandidateService {
 
     /** 额外要求存在时：让 AttractionAgent 带着要求从池中重筛（失败返回 null 沿用规则池） */
     private List<Attraction> refineAttractionsByAi(TravelState state, List<Attraction> poolEntities,
-                                                   List<AttractionCandidate> pool) {
+                                                   List<AttractionCandidate> pool, String request) {
         String raw = null;
         try {
             String poolJson = objectMapper.writeValueAsString(
                     poolEntities.stream().map(this::attractionPoolItem).toList());
             int target = Math.min(LLM_SELECT_MAX, poolEntities.size());
-            String prefJson = prefJson(state);
+            String prefJson = prefJson(state, request);
             Traced<String> traced = withTrace(state, "AttractionAgent", "景点AI重筛",
                     () -> attractionAgent.select(poolJson, prefJson, target));
             raw = traced.content();
@@ -647,7 +754,7 @@ public class CandidateService {
                     break;
                 }
             }
-            if (refined.isEmpty()) {
+            if (refined.isEmpty() && itemsNode.size() > 0) {
                 // S03：全部 ID 无效（池外/非法/硬约束）→ 降级且清除未验证 advice，不把模型自由文本当事实展示
                 // S12：模型成功但语义失败——validation=FAILED + 回退原因 + 业务结果 DEGRADED
                 span.setValidationStatus(AgentTrace.FAILED);
@@ -656,6 +763,15 @@ public class CandidateService {
                 state.setCandidateAdvice(null);
                 log.warn("景点候选 AI 输出解析后有效项为 0（输出形状或 id 与池不符），原始输出前300字：{}", snippet(raw));
                 return null;
+            }
+            if (refined.isEmpty()) {
+                // AI 明确表示池内无匹配（如地点限制）：这是合法语义结果而非失败——
+                // 返回空列表，调用方保留规则池兜底展示并触发联网检索补候选（与美食通道同口径）
+                span.setValidationStatus(AgentTrace.SUCCESS);
+                span.setFallbackReason("POOL_NO_MATCH");
+                traced.ctx().setBusinessStatus("DEGRADED");
+                log.warn("景点候选 AI 表示池内无匹配（items 为空），将保留规则池并尝试联网检索。原始输出前300字：{}", snippet(raw));
+                return new ArrayList<>();
             }
             span.setValidationStatus(AgentTrace.SUCCESS);
             traced.ctx().setBusinessStatus("COMMITTED");
@@ -811,18 +927,20 @@ public class CandidateService {
 
         boolean aiOk = true;
         List<Restaurant> finalEntities = poolEntities;
-        if (state.getExtraRequest() != null && !state.getExtraRequest().isBlank()) {
-            List<Restaurant> refined = refineFoodsByAi(state, poolEntities, target, mealTypes);
+        String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_FOOD);
+        if (req != null && !req.isBlank()) {
+            List<Restaurant> refined = refineFoodsByAi(state, poolEntities, target, mealTypes, req);
             if (refined != null) {
+                boolean suppressed = false;
                 if (refined.isEmpty()) {
                     // AI 表示池内无匹配（如地点限制）：保留规则池兜底展示，同时自动联网检索补候选
                     evidence.put("aiNoMatch", true);
-                    triggerWebSearchOnNoMatch(state);
+                    suppressed = triggerWebSearchOnNoMatch(state);
                 } else if (refined.size() < target) {
                     // 确定性触发：AI 精挑数量低于目标即视为覆盖不足（如「园区仅 1 家符合选址，
                     // 其余补位」），直接联网检索扩充——不依赖 advice 文本措辞（措辞多变会漏触发）
                     evidence.put("aiInsufficient", true);
-                    triggerWebSearchOnNoMatch(state);
+                    suppressed = triggerWebSearchOnNoMatch(state);
                 }
                 // AI 精挑通常只有 2~3 家：先并入本会话已通过校验入库的网搜店（与 KB 店同等对待），
                 // 仍不足目标数量时再用规则池补足（补足项同样已经过硬过滤与小吃排除）
@@ -831,25 +949,49 @@ public class CandidateService {
                 List<String> aiAccepted = refined.stream().map(r -> placeKey("FOOD", r.getId())).toList();
                 List<String> webAccepted = new ArrayList<>();
                 List<String> backfillAccepted = new ArrayList<>();
-                for (Restaurant w : webExpandedRestaurants(state, poolEntities)) {
+                // 网搜补充池：本会话新搜结果在前；跨会话复用（历史验证过的网搜店）在后（功能隔离：未装配时只有前者）
+                List<Restaurant> webPool = new ArrayList<>(webExpandedRestaurants(state, poolEntities));
+                Set<Long> webPoolIds = webPool.stream().map(Restaurant::getId).collect(Collectors.toSet());
+                if (promotion != null) {
+                    for (Restaurant w : promotion.reusableWebRestaurants(state.getDestinationId(),
+                            java.time.LocalDateTime.now())) {
+                        if (webPoolIds.add(w.getId())) {
+                            webPool.add(w);
+                        }
+                    }
+                }
+                for (Restaurant w : webPool) {
                     if (finalEntities.size() >= target) {
                         break;
                     }
                     if (chosenIds.add(w.getId())) {
                         finalEntities.add(w);
                         webAccepted.add(placeKey("FOOD", w.getId()));
+                        if (promotion != null) {
+                            // 晋升计数是旁路功能：任何异常都不阻断候选主流程（表缺失/并发冲突等降级为不计数）
+                            try {
+                                promotion.recordRecommend(state.getSessionId(), w.getId(), state.getDestinationId());
+                            } catch (Exception e) {
+                                log.warn("网搜店推荐计数失败（{}），已降级跳过", e.getClass().getSimpleName());
+                            }
+                        }
                     }
                 }
                 if (!webAccepted.isEmpty()) {
                     String adv = state.getCandidateAdvice();
                     state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
-                            + "已联网检索扩充 " + webAccepted.size() + " 家符合要求的店铺。");
+                            + (suppressed
+                                ? "已复用历史网搜结果补充 " + webAccepted.size() + " 家符合要求的店铺。"
+                                : "已联网检索扩充 " + webAccepted.size() + " 家符合要求的店铺。"));
                 } else if (Boolean.TRUE.equals(evidence.get("aiInsufficient"))
                         || Boolean.TRUE.equals(evidence.get("aiNoMatch"))) {
-                    // 触发过检索但没有新条目并入（失败或全部被校验拒绝）：如实告知，避免用户以为列表已更新
+                    // 触发过检索但没有新条目并入（失败或全部被校验拒绝）：保持既有文案；
+                    // 仅当检索被「历史复用抑制」跳过时使用新文案，两种场景都如实告知
                     String adv = state.getCandidateAdvice();
                     state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
-                            + "（联网检索暂不可用，本次按备选池给出结果，可稍后重试）");
+                            + (suppressed
+                                ? "（本次未获取到新的联网结果，已按备选池给出结果，可稍后重试）"
+                                : "（联网检索暂不可用，本次按备选池给出结果，可稍后重试）"));
                 }
                 for (Restaurant r : poolEntities) {
                     if (finalEntities.size() >= target) {
@@ -938,12 +1080,12 @@ public class CandidateService {
 
     /** 额外要求存在时：让 FoodAgent 带着要求重筛（失败返回 null 沿用规则池）；AI 可修正各店餐次归类 */
     private List<Restaurant> refineFoodsByAi(TravelState state, List<Restaurant> poolEntities,
-                                             int target, Map<Long, String> mealTypes) {
+                                             int target, Map<Long, String> mealTypes, String request) {
         String raw = null;
         try {
             String poolJson = objectMapper.writeValueAsString(
                     poolEntities.stream().map(this::restaurantPoolItem).toList());
-            String prefJson = prefJson(state);
+            String prefJson = prefJson(state, request);
             Traced<String> traced = withTrace(state, "FoodAgent", "美食AI重筛",
                     () -> foodAgent.select(poolJson, prefJson, target));
             raw = traced.content();
@@ -1090,11 +1232,23 @@ public class CandidateService {
         }
     }
 
-    /** AI 明确表示池内无匹配或覆盖不足时：自动联网检索补充候选（同一需求只搜一次，失败静默降级） */
-    private void triggerWebSearchOnNoMatch(TravelState state) {
-        String key = "confirm:" + (state.getExtraRequest() == null ? "" : state.getExtraRequest());
+    /**
+     * AI 明确表示池内无匹配或覆盖不足时：自动联网检索补充候选。
+     * 同一需求只搜一次（会话内去重）；存在可复用历史网搜店时跳过本次检索（跨会话复用，
+     * 避免同需求重复付费搜索；未装配晋升组件时无此抑制，保持既有行为）。
+     * 返回 true 表示本次检索被「历史复用抑制」跳过（未发起检索）。
+     */
+    private boolean triggerWebSearchOnNoMatch(TravelState state) {
+        String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_FOOD);
+        String key = "confirm:" + (req == null ? "" : req);
         if (key.equals(state.getWebSearchKey())) {
-            return;
+            return false;
+        }
+        if (promotion != null
+                && !promotion.reusableWebRestaurants(state.getDestinationId(),
+                        java.time.LocalDateTime.now()).isEmpty()) {
+            log.info("[Food][sessionId={}] 存在可复用历史网搜店，跳过本次联网检索", state.getSessionId());
+            return true;
         }
         List<WebFoodCandidate> web = searchFoodsOnline(state);
         if (web != null && !web.isEmpty()) {
@@ -1102,6 +1256,391 @@ public class CandidateService {
             state.setWebSearchKey(key);
             state.setWebFoodCandidates(web);
         }
+        return false;
+    }
+
+    /** 景点通道：AI 表示池内无匹配或覆盖不足时自动联网检索补充（会话内去重，语义与美食通道对称）。
+     *  存在可复用历史网搜景点时跳过本次检索（跨会话复用，避免同需求重复付费搜索；
+     *  未装配晋升组件时无此抑制，保持既有行为）。返回 true 表示本次检索被「历史复用抑制」跳过。 */
+    private boolean triggerWebSearchForAttractions(TravelState state) {
+        String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_ATTRACTION);
+        String key = "confirm:" + (req == null ? "" : req);
+        if (key.equals(state.getWebAttractionSearchKey())) {
+            return false;
+        }
+        if (promotion != null
+                && !promotion.reusableWebAttractions(state.getDestinationId(),
+                        java.time.LocalDateTime.now()).isEmpty()) {
+            log.info("[Attraction][sessionId={}] 存在可复用历史网搜景点，跳过本次联网检索", state.getSessionId());
+            return true;
+        }
+        List<WebAttractionCandidate> web = searchAttractionsOnline(state);
+        if (web != null && !web.isEmpty()) {
+            state.setWebAttractionSearchKey(key);
+            state.setWebAttractionCandidates(web);
+        }
+        return false;
+    }
+
+    /** 酒店通道：AI 表示池内无匹配或覆盖不足时自动联网检索补充（会话内去重，语义与美食通道对称）。
+     *  存在可复用历史网搜酒店时跳过本次检索。返回 true 表示本次检索被「历史复用抑制」跳过。 */
+    private boolean triggerWebSearchForHotels(TravelState state) {
+        String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_HOTEL);
+        String key = "confirm:" + (req == null ? "" : req);
+        if (key.equals(state.getWebHotelSearchKey())) {
+            return false;
+        }
+        if (promotion != null
+                && !promotion.reusableWebHotels(state.getDestinationId(),
+                        java.time.LocalDateTime.now()).isEmpty()) {
+            log.info("[Hotel][sessionId={}] 存在可复用历史网搜酒店，跳过本次联网检索", state.getSessionId());
+            return true;
+        }
+        List<WebHotelCandidate> web = searchHotelsOnline(state);
+        if (web != null && !web.isEmpty()) {
+            state.setWebHotelSearchKey(key);
+            state.setWebHotelCandidates(web);
+        }
+        return false;
+    }
+
+    /**
+     * 景点通道：知识库无法满足时联网检索真实景点（enable_search），与知识库景点名去重。
+     * 失败或未找到返回 null（调用方降级为仅知识库推荐，不阻塞主流程）。
+     */
+    public List<WebAttractionCandidate> searchAttractionsOnline(TravelState state) {
+        if (dashScopeSearchClient == null) {
+            log.warn("[Candidate] 联网检索客户端不可用，景点通道跳过");
+            return null;
+        }
+        long start = System.currentTimeMillis();
+        String raw = null;
+        // O1：搜索也是一次物理 provider attempt——独立 PROVIDER 叶子 span（与候选重筛 span 同口径）
+        TraceContext sctx = traceService.newTrace(state.getSessionId(), "AttractionSearchAgent");
+        sctx.setSpanId("AttractionSearchAgent-" + UUID.randomUUID());
+        sctx.setKind("PROVIDER");
+        traceService.register(sctx);
+        try {
+            String city = state.getDestinationName();
+            String system = loadPrompt("prompts/search_attraction.txt");
+            String user = "城市：" + city
+                    + "\n用户的特殊需求：" + state.getExtraRequest()
+                    + "\n用户偏好：" + objectMapper.writeValueAsString(state.getPreference());
+            DashScopeSearchClient.SearchResult r = dashScopeSearchClient.search(system, user);
+            raw = r.content();
+            int promptTokens = r.promptTokens() == null ? 0 : r.promptTokens();
+            int completionTokens = r.completionTokens() == null ? 0 : r.completionTokens();
+            TokenUsage searchUsage = new TokenUsage(promptTokens, completionTokens);
+            JsonNode node = JsonUtils.readTree(raw);
+            Set<String> kbNames = attractionMapper.selectList(new LambdaQueryWrapper<Attraction>()
+                            .eq(Attraction::getDestinationId, state.getDestinationId())
+                            .eq(Attraction::getStatus, 1))
+                    .stream().map(Attraction::getName).collect(Collectors.toSet());
+            List<WebAttractionCandidate> items = new ArrayList<>();
+            for (JsonNode it : node.path("items")) {
+                String name = it.path("name").asText("").trim();
+                if (name.isBlank() || items.size() >= WEB_ATTRACTION_MAX) {
+                    continue;
+                }
+                if (kbNames.stream().anyMatch(kb -> kb.contains(name) || name.contains(kb))) {
+                    continue;
+                }
+                WebAttractionCandidate w = new WebAttractionCandidate();
+                w.setName(name);
+                w.setCategory(it.path("category").asText("").trim());
+                w.setTags(it.path("tags").asText("").trim());
+                try {
+                    w.setTicketPrice(new BigDecimal(it.path("ticketPrice").asText("").trim()));
+                } catch (NumberFormatException ignored) {
+                    // 价格缺失：保留 null，由入库校验拒绝（价格未知的景点不进知识库）
+                }
+                w.setAddress(it.path("address").asText("").trim());
+                w.setWhy(it.path("why").asText("").trim());
+                items.add(w);
+            }
+            // 入库前确定性校验 + 审计 + 扩充知识库：只返回通过校验并成功入库的条目
+            List<WebAttractionCandidate> accepted = ingestWebAttraction(state, items, kbNames);
+            state.setWebAttractionCandidates(accepted);
+            long cost = System.currentTimeMillis() - start;
+            AgentTrace sspan = AgentTrace.success("AttractionSearchAgent", cost, searchUsage);
+            sspan.setAnswer(UsageService.clip(raw, 2000));
+            sctx.add(sspan);
+            sctx.finish("SUCCESS");
+            // O1：搜索 token 与耗时如实落库（attempt 明细行），并归集到本轮（turn）
+            String remark = "n=" + accepted.size()
+                    + (accepted.size() < items.size() ? ",rejected=" + (items.size() - accepted.size()) : "");
+            usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
+                    "ATTRACTIONS", "景点联网检索", "AttractionSearchAgent", searchUsage, cost, "SUCCESS",
+                    remark, searchModel, UsageChannel.AGENT,
+                    UsageService.clip(raw, 2000));
+            state.addTurnUsage(searchModel, promptTokens, completionTokens, UsageChannel.AGENT);
+            return accepted.isEmpty() ? null : accepted;
+        } catch (Exception e) {
+            long cost = System.currentTimeMillis() - start;
+            log.warn("景点联网检索失败（{}），降级为仅知识库推荐", e.getClass().getName());
+            AgentTrace sspan = AgentTrace.failure("AttractionSearchAgent", cost,
+                    e.getClass().getName() + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+            sctx.add(sspan);
+            sctx.finish("FAILED");
+            usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
+                    "ATTRACTIONS", "景点联网检索", "AttractionSearchAgent", null, cost, "FAILED",
+                    e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()),
+                    searchModel, UsageChannel.RULE_FALLBACK, null);
+            return null;
+        } finally {
+            traceService.finish(sctx);
+        }
+    }
+
+    /**
+     * 酒店通道：知识库无法满足时联网检索真实酒店（enable_search），与知识库酒店名去重。
+     * 失败或未找到返回 null（调用方降级为仅知识库推荐，不阻塞主流程）。
+     */
+    public List<WebHotelCandidate> searchHotelsOnline(TravelState state) {
+        if (dashScopeSearchClient == null) {
+            log.warn("[Candidate] 联网检索客户端不可用，酒店通道跳过");
+            return null;
+        }
+        long start = System.currentTimeMillis();
+        String raw = null;
+        // O1：搜索也是一次物理 provider attempt——独立 PROVIDER 叶子 span（与候选重筛 span 同口径）
+        TraceContext sctx = traceService.newTrace(state.getSessionId(), "HotelSearchAgent");
+        sctx.setSpanId("HotelSearchAgent-" + UUID.randomUUID());
+        sctx.setKind("PROVIDER");
+        traceService.register(sctx);
+        try {
+            String city = state.getDestinationName();
+            String system = loadPrompt("prompts/search_hotel.txt");
+            String user = "城市：" + city
+                    + "\n用户的特殊需求：" + state.getExtraRequest()
+                    + "\n用户偏好：" + objectMapper.writeValueAsString(state.getPreference());
+            DashScopeSearchClient.SearchResult r = dashScopeSearchClient.search(system, user);
+            raw = r.content();
+            int promptTokens = r.promptTokens() == null ? 0 : r.promptTokens();
+            int completionTokens = r.completionTokens() == null ? 0 : r.completionTokens();
+            TokenUsage searchUsage = new TokenUsage(promptTokens, completionTokens);
+            JsonNode node = JsonUtils.readTree(raw);
+            Set<String> kbNames = hotelMapper.selectList(new LambdaQueryWrapper<Hotel>()
+                            .eq(Hotel::getDestinationId, state.getDestinationId())
+                            .eq(Hotel::getStatus, 1))
+                    .stream().map(Hotel::getName).collect(Collectors.toSet());
+            List<WebHotelCandidate> items = new ArrayList<>();
+            for (JsonNode it : node.path("items")) {
+                String name = it.path("name").asText("").trim();
+                if (name.isBlank() || items.size() >= WEB_HOTEL_MAX) {
+                    continue;
+                }
+                if (kbNames.stream().anyMatch(kb -> kb.contains(name) || name.contains(kb))) {
+                    continue;
+                }
+                WebHotelCandidate w = new WebHotelCandidate();
+                w.setName(name);
+                try {
+                    w.setPricePerNight(new BigDecimal(it.path("pricePerNight").asText("").trim()));
+                } catch (NumberFormatException ignored) {
+                    // 价格缺失：保留 null，由入库校验拒绝（价格未知的酒店不进知识库）
+                }
+                w.setLevel(it.path("level").asText("").trim());
+                w.setTags(it.path("tags").asText("").trim());
+                w.setAddress(it.path("address").asText("").trim());
+                w.setWhy(it.path("why").asText("").trim());
+                items.add(w);
+            }
+            // 入库前确定性校验 + 审计 + 扩充知识库：只返回通过校验并成功入库的条目
+            List<WebHotelCandidate> accepted = ingestWebHotel(state, items, kbNames);
+            state.setWebHotelCandidates(accepted);
+            long cost = System.currentTimeMillis() - start;
+            AgentTrace sspan = AgentTrace.success("HotelSearchAgent", cost, searchUsage);
+            sspan.setAnswer(UsageService.clip(raw, 2000));
+            sctx.add(sspan);
+            sctx.finish("SUCCESS");
+            // O1：搜索 token 与耗时如实落库（attempt 明细行），并归集到本轮（turn）
+            String remark = "n=" + accepted.size()
+                    + (accepted.size() < items.size() ? ",rejected=" + (items.size() - accepted.size()) : "");
+            usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
+                    "HOTELS", "酒店联网检索", "HotelSearchAgent", searchUsage, cost, "SUCCESS",
+                    remark, searchModel, UsageChannel.AGENT,
+                    UsageService.clip(raw, 2000));
+            state.addTurnUsage(searchModel, promptTokens, completionTokens, UsageChannel.AGENT);
+            return accepted.isEmpty() ? null : accepted;
+        } catch (Exception e) {
+            long cost = System.currentTimeMillis() - start;
+            log.warn("酒店联网检索失败（{}），降级为仅知识库推荐", e.getClass().getName());
+            AgentTrace sspan = AgentTrace.failure("HotelSearchAgent", cost,
+                    e.getClass().getName() + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+            sctx.add(sspan);
+            sctx.finish("FAILED");
+            usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
+                    "HOTELS", "酒店联网检索", "HotelSearchAgent", null, cost, "FAILED",
+                    e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()),
+                    searchModel, UsageChannel.RULE_FALLBACK, null);
+            return null;
+        } finally {
+            traceService.finish(sctx);
+        }
+    }
+
+    /** 本会话已通过校验入库的网搜景点（不在当前 KB 池内，避免重复并入）；source 双重过滤防异常数据混入 */
+    private List<Attraction> webExpandedAttractions(TravelState state, List<Attraction> poolEntities) {
+        Set<Long> kbIds = poolEntities.stream().map(Attraction::getId).collect(Collectors.toSet());
+        List<Attraction> web = attractionMapper.selectList(new LambdaQueryWrapper<Attraction>()
+                .eq(Attraction::getDestinationId, state.getDestinationId())
+                .eq(Attraction::getSource, "WEB_SEARCH")
+                .eq(Attraction::getSourceRef, state.getSessionId())
+                .eq(Attraction::getStatus, 1));
+        return web.stream()
+                .filter(a -> "WEB_SEARCH".equals(a.getSource())
+                        && a.getId() != null && !kbIds.contains(a.getId()))
+                .toList();
+    }
+
+    /** 本会话已通过校验入库的网搜酒店（不在当前 KB 池内，避免重复并入）；source 双重过滤防异常数据混入 */
+    private List<Hotel> webExpandedHotels(TravelState state, List<Hotel> poolEntities) {
+        Set<Long> kbIds = poolEntities.stream().map(Hotel::getId).collect(Collectors.toSet());
+        List<Hotel> web = hotelMapper.selectList(new LambdaQueryWrapper<Hotel>()
+                .eq(Hotel::getDestinationId, state.getDestinationId())
+                .eq(Hotel::getSource, "WEB_SEARCH")
+                .eq(Hotel::getSourceRef, state.getSessionId())
+                .eq(Hotel::getStatus, 1));
+        return web.stream()
+                .filter(h -> "WEB_SEARCH".equals(h.getSource())
+                        && h.getId() != null && !kbIds.contains(h.getId()))
+                .toList();
+    }
+
+    /**
+     * 网搜景点入库：确定性校验 → 审计 → 扩充知识库；只返回通过校验并成功入库的条目。
+     * 防恶意写入与美食通道同口径：参数化 insert + WebAttractionValidator 把关 + t_web_food_audit 留痕。
+     */
+    private List<WebAttractionCandidate> ingestWebAttraction(TravelState state, List<WebAttractionCandidate> items,
+                                                             Set<String> kbNames) {
+        List<WebAttractionCandidate> accepted = new ArrayList<>();
+        Set<String> taken = new LinkedHashSet<>();
+        for (WebAttractionCandidate w : items) {
+            String norm = normalizeName(w.getName());
+            boolean dup = !taken.add(norm) || kbNames.stream().anyMatch(k -> {
+                String kn = normalizeName(k);
+                return kn.equals(norm) || (kn.length() >= 4 && norm.length() >= 4
+                        && (kn.contains(norm) || norm.contains(kn)));
+            });
+            List<String> reasons = WebAttractionValidator.validate(w);
+            if (!dup) {
+                // 与已入库的网搜景点再查重（同目的地同来源同名）
+                Long same = attractionMapper.selectCount(new LambdaQueryWrapper<Attraction>()
+                        .eq(Attraction::getDestinationId, state.getDestinationId())
+                        .eq(Attraction::getSource, "WEB_SEARCH")
+                        .eq(Attraction::getName, w.getName()));
+                if (same != null && same > 0) {
+                    dup = true;
+                    reasons = List.of("DUPLICATE_DB");
+                }
+            }
+            if (dup && reasons.isEmpty()) {
+                reasons = List.of("DUPLICATE");
+            }
+            if (!reasons.isEmpty()) {
+                auditWebPoi(state, "ATTRACTION", null, w.getName(), w.getCategory(), w.getTicketPrice(),
+                        w.getAddress(), "REJECT", String.join(",", reasons), w.getWhy());
+                continue;
+            }
+            Attraction a = new Attraction();
+            a.setDestinationId(state.getDestinationId());
+            a.setName(w.getName().trim());
+            a.setCategory(w.getCategory().trim());
+            a.setFeatures(w.getTags().trim());
+            a.setTags(w.getTags().trim());
+            a.setIntensity(3);
+            a.setSuggestHours(2.0);
+            a.setTicketPrice(w.getTicketPrice());
+            a.setRating(4.5);
+            a.setIndoor(0);
+            a.setStatus(1);
+            a.setAddress(blankToNull(w.getAddress()));
+            a.setSource("WEB_SEARCH");
+            a.setSourceRef(state.getSessionId());
+            a.setSourceNote(UsageService.clip(w.getWhy(), 200));
+            try {
+                if (attractionMapper.insert(a) > 0) {
+                    accepted.add(w);
+                    auditWebPoi(state, "ATTRACTION", a.getId(), w.getName(), w.getCategory(), w.getTicketPrice(),
+                            w.getAddress(), "ACCEPT", null, w.getWhy());
+                } else {
+                    auditWebPoi(state, "ATTRACTION", null, w.getName(), w.getCategory(), w.getTicketPrice(),
+                            w.getAddress(), "REJECT", "INSERT_FAILED", w.getWhy());
+                }
+            } catch (Exception e) {
+                log.warn("网搜景点入库失败（{}）：{}", w.getName(), e.getClass().getSimpleName());
+                auditWebPoi(state, "ATTRACTION", null, w.getName(), w.getCategory(), w.getTicketPrice(),
+                        w.getAddress(), "REJECT", "INSERT_ERROR", w.getWhy());
+            }
+        }
+        return accepted;
+    }
+
+    /**
+     * 网搜酒店入库：确定性校验 → 审计 → 扩充知识库；只返回通过校验并成功入库的条目。
+     * 防恶意写入与美食通道同口径：参数化 insert + WebHotelValidator 把关 + t_web_food_audit 留痕。
+     */
+    private List<WebHotelCandidate> ingestWebHotel(TravelState state, List<WebHotelCandidate> items,
+                                                   Set<String> kbNames) {
+        List<WebHotelCandidate> accepted = new ArrayList<>();
+        Set<String> taken = new LinkedHashSet<>();
+        for (WebHotelCandidate w : items) {
+            String norm = normalizeName(w.getName());
+            boolean dup = !taken.add(norm) || kbNames.stream().anyMatch(k -> {
+                String kn = normalizeName(k);
+                return kn.equals(norm) || (kn.length() >= 4 && norm.length() >= 4
+                        && (kn.contains(norm) || norm.contains(kn)));
+            });
+            List<String> reasons = WebHotelValidator.validate(w);
+            if (!dup) {
+                // 与已入库的网搜酒店再查重（同目的地同来源同名）
+                Long same = hotelMapper.selectCount(new LambdaQueryWrapper<Hotel>()
+                        .eq(Hotel::getDestinationId, state.getDestinationId())
+                        .eq(Hotel::getSource, "WEB_SEARCH")
+                        .eq(Hotel::getName, w.getName()));
+                if (same != null && same > 0) {
+                    dup = true;
+                    reasons = List.of("DUPLICATE_DB");
+                }
+            }
+            if (dup && reasons.isEmpty()) {
+                reasons = List.of("DUPLICATE");
+            }
+            if (!reasons.isEmpty()) {
+                auditWebPoi(state, "HOTEL", null, w.getName(), w.getLevel(), w.getPricePerNight(),
+                        w.getAddress(), "REJECT", String.join(",", reasons), w.getWhy());
+                continue;
+            }
+            Hotel h = new Hotel();
+            h.setDestinationId(state.getDestinationId());
+            h.setName(w.getName().trim());
+            h.setPricePerNight(w.getPricePerNight());
+            h.setRating(4.5);
+            h.setLevel(blankToNull(w.getLevel()) == null ? "舒适" : w.getLevel().trim());
+            h.setFeatures(w.getTags().trim());
+            h.setTags(w.getTags().trim());
+            h.setStatus(1);
+            h.setAddress(blankToNull(w.getAddress()));
+            h.setSource("WEB_SEARCH");
+            h.setSourceRef(state.getSessionId());
+            h.setSourceNote(UsageService.clip(w.getWhy(), 200));
+            try {
+                if (hotelMapper.insert(h) > 0) {
+                    accepted.add(w);
+                    auditWebPoi(state, "HOTEL", h.getId(), w.getName(), w.getLevel(), w.getPricePerNight(),
+                            w.getAddress(), "ACCEPT", null, w.getWhy());
+                } else {
+                    auditWebPoi(state, "HOTEL", null, w.getName(), w.getLevel(), w.getPricePerNight(),
+                            w.getAddress(), "REJECT", "INSERT_FAILED", w.getWhy());
+                }
+            } catch (Exception e) {
+                log.warn("网搜酒店入库失败（{}）：{}", w.getName(), e.getClass().getSimpleName());
+                auditWebPoi(state, "HOTEL", null, w.getName(), w.getLevel(), w.getPricePerNight(),
+                        w.getAddress(), "REJECT", "INSERT_ERROR", w.getWhy());
+            }
+        }
+        return accepted;
     }
 
     /** 本会话已通过校验入库的网搜店（不在当前 KB 池内，避免重复并入）；source 双重过滤防异常数据混入 */
@@ -1150,7 +1689,8 @@ public class CandidateService {
                 reasons = List.of("DUPLICATE");
             }
             if (!reasons.isEmpty()) {
-                auditWebFood(state, w, "REJECT", String.join(",", reasons));
+                auditWebPoi(state, "FOOD", null, w.getName(), w.getCuisine(), w.getAvgPrice(),
+                        w.getAddress(), "REJECT", String.join(",", reasons), w.getWhy());
                 continue;
             }
             Restaurant r = new Restaurant();
@@ -1167,20 +1707,27 @@ public class CandidateService {
             try {
                 if (restaurantMapper.insert(r) > 0) {
                     accepted.add(w);
-                    auditWebFood(state, w, "ACCEPT", null);
+                    auditWebPoi(state, "FOOD", r.getId(), w.getName(), w.getCuisine(), w.getAvgPrice(),
+                            w.getAddress(), "ACCEPT", null, w.getWhy());
                 } else {
-                    auditWebFood(state, w, "REJECT", "INSERT_FAILED");
+                    auditWebPoi(state, "FOOD", null, w.getName(), w.getCuisine(), w.getAvgPrice(),
+                            w.getAddress(), "REJECT", "INSERT_FAILED", w.getWhy());
                 }
             } catch (Exception e) {
                 log.warn("网搜店铺入库失败（{}）：{}", w.getName(), e.getClass().getSimpleName());
-                auditWebFood(state, w, "REJECT", "INSERT_ERROR");
+                auditWebPoi(state, "FOOD", null, w.getName(), w.getCuisine(), w.getAvgPrice(),
+                        w.getAddress(), "REJECT", "INSERT_ERROR", w.getWhy());
             }
         }
         return accepted;
     }
 
-    /** 逐条审计：接受/拒绝都留痕（mapper 未装配时静默跳过，不影响主流程） */
-    private void auditWebFood(TravelState state, WebFoodCandidate w, String action, String rejectReason) {
+    /**
+     * 逐条审计：接受/拒绝都留痕（mapper 未装配时静默跳过，不影响主流程）。
+     * placeType 区分 FOOD/ATTRACTION/HOTEL；placeId 为入库后的 POI 主键（ACCEPT 时回填）。
+     */
+    private void auditWebPoi(TravelState state, String placeType, Long placeId, String name, String secondary,
+                             BigDecimal price, String address, String action, String rejectReason, String why) {
         if (webFoodAuditMapper == null) {
             return;
         }
@@ -1189,13 +1736,15 @@ public class CandidateService {
             a.setSessionId(state.getSessionId());
             a.setDestinationId(state.getDestinationId());
             a.setUserId(state.getUserId());
-            a.setName(UsageService.clip(w.getName(), 128));
-            a.setCuisine(UsageService.clip(w.getCuisine(), 32));
-            a.setAvgPrice(w.getAvgPrice());
-            a.setAddress(UsageService.clip(w.getAddress(), 128));
+            a.setPlaceType(placeType);
+            a.setPlaceId(placeId);
+            a.setName(UsageService.clip(name, 128));
+            a.setCuisine(UsageService.clip(secondary, 32));
+            a.setAvgPrice(price);
+            a.setAddress(UsageService.clip(address, 128));
             a.setAction(action);
             a.setRejectReason(UsageService.clip(rejectReason, 255));
-            a.setRawPayload(UsageService.clip("name=" + w.getName() + "; why=" + w.getWhy(), 500));
+            a.setRawPayload(UsageService.clip("name=" + name + "; why=" + why, 500));
             webFoodAuditMapper.insert(a);
         } catch (Exception e) {
             log.warn("网搜审计写入失败：{}", e.getClass().getSimpleName());
@@ -1306,13 +1855,13 @@ public class CandidateService {
             "特色小吃", "想吃小吃", "要小吃", "来点小吃", "点小吃", "尝尝小吃");
 
     private static boolean priceSensitive(TravelState state) {
-        return containsAny(state.getExtraRequest(), PRICE_SENSITIVE_WORDS)
+        return containsAny(channelRequest(state, CandidateChannelCoordinator.CHANNEL_FOOD), PRICE_SENSITIVE_WORDS)
                 || containsAny(state.getPreference() == null ? null
                         : state.getPreference().getSpecialRequests(), PRICE_SENSITIVE_WORDS);
     }
 
     private static boolean wantsSnacks(TravelState state) {
-        return containsAny(state.getExtraRequest(), SNACK_WANT_WORDS)
+        return containsAny(channelRequest(state, CandidateChannelCoordinator.CHANNEL_FOOD), SNACK_WANT_WORDS)
                 || containsAny(state.getPreference() == null ? null
                         : state.getPreference().getSpecialRequests(), SNACK_WANT_WORDS);
     }
@@ -1503,9 +2052,10 @@ public class CandidateService {
         HardConstraintEvaluator.HardPolicy policy = buildHardPolicy(state);
         String city = state.getDestinationName();
 
-        // S07：距离排序后逐项硬过滤（禁止截断后过滤）
+        // S07：距离排序后逐项硬过滤（禁止截断后过滤）；网搜酒店无坐标排到末尾
         List<Hotel> sorted = hotels.stream()
-                .sorted(Comparator.comparingDouble(h -> GeoUtils.distanceKm(center[0], center[1], h.getLng(), h.getLat())))
+                .sorted(Comparator.comparingDouble(h -> distanceKmSafe(center, h.getLng(), h.getLat()) == null
+                        ? Double.MAX_VALUE : distanceKmSafe(center, h.getLng(), h.getLat())))
                 .toList();
         List<Hotel> poolEntities = new ArrayList<>();
         Map<String, Object> evidence = new LinkedHashMap<>();
@@ -1531,26 +2081,95 @@ public class CandidateService {
 
         boolean aiOk = true;
         List<Hotel> finalEntities = poolEntities;
-        if (state.getExtraRequest() != null && !state.getExtraRequest().isBlank()) {
-            List<Hotel> refined = refineHotelsByAi(state, poolEntities, pool, center);
+        String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_HOTEL);
+        if (req != null && !req.isBlank()) {
+            List<Hotel> refined = refineHotelsByAi(state, poolEntities, pool, center, req);
             if (refined != null) {
-                // AI 精挑通常只有 3 家：不足 6 家时用规则池补足（补足项同步进展示池）
+                boolean suppressed = false;
+                if (refined.isEmpty()) {
+                    // AI 表示池内无匹配：保留规则池兜底展示，同时自动联网检索补候选
+                    evidence.put("aiNoMatch", true);
+                    suppressed = triggerWebSearchForHotels(state);
+                } else if (refined.size() < HOTEL_POOL_FLOOR) {
+                    // 确定性触发：AI 精挑数量低于下限即视为覆盖不足，直接联网检索扩充
+                    evidence.put("aiInsufficient", true);
+                    suppressed = triggerWebSearchForHotels(state);
+                }
+                // AI 精挑通常只有 3 家：先并入本会话已通过校验入库的网搜酒店（与 KB 酒店同等对待），
+                // 仍不足下限时用规则池补足（补足项同样已经过硬过滤）
                 finalEntities = new ArrayList<>(refined);
-                Set<Long> refinedIds = refined.stream().map(Hotel::getId).collect(Collectors.toSet());
+                Set<Long> chosenIds = refined.stream().map(Hotel::getId).collect(Collectors.toSet());
                 List<String> aiAccepted = refined.stream().map(h -> placeKey("HOTEL", h.getId())).toList();
+                List<String> webAccepted = new ArrayList<>();
                 List<String> backfillAccepted = new ArrayList<>();
+                List<HotelCandidate> extraPool = new ArrayList<>();
+                // 网搜补充池：本会话新搜结果在前；跨会话复用（历史验证过的网搜酒店）在后（功能隔离：未装配时只有前者）
+                List<Hotel> webPool = new ArrayList<>(webExpandedHotels(state, poolEntities));
+                Set<Long> webPoolIds = webPool.stream().map(Hotel::getId).collect(Collectors.toSet());
+                if (promotion != null) {
+                    for (Hotel w : promotion.reusableWebHotels(state.getDestinationId(),
+                            java.time.LocalDateTime.now())) {
+                        if (webPoolIds.add(w.getId())) {
+                            webPool.add(w);
+                        }
+                    }
+                }
+                for (Hotel w : webPool) {
+                    if (finalEntities.size() >= HOTEL_POOL_FLOOR) {
+                        break;
+                    }
+                    if (chosenIds.add(w.getId())) {
+                        finalEntities.add(w);
+                        extraPool.add(hotelOf(w, center, "联网检索补充"));
+                        webAccepted.add(placeKey("HOTEL", w.getId()));
+                        if (promotion != null) {
+                            // 晋升计数是旁路功能：任何异常都不阻断候选主流程
+                            try {
+                                promotion.recordRecommend(FoodPromotionService.TYPE_HOTEL,
+                                        state.getSessionId(), w.getId(), state.getDestinationId());
+                            } catch (Exception e) {
+                                log.warn("网搜酒店推荐计数失败（{}），已降级跳过", e.getClass().getSimpleName());
+                            }
+                        }
+                    }
+                }
+                if (!webAccepted.isEmpty()) {
+                    String adv = state.getCandidateAdvice();
+                    state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
+                            + (suppressed
+                                ? "已复用历史网搜结果补充 " + webAccepted.size() + " 家符合要求的酒店。"
+                                : "已联网检索扩充 " + webAccepted.size() + " 家符合要求的酒店。"));
+                } else if (Boolean.TRUE.equals(evidence.get("aiInsufficient"))
+                        || Boolean.TRUE.equals(evidence.get("aiNoMatch"))) {
+                    // 触发过检索但没有新条目并入（失败或全部被校验拒绝）：保持既有文案；
+                    // 仅当检索被「历史复用抑制」跳过时使用新文案，两种场景都如实告知
+                    String adv = state.getCandidateAdvice();
+                    state.setCandidateAdvice((adv == null || adv.isBlank() ? "" : adv.trim() + " ")
+                            + (suppressed
+                                ? "（本次未获取到新的联网结果，已按备选池给出结果，可稍后重试）"
+                                : "（联网检索暂不可用，本次按备选池给出结果，可稍后重试）"));
+                }
                 for (Hotel h : poolEntities) {
                     if (finalEntities.size() >= HOTEL_POOL_FLOOR) {
                         break;
                     }
-                    if (!refinedIds.contains(h.getId())) {
+                    if (chosenIds.add(h.getId())) {
                         finalEntities.add(h);
-                        pool.add(hotelOf(h, center, "综合推荐"));
+                        extraPool.add(hotelOf(h, center, "综合推荐"));
                         backfillAccepted.add(placeKey("HOTEL", h.getId()));
                     }
                 }
                 acceptedByOrigin.put("AI", aiAccepted);
+                acceptedByOrigin.put("WEB", webAccepted);
                 acceptedByOrigin.put("BACKFILL", backfillAccepted);
+                // 以最终实体重建展示池（保留 AI 精选项的 why 文案；无坐标网搜酒店距离为 null）
+                Map<Long, HotelCandidate> whyById = new LinkedHashMap<>();
+                pool.forEach(c -> whyById.putIfAbsent(c.getHotelId(), c));
+                extraPool.forEach(c -> whyById.putIfAbsent(c.getHotelId(), c));
+                pool.clear();
+                for (Hotel h : finalEntities) {
+                    pool.add(whyById.getOrDefault(h.getId(), hotelOf(h, center, "综合推荐")));
+                }
             } else {
                 aiOk = false;
                 acceptedByOrigin.put("BACKFILL", acceptedByOrigin.get("SQL"));
@@ -1597,12 +2216,12 @@ public class CandidateService {
     }
 
     private List<Hotel> refineHotelsByAi(TravelState state, List<Hotel> poolEntities,
-                                         List<HotelCandidate> pool, double[] center) {
+                                         List<HotelCandidate> pool, double[] center, String request) {
         String raw = null;
         try {
             String poolJson = objectMapper.writeValueAsString(
                     poolEntities.stream().map(h -> hotelPoolItem(h, center)).toList());
-            String prefJson = prefJson(state);
+            String prefJson = prefJson(state, request);
             Traced<String> traced = withTrace(state, "HotelAgent", "酒店AI重筛",
                     () -> hotelAgent.select(poolJson, prefJson));
             raw = traced.content();
@@ -1639,13 +2258,22 @@ public class CandidateService {
                     break;
                 }
             }
-            if (refined.isEmpty()) {
+            if (refined.isEmpty() && itemsNode.size() > 0) {
                 // S12：模型成功但语义失败——validation=FAILED + 回退原因 + 业务结果 DEGRADED
                 span.setValidationStatus(AgentTrace.FAILED);
                 span.setFallbackReason("HARD_CONSTRAINT_VIOLATION");
                 traced.ctx().setBusinessStatus("DEGRADED");
                 log.warn("酒店候选 AI 输出解析后有效项为 0（输出形状或 id 与池不符），原始输出前300字：{}", snippet(raw));
                 return null;
+            }
+            if (refined.isEmpty()) {
+                // AI 明确表示池内无匹配：合法语义结果而非失败——返回空列表，
+                // 调用方保留规则池兜底展示并触发联网检索补候选（与美食/景点通道同口径）
+                span.setValidationStatus(AgentTrace.SUCCESS);
+                span.setFallbackReason("POOL_NO_MATCH");
+                traced.ctx().setBusinessStatus("DEGRADED");
+                log.warn("酒店候选 AI 表示池内无匹配（items 为空），将保留规则池并尝试联网检索。原始输出前300字：{}", snippet(raw));
+                return new ArrayList<>();
             }
             span.setValidationStatus(AgentTrace.SUCCESS);
             traced.ctx().setBusinessStatus("COMMITTED");
@@ -1733,11 +2361,19 @@ public class CandidateService {
         c.setName(h.getName());
         c.setPricePerNight(h.getPricePerNight());
         c.setRating(h.getRating());
-        c.setDistanceToCenter(round(GeoUtils.distanceKm(center[0], center[1], h.getLng(), h.getLat())));
+        c.setDistanceToCenter(distanceKmSafe(center, h.getLng(), h.getLat()));
         c.setFeature(h.getFeatures());
         c.setTags(h.getTags());
         c.setWhy(why);
         return c;
+    }
+
+    /** 距中心距离（公里）；任一端无坐标返回 null（网搜酒店无坐标，前端不展示距离） */
+    private Double distanceKmSafe(double[] center, Double lng, Double lat) {
+        if (center == null || lng == null || lat == null) {
+            return null;
+        }
+        return round(GeoUtils.distanceKm(center[0], center[1], lng, lat));
     }
 
     private double round(double v) {

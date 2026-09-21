@@ -35,4 +35,12 @@ public class Restaurant {
     private String sourceRef;
     /** 来源说明（网搜匹配理由） */
     private String sourceNote;
+    /** 推荐计数（被纳入候选池展示的不同会话数，POI 晋升口径） */
+    private Integer recommendCount;
+    /** 勾选计数（被用户确认选择的不同会话数，POI 晋升口径） */
+    private Integer selectCount;
+    /** 最近一次被推荐时间（跨会话复用新鲜度锚点） */
+    private java.time.LocalDateTime lastRecommendedAt;
+    /** 晋升为知识库的时间（KB_PROMOTED） */
+    private java.time.LocalDateTime promotedAt;
 }
