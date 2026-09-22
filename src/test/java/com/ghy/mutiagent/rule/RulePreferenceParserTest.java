@@ -52,6 +52,38 @@ class RulePreferenceParserTest {
     }
 
     @Test
+    void 预算问题下纯数字按预算解析且没有残余() {
+        RuleParseResult r = parser.parseResult("600", "totalBudget", null);
+
+        assertThat(r.getUpdates()).containsEntry("totalBudget", "600");
+        assertThat(r.getBudget()).isNotNull();
+        assertThat(r.getBudget().getTarget()).isEqualByComparingTo("600");
+        assertThat(r.getUnresolvedText()).isNull();
+    }
+
+    @Test
+    void 天数和人数问题支持纯数字短答() {
+        assertThat(parser.parse("6", "days")).containsEntry("days", "6");
+        assertThat(parser.parse("4", "peopleCount")).containsEntry("peopleCount", "4");
+    }
+
+    @Test
+    void 没有字段上下文时不把纯数字猜成预算() {
+        RuleParseResult r = parser.parseResult("600", null, null);
+
+        assertThat(r.getUpdates()).doesNotContainKey("totalBudget");
+        assertThat(r.getUnresolvedText()).isEqualTo("600");
+    }
+
+    @Test
+    void 带其他字段单位的数字仍按显式字段解析() {
+        RuleParseResult r = parser.parseResult("3天", "totalBudget", null);
+
+        assertThat(r.getUpdates()).containsEntry("days", "3")
+                .doesNotContainKey("totalBudget");
+    }
+
+    @Test
     void 短句婉拒标记当前字段为不确定() {
         assertThat(parser.parse("随便", "days")).containsEntry("days", "UNSURE");
         assertThat(parser.parse("还没想好", "totalBudget")).containsEntry("totalBudget", "UNSURE");

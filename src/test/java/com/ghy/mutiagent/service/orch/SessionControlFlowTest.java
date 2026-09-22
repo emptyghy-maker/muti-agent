@@ -173,6 +173,28 @@ class SessionControlFlowTest {
         verify(sessionService, never()).save(any());
     }
 
+    @Test
+    void 预算问题输入纯数字直接推进且不写入特殊需求() {
+        TravelOrchestrator contextAware = new TravelOrchestrator(sessionService, destinationMapper,
+                new RulePreferenceParser(), preferenceAgent, requirementAgent, candidateService,
+                itineraryService, usageService, traceService, new ObjectMapper(), Runnable::run,
+                operationService);
+        TravelState s = state(TravelStage.PREFERENCE);
+        s.getPreference().setDays(1);
+        s.getPreference().markConfirmed("days");
+        s.setCurrentField("totalBudget");
+        when(sessionService.loadOwned("old-session", 7L)).thenReturn(s);
+
+        ChatStepResult result = contextAware.chat(actor, "old-session", "600");
+
+        assertThat(s.getPreference().getTotalBudget()).isEqualByComparingTo("600");
+        assertThat(s.getPreference().getSpecialRequests()).isNull();
+        assertThat(result.getQuestion()).isNotNull();
+        assertThat(result.getQuestion().getField()).isEqualTo("peopleCount");
+        assertThat(result.getMessage()).contains("预算 600 元");
+        verify(preferenceAgent, never()).parse(any(), any(), any(), any());
+    }
+
     private TravelState state(TravelStage stage) {
         TravelState s = new TravelState();
         s.setSessionId("old-session");

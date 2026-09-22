@@ -100,6 +100,14 @@ public class RulePreferenceParser {
             return r;
         }
 
+        // 2.5 当前问题上下文中的纯数值回答：
+        // 问“预算多少”答“600”时，数字本身就是预算，不应作为未解析残余进入特殊需求。
+        // 天数、人数使用同一规则，并在这里先做范围校验，非法数字仍留给后续澄清。
+        if (parseContextualScalar(m, currentField, r)) {
+            r.getIntents().add("CONDITION");
+            return r;
+        }
+
         // 3. 否定纠正：「不是3天，是5天」→ 5
         Matcher neg = Pattern.compile("不是\\s*(\\d+)\\s*天[，,、\\s]*是?\\s*(\\d+)\\s*天").matcher(m);
         if (neg.find()) {
@@ -173,6 +181,67 @@ public class RulePreferenceParser {
             r.getIntents().add("CONDITION");
         }
         return r;
+    }
+
+    /** 只在明确的数值型当前问题下解释无主语短答，避免脱离上下文时把任意数字猜成预算。 */
+    private boolean parseContextualScalar(String message, String currentField, RuleParseResult r) {
+        if (currentField == null) {
+            return false;
+        }
+        Pattern expected = switch (currentField) {
+            case "totalBudget" -> Pattern.compile("^(\\d+(?:\\.\\d+)?)\\s*(?:元|块)?\\s*(?:左右|上下)?$");
+            case "days" -> Pattern.compile("^(\\d+(?:\\.\\d+)?)\\s*天?$");
+            case "peopleCount" -> Pattern.compile("^(\\d+(?:\\.\\d+)?)\\s*(?:个?人)?$");
+            default -> null;
+        };
+        if (expected == null) {
+            return false;
+        }
+        Matcher scalar = expected.matcher(message);
+        if (!scalar.matches()) {
+            return false;
+        }
+        BigDecimal number = new BigDecimal(scalar.group(1));
+        switch (currentField) {
+            case "totalBudget" -> {
+                if (number.signum() <= 0) {
+                    return false;
+                }
+                String value = number.stripTrailingZeros().toPlainString();
+                r.getUpdates().put("totalBudget", value);
+                BudgetSpec spec = new BudgetSpec();
+                spec.setTarget(number);
+                spec.setScope("GROUP_TRIP");
+                r.setBudget(spec);
+                return true;
+            }
+            case "days" -> {
+                try {
+                    int value = number.intValueExact();
+                    if (value >= 1 && value <= 15) {
+                        r.getUpdates().put("days", String.valueOf(value));
+                        return true;
+                    }
+                } catch (ArithmeticException ignored) {
+                    // 小数天数或超范围数字不强行解释，交给后续澄清。
+                }
+            }
+            case "peopleCount" -> {
+                try {
+                    int value = number.intValueExact();
+                    if (value >= 1 && value <= 20) {
+                        r.getUpdates().put("peopleCount", String.valueOf(value));
+                        return true;
+                    }
+                } catch (ArithmeticException ignored) {
+                    // 小数人数或超范围数字不强行解释，交给后续澄清。
+                }
+            }
+            default -> {
+                return false;
+            }
+        }
+        return false;
     }
 
     // ==================== 约束抽取 ====================
