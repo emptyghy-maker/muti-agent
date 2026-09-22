@@ -17,6 +17,7 @@ import com.ghy.mutiagent.model.FoodCandidate;
 import com.ghy.mutiagent.model.HotelCandidate;
 import com.ghy.mutiagent.model.LockedSelection;
 import com.ghy.mutiagent.model.RequirementSnapshot;
+import com.ghy.mutiagent.model.ResolvedPlanningPolicy;
 import com.ghy.mutiagent.model.TravelPreference;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.UsageChannel;
@@ -34,7 +35,10 @@ import com.ghy.mutiagent.repository.mapper.WebFoodAuditMapper;
 import com.ghy.mutiagent.rule.AhpWeightCalculator;
 import com.ghy.mutiagent.rule.CandidateScorer;
 import com.ghy.mutiagent.rule.HardConstraintEvaluator;
+import com.ghy.mutiagent.rule.MealPolicySupport;
+import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.rule.TagMatcher;
+import com.ghy.mutiagent.model.requirement.RequirementScope;
 import com.ghy.mutiagent.trace.AgentTrace;
 import com.ghy.mutiagent.trace.TraceContext;
 import com.ghy.mutiagent.trace.TraceService;
@@ -468,22 +472,21 @@ public class CandidateService {
             extra.append("\n\n需求匹配关键字：").append(String.join("、", state.getNeedTags()))
                     .append("\n请优先推荐同时命中多个关键字的候选。");
         }
-        TravelPreference.MealPlan mp = state.getPreference() == null
-                ? null : state.getPreference().getMealPlan();
-        if (mp != null && (mp.getBreakfastPerDay() != null || mp.getLunchPerDay() != null
-                || mp.getDinnerPerDay() != null || mp.getSnacksAllowed() != null)) {
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (isExplicitMeal(planning.getMeal().getLunch()) || isExplicitMeal(planning.getMeal().getDinner())
+                || planning.getMeal().getLunchCandidateCount() != null
+                || planning.getMeal().getDinnerCandidateCount() != null
+                || !planning.getMeal().isSnacksAllowed()) {
             List<String> parts = new ArrayList<>();
-            if (mp.getBreakfastPerDay() != null) {
-                parts.add("早餐 " + mp.getBreakfastPerDay() + " 顿/天");
+            parts.add(mealRuleSummary(planning.getMeal().getLunch(), "午餐"));
+            parts.add(mealRuleSummary(planning.getMeal().getDinner(), "晚餐"));
+            if (planning.getMeal().getLunchCandidateCount() != null) {
+                parts.add("午餐候选店 " + planning.getMeal().getLunchCandidateCount() + " 家");
             }
-            if (mp.getLunchPerDay() != null) {
-                parts.add("午餐 " + mp.getLunchPerDay() + " 顿/天");
+            if (planning.getMeal().getDinnerCandidateCount() != null) {
+                parts.add("晚餐候选店 " + planning.getMeal().getDinnerCandidateCount() + " 家");
             }
-            if (mp.getDinnerPerDay() != null) {
-                parts.add("晚餐 " + mp.getDinnerPerDay() + " 顿/天");
-            }
-            // 与生成侧 excludeSnacks 同口径：提出餐次/正餐需求即默认不含小吃，显式要小吃才保留
-            if (Boolean.TRUE.equals(mp.getSnacksAllowed())) {
+            if (planning.getMeal().isSnacksAllowed()) {
                 parts.add("含小吃/夜宵");
             } else {
                 parts.add("不含小吃/夜宵");
@@ -491,6 +494,14 @@ public class CandidateService {
             extra.append("\n\n餐次结构：").append(String.join("，", parts));
         }
         return json + extra;
+    }
+
+    private static String mealRuleSummary(ResolvedPlanningPolicy.MealRule rule, String label) {
+        if (rule == null) {
+            return label + " 0 顿";
+        }
+        String scope = rule.getScope() == RequirementScope.PER_DAY ? "每天" : "全程";
+        return label + " " + scope + " " + rule.getCount() + " 顿（" + rule.getOperator() + "）";
     }
 
     private String snippet(String raw) {
@@ -860,12 +871,13 @@ public class CandidateService {
         HardConstraintEvaluator.HardPolicy policy = buildHardPolicy(state);
         String city = state.getDestinationName();
         TravelPreference pref = state.getPreference();
-        TravelPreference.MealPlan mp = pref == null ? null : pref.getMealPlan();
-        boolean mealActive = mp != null && (mp.getBreakfastPerDay() != null
-                || mp.getLunchPerDay() != null || mp.getDinnerPerDay() != null
-                || mp.getSnacksAllowed() != null);
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        boolean mealActive = isExplicitMeal(planning.getMeal().getLunch())
+                || isExplicitMeal(planning.getMeal().getDinner())
+                || planning.getMeal().getLunchCandidateCount() != null
+                || planning.getMeal().getDinnerCandidateCount() != null;
         // 明确提出餐次/正餐需求（如「2顿午饭1顿晚饭」「不要小吃」）→ 默认不含小吃；显式「要小吃」可覆盖
-        boolean excludeSnacks = mealActive && !Boolean.TRUE.equals(mp.getSnacksAllowed());
+        boolean excludeSnacks = !planning.getMeal().isSnacksAllowed();
 
         // S07：分组前先统一硬过滤（禁止截断后过滤）
         Map<String, List<Restaurant>> groups = new LinkedHashMap<>();
@@ -877,7 +889,7 @@ public class CandidateService {
         int overCap = 0;
         for (Restaurant r : orderRestaurants(all, pref)) {
             scanned++;
-            if (excludeSnacks && "小吃".equals(r.getCuisine())) {
+            if (excludeSnacks && MealPolicySupport.isSnack(r)) {
                 continue;
             }
             HardConstraintEvaluator.Verdict v = HardConstraintEvaluator.evaluate(restaurantFact(r, city), policy);
@@ -908,19 +920,22 @@ public class CandidateService {
                 .map(r -> placeKey("FOOD", r.getId())).toList());
         Map<Long, String> mealTypes = new LinkedHashMap<>();
         if (mealActive) {
-            assignMealTypes(poolEntities, mp, daysOf(state), excludeSnacks, mealTypes);
+            assignMealTypes(poolEntities, planning, daysOf(state), excludeSnacks, mealTypes);
         }
         List<FoodCandidate> pool = new ArrayList<>(groupItems(poolEntities, mealTypes));
 
         // 目标数量：默认 1 天 3 餐（早餐 3×天数 + 正餐 6×天数），不足 15 按 15（candidate.food 可配置）；
         // 用户明确提出餐次结构时按「各餐顿数 × 天数」计算，尊重需求不再用 15 保底
         int target;
-        if (mp != null && (mp.getBreakfastPerDay() != null || mp.getLunchPerDay() != null
-                || mp.getDinnerPerDay() != null)) {
-            int perDay = (mp.getBreakfastPerDay() == null ? 0 : mp.getBreakfastPerDay())
-                    + (mp.getLunchPerDay() == null ? 0 : mp.getLunchPerDay())
-                    + (mp.getDinnerPerDay() == null ? 0 : mp.getDinnerPerDay());
-            target = Math.min(Math.max(perDay * daysOf(state), 1), poolEntities.size());
+        if (mealActive) {
+            int requiredMeals = mealEventCount(planning.getMeal().getLunch(), daysOf(state))
+                    + mealEventCount(planning.getMeal().getDinner(), daysOf(state));
+            int requestedCandidates = Math.max(
+                    planning.getMeal().getLunchCandidateCount() == null ? 0
+                            : planning.getMeal().getLunchCandidateCount(),
+                    planning.getMeal().getDinnerCandidateCount() == null ? 0
+                            : planning.getMeal().getDinnerCandidateCount());
+            target = Math.min(Math.max(Math.max(requiredMeals, requestedCandidates), 1), poolEntities.size());
         } else {
             target = foodConfig.resolveTarget(daysOf(state), poolEntities.size());
         }
@@ -1985,14 +2000,14 @@ public class CandidateService {
      * 规则侧餐次归类（知识库无店铺时段数据，属诚实近似）：
      * 小吃风味 → 小吃；其余按午饭/晚饭配额轮转；早餐类店铺无法可靠识别，留给 AI 按店名补充。
      */
-    private void assignMealTypes(List<Restaurant> pool, TravelPreference.MealPlan mp, int days,
+    private void assignMealTypes(List<Restaurant> pool, ResolvedPlanningPolicy planning, int days,
                                  boolean excludeSnacks, Map<Long, String> out) {
-        int lunchTotal = (mp.getLunchPerDay() == null ? 0 : mp.getLunchPerDay()) * days;
-        int dinnerTotal = (mp.getDinnerPerDay() == null ? 0 : mp.getDinnerPerDay()) * days;
+        int lunchTotal = mealEventCount(planning.getMeal().getLunch(), days);
+        int dinnerTotal = mealEventCount(planning.getMeal().getDinner(), days);
         int lunch = 0;
         int dinner = 0;
         for (Restaurant r : pool) {
-            if ("小吃".equals(r.getCuisine())) {
+            if (MealPolicySupport.isSnack(r)) {
                 if (!excludeSnacks) {
                     out.put(r.getId(), "小吃");
                 }
@@ -2009,6 +2024,17 @@ public class CandidateService {
                 out.put(r.getId(), "午餐");
             }
         }
+    }
+
+    private static int mealEventCount(ResolvedPlanningPolicy.MealRule rule, int days) {
+        if (rule == null) {
+            return 0;
+        }
+        return rule.getScope() == RequirementScope.PER_DAY ? rule.getCount() * days : rule.getCount();
+    }
+
+    private static boolean isExplicitMeal(ResolvedPlanningPolicy.MealRule rule) {
+        return rule != null && rule.isExplicit();
     }
 
     /** AI 输出餐次归一：仅接受四类，其余视为未标注 */

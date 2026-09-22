@@ -5,6 +5,7 @@ import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { api } from '../api'
 import ItineraryTimeline from '../components/ItineraryTimeline.vue'
 import RouteDialog from '../components/RouteDialog.vue'
+import { channelStatusFromSnapshot, isChannelTerminal } from '../utils/channelStatus'
 
 const params = new URLSearchParams((location.hash.split('?')[1] || ''))
 const destinationId = Number(params.get('destinationId'))
@@ -175,6 +176,8 @@ const channelReadyChips = computed(() => {
     if (ch === current) continue
     if (st[ch] === 'READY') {
       chips.push({ text: CHANNEL_LABELS[ch] + '已好', ready: true })
+    } else if (st[ch] === 'SKIPPED') {
+      continue
     } else if (stage.value === 'ATTRACTIONS') {
       chips.push({ text: CHANNEL_LABELS[ch] + '生成中…', ready: false })
     }
@@ -186,7 +189,7 @@ const channelReadyChips = computed(() => {
 async function ensureChannelPolling() {
   if (channelPolling || stage.value !== 'ATTRACTIONS' || !sessionId.value) return
   if (!Object.keys(channelStatus.value).length) return // 后端未开启并行：无就绪标记可轮询
-  const need = ['FOOD', 'HOTEL'].some(ch => channelStatus.value[ch] !== 'READY')
+  const need = ['FOOD', 'HOTEL'].some(ch => !isChannelTerminal(channelStatus.value[ch]))
   if (!need) return
   channelPolling = true
   try {
@@ -194,10 +197,11 @@ async function ensureChannelPolling() {
       await new Promise((w) => setTimeout(w, 2000))
       if (stage.value !== 'ATTRACTIONS') break
       const s = await api.get('/travel/session/' + sessionId.value)
-      // 快照同步文案不进聊天历史（与标签页切回同步同口径）
-      if (s && s.message === '已同步最新会话状态。') delete s.message
-      if (s) applyStep(s)
-      if (['FOOD', 'HOTEL'].every(ch => (channelStatus.value || {})[ch] === 'READY')) break
+      // 就绪轮询只合并通道状态。完整快照里的 selected*Ids 仍是“确认前”的旧值，
+      // 若调用 applyStep 会覆盖用户刚在页面勾选、尚未提交的候选。
+      const polledStatus = channelStatusFromSnapshot(s)
+      if (polledStatus) channelStatus.value = polledStatus
+      if (['FOOD', 'HOTEL'].every(ch => isChannelTerminal((channelStatus.value || {})[ch]))) break
     }
   } catch (e) { /* 轮询失败不阻塞：徽标停留在最近一次快照 */ } finally {
     channelPolling = false

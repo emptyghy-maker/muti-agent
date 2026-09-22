@@ -6,10 +6,16 @@ import com.ghy.mutiagent.model.ItineraryPlan;
 import com.ghy.mutiagent.model.PlaceKey;
 import com.ghy.mutiagent.model.PlanNode;
 import com.ghy.mutiagent.model.RequirementSnapshot;
+import com.ghy.mutiagent.model.ResolvedPlanningPolicy;
 import com.ghy.mutiagent.model.TravelPreference;
+import com.ghy.mutiagent.model.requirement.RequirementOperator;
+import com.ghy.mutiagent.model.requirement.RequirementScope;
+import com.ghy.mutiagent.model.requirement.RequirementSubject;
 import com.ghy.mutiagent.repository.entity.Attraction;
 import com.ghy.mutiagent.rule.MealTimeChecker;
+import com.ghy.mutiagent.rule.MealPolicySupport;
 import com.ghy.mutiagent.rule.OpeningHoursParser;
+import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.rule.PlaceKeyResolver;
 import com.ghy.mutiagent.rule.PlanNodeRef;
 
@@ -93,6 +99,7 @@ public final class ItineraryValidator {
         // 用户明确不需要美食（noFood 硬约束）：用餐由用户自行解决，不强制饭点窗口——否则与
         // 「不要 restaurant 节点」硬约束冲突，形成无法收敛的缺餐死锁
         boolean noFoodActive = activeHard(snapshot, "noFood");
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(snapshot, preference, noFoodActive);
         boolean nightCountCapped = preference != null && "ONE".equals(preference.getNightPlan());
         for (DailyPlan d : plan.getDays()) {
             int dayEndMin = dayEndMin(d, preference, snapshot, attById);
@@ -104,15 +111,11 @@ public final class ItineraryValidator {
                     nightRefs.forEach(ref -> locate(located, NIGHT_COUNT_EXCEEDED, ref));
                 }
             }
-            if (!noFoodActive) {
-                List<String> missing = new ArrayList<>(MealTimeChecker.missingWindows(d.getNodes()));
-                // 返程早于晚餐窗口结束（19:30）的当天不强制晚餐——与注入侧跳过口径一致，
-                // 避免「来不及吃晚餐」的早返程行程陷入缺餐死锁
-                missing.removeIf(m -> "晚餐".equals(m) && returnsBeforeDinner(d));
-                if (!missing.isEmpty()) {
-                    violations.add(MEAL_WINDOW_UNSATISFIABLE);
-                }
-            }
+        }
+        if (!planning.getMeal().isNoFood()
+                && (!mealRuleSatisfied(plan, planning.getMeal().getLunch())
+                || !mealRuleSatisfied(plan, planning.getMeal().getDinner()))) {
+            violations.add(MEAL_WINDOW_UNSATISFIABLE);
         }
 
         if (budget != null && knownSubtotal != null && knownSubtotal.compareTo(budget) > 0) {
@@ -137,6 +140,39 @@ public final class ItineraryValidator {
         PlanNode last = d.getNodes().get(d.getNodes().size() - 1);
         return "transport".equals(last.getType()) && last.getTime() != null
                 && last.getTime().compareTo(MealTimeChecker.DINNER_TO) < 0;
+    }
+
+    private static boolean mealRuleSatisfied(ItineraryPlan plan, ResolvedPlanningPolicy.MealRule rule) {
+        if (rule == null) {
+            return true;
+        }
+        List<Integer> eligibleCounts = new ArrayList<>();
+        for (DailyPlan day : plan.getDays()) {
+            if (!MealPolicySupport.eligible(day, rule.getSubject())) {
+                continue;
+            }
+            int actual = (int) (day.getNodes() == null ? java.util.stream.Stream.<PlanNode>empty()
+                    : day.getNodes().stream())
+                    .filter(n -> MealPolicySupport.isMealNode(n, rule.getSubject()))
+                    .count();
+            eligibleCounts.add(actual);
+        }
+        if (rule.getScope() == RequirementScope.PER_DAY) {
+            return eligibleCounts.stream().allMatch(n -> compareMealCount(n, rule.getCount(), rule.getOperator()));
+        }
+        int total = eligibleCounts.stream().mapToInt(Integer::intValue).sum();
+        return compareMealCount(total, rule.getCount(), rule.getOperator());
+    }
+
+    private static boolean compareMealCount(int actual, int expected, RequirementOperator operator) {
+        RequirementOperator op = operator == null ? RequirementOperator.EQ : operator;
+        return switch (op) {
+            case EQ -> actual == expected;
+            case AT_LEAST -> actual >= expected;
+            case AT_MOST -> actual <= expected;
+            case ALLOW -> true;
+            case FORBID -> actual == 0;
+        };
     }
 
     /** 需求快照中是否存在 ACTIVE 的指定硬约束 */

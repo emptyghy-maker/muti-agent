@@ -13,6 +13,8 @@ import com.ghy.mutiagent.repository.entity.Restaurant;
 import com.ghy.mutiagent.repository.mapper.AttractionMapper;
 import com.ghy.mutiagent.repository.mapper.HotelMapper;
 import com.ghy.mutiagent.repository.mapper.RestaurantMapper;
+import com.ghy.mutiagent.rule.RequirementMerger;
+import com.ghy.mutiagent.rule.RulePreferenceParser;
 import com.ghy.mutiagent.trace.TraceContext;
 import com.ghy.mutiagent.trace.TraceService;
 import dev.langchain4j.service.Result;
@@ -78,6 +80,7 @@ class CandidateServiceTest {
         st.setStage(TravelStage.FOODS);
         TravelPreference p = new TravelPreference();
         p.setDays(2);
+        p.setSpecialRequests("每天2顿午餐和1顿晚餐，不需要早餐");
         TravelPreference.MealPlan mp = new TravelPreference.MealPlan();
         mp.setLunchPerDay(2);
         mp.setDinnerPerDay(1);
@@ -186,5 +189,52 @@ class CandidateServiceTest {
         // AI 修正生效且归一（早饭→早餐、午饭→午餐）；补足项沿用规则配额
         assertThat(types).containsEntry(1L, "早餐").containsEntry(4L, "午餐");
         assertThat(types).containsValue("晚餐");
+    }
+
+    @Test
+    void O2_CANDIDATE_全程两午一晚的候选目标是三而不是按天放大() {
+        when(restaurantMapper.selectList(any())).thenReturn(List.of(
+                r(1, "本地菜", 4.8), r(2, "本地菜", 4.6), r(3, "火锅", 4.5),
+                r(4, "火锅", 4.4), r(5, "素斋", 4.3), r(9, "小吃", 4.9)));
+        when(foodAgent.select(anyString(), anyString(), anyInt())).thenReturn(
+                Result.<String>builder().content(
+                        "{\"items\":[{\"restaurantId\":1},{\"restaurantId\":2},{\"restaurantId\":3}]}")
+                        .build());
+        TravelState st = new TravelState();
+        st.setSessionId("o2-trip-meals");
+        st.setUserId(1L);
+        st.setDestinationId(1L);
+        st.setDestinationName("杭州");
+        st.setStage(TravelStage.FOODS);
+        st.getPreference().setDays(4);
+        RequirementMerger.mergeInto(st, new RulePreferenceParser().parseResult(
+                "全程2顿午餐和1顿晚餐", null, st.getPreference()));
+        st.setExtraRequest("严格按餐次需求筛选");
+
+        svc.generateFoods(st);
+
+        int total = st.getFoodPool().stream().mapToInt(g -> g.getRestaurants().size()).sum();
+        assertThat(total).isEqualTo(3);
+        assertThat(st.getFoodPool().stream().map(FoodCandidate::getCuisine)).doesNotContain("小吃");
+        assertThat(mealTypesOf(st).values()).containsExactlyInAnyOrder("午餐", "午餐", "晚餐");
+    }
+
+    @Test
+    void O2_T06_单独说不要小吃也会在候选层排除() {
+        when(restaurantMapper.selectList(any())).thenReturn(List.of(
+                r(1, "本地菜", 4.8), r(2, "火锅", 4.6), r(9, "小吃", 4.9)));
+        TravelState st = new TravelState();
+        st.setSessionId("o2-no-snack");
+        st.setUserId(1L);
+        st.setDestinationId(1L);
+        st.setDestinationName("杭州");
+        st.setStage(TravelStage.FOODS);
+        st.getPreference().setDays(1);
+        RequirementMerger.mergeInto(st, new RulePreferenceParser().parseResult(
+                "不要小吃", null, st.getPreference()));
+
+        svc.generateFoods(st);
+
+        assertThat(st.getFoodPool().stream().map(FoodCandidate::getCuisine)).doesNotContain("小吃");
     }
 }

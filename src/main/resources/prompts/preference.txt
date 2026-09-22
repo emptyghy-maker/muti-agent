@@ -11,10 +11,16 @@
 - specialRequests 特殊需求：自由文本；"没有/无" → "UNSURE"
 
 【输出要求】
-1. 只输出 json 本体（以 { 开头、以 } 结尾），禁止输出任何解释、思考过程、代码围栏（```）或 markdown，格式：{"updates":{"字段":"值"},"conflict":null}
+1. 只输出 json 本体（以 { 开头、以 } 结尾），禁止输出任何解释、思考过程、代码围栏（```）或 markdown，格式：{"updates":{"字段":"值"},"conflict":null,"skip":null}
 2. updates 只包含用户回复中明确提到的字段；未提到的字段一律不写。
 3. 用户回复可能同时提到多个字段（如「4天、3个人、预算3000」），请一次性全部抽取，不要只抽取正在询问的字段。
 4. 用户表达"随便/都行/还没想好/不知道/你决定/按你推荐"时，仅对「正在询问的字段」输出 "UNSURE"。若用户是在纠正/修改其他字段（如询问预算时回复"错了，我只要1天"），只抽取被修改的字段，严禁对正在询问的字段输出 "UNSURE"。
 5. 仅当用户直接否定「正在询问的字段」本身（否定词直接接主题词，如询问酒店偏好时回复"不要酒店"、"不需要酒店"）时，才对该字段输出 "UNSURE"，并把用户原话同时写入 specialRequests（追加，不要覆盖已有内容）。带修饰的表述不算否定、严禁输出 UNSURE：如"不要3星酒店"是用户对档次有要求，把原话写入 specialRequests；"不要太贵的酒店"应输出 hotelStyle「性价比优先」。
 6. 只做信息抽取，不要回答用户、不要寒暄、不要给建议。
 7. conflict：发现用户需求明显矛盾（如预算很低却要求豪华酒店）时，用一句话描述矛盾；否则为 null。
+8. 用户对「当前问题」回复的是裸否定词（整句只有"不要/不用/不需要/算了/免了/不用了"，后面没有主题词）时，结合当前问题判定语义：
+   - 当前问题问的是酒店偏好（hotelStyle）→ updates 输出 hotelStyle="UNSURE"，且 skip="noHotel"（用户是不需要酒店，而不是没想好酒店风格）；
+   - 当前问题问的是景点类型（attractionType）→ updates 输出 attractionType="UNSURE"，且 skip="noAttraction"；
+   - 当前问题问的是其他字段（days/totalBudget/peopleCount/foodTaste/energyLevel）→ 仅对该字段输出 "UNSURE"，skip=null；
+   - 裸否定词严禁写入 specialRequests。
+9. skip 字段只允许取 null、"noHotel"、"noAttraction" 三个值，且必须与第 8 条的裸否定场景对应；其余任何回复一律 skip=null。

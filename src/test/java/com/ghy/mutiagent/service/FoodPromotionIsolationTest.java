@@ -102,6 +102,7 @@ class FoodPromotionIsolationTest {
         st.setExtraRequest("苏州工业园区附近，饭店要有氛围感");
         TravelPreference p = new TravelPreference();
         p.setDays(1);
+        p.setSpecialRequests("每天2顿午餐和1顿晚餐，不需要早餐");
         TravelPreference.MealPlan mp = new TravelPreference.MealPlan();
         mp.setBreakfastPerDay(0);
         mp.setLunchPerDay(2);

@@ -1,6 +1,8 @@
 package com.ghy.mutiagent.rule;
 
 import org.junit.jupiter.api.Test;
+import com.ghy.mutiagent.model.requirement.InterpretationStatus;
+import com.ghy.mutiagent.model.requirement.RequirementScope;
 
 import java.util.Map;
 
@@ -111,12 +113,15 @@ class RulePreferenceParserTest {
     // ==================== C3 餐次结构 ====================
 
     @Test
-    void 餐次顿数与不吃早餐可同时解析() {
+    void 无范围餐次进入待澄清且不污染每日投影() {
         RuleParseResult r = parser.parseResult("我要2顿午饭1顿晚饭，不需要早餐", null, null);
         assertThat(r.getUpdates())
-                .containsEntry("lunchPerDay", "2")
-                .containsEntry("dinnerPerDay", "1")
-                .containsEntry("breakfastPerDay", "0");
+                .containsEntry("breakfastPerDay", "0")
+                .doesNotContainKeys("lunchPerDay", "dinnerPerDay");
+        assertThat(r.getConstraints()).filteredOn(c -> c.getInterpretationStatus()
+                        == InterpretationStatus.NEEDS_CLARIFICATION)
+                .hasSize(2)
+                .allSatisfy(c -> assertThat(c.getScope()).isEqualTo(RequirementScope.UNRESOLVED));
         assertThat(r.getUnresolvedText()).isNullOrEmpty();
     }
 
@@ -127,8 +132,8 @@ class RulePreferenceParserTest {
     }
 
     @Test
-    void 餐次与小吃排除可叠加() {
-        assertThat(parser.parse("2顿午饭1顿晚饭，不要小吃", null))
+    void 明确每天后才写入旧每日投影且可叠加小吃排除() {
+        assertThat(parser.parse("每天2顿午饭1顿晚饭，不要小吃", null))
                 .containsEntry("lunchPerDay", "2")
                 .containsEntry("dinnerPerDay", "1")
                 .containsEntry("snacksAllowed", "false");

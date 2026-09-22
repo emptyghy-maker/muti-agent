@@ -71,6 +71,11 @@ public class TravelPreference {
         fieldStates.put(field, "DEFAULTED");
     }
 
+    /** 撤销字段的已答标记（兜底/中途写入不算正式回答，最终问题仍需询问一次） */
+    public void unmark(String field) {
+        fieldStates.remove(field);
+    }
+
     /** 旧会话快照反序列化时字段可能为 null：统一惰性初始化 */
     public Map<String, String> fieldNotes() {
         if (fieldNotes == null) {

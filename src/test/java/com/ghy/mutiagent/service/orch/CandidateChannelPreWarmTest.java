@@ -194,6 +194,42 @@ class CandidateChannelPreWarmTest {
         verify(candidateService, times(1)).generateFoods(anyStateArg());
     }
 
+    @Test
+    void 不需要酒店时只预热美食并把酒店标记为跳过() {
+        enableParallel();
+        TravelState s = state();
+        s.setNoHotelNeeded(true);
+
+        ReflectionTestUtils.invokeMethod(orchestrator, "doCompletePreference", s);
+
+        verify(candidateService, times(1)).generateFoods(anyStateArg());
+        verify(candidateService, never()).generateHotels(anyStateArg());
+        verify(coordinator).markReady(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD),
+                eq(CandidateChannelCoordinator.STATUS_READY));
+        verify(coordinator).markReady(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_HOTEL),
+                eq(CandidateChannelCoordinator.STATUS_SKIPPED));
+        verify(coordinator, never()).putResult(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_HOTEL),
+                org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void 不需要美食时只预热酒店并把美食标记为跳过() {
+        enableParallel();
+        TravelState s = state();
+        s.setNoFoodNeeded(true);
+
+        ReflectionTestUtils.invokeMethod(orchestrator, "doCompletePreference", s);
+
+        verify(candidateService, never()).generateFoods(anyStateArg());
+        verify(candidateService, times(1)).generateHotels(anyStateArg());
+        verify(coordinator).markReady(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD),
+                eq(CandidateChannelCoordinator.STATUS_SKIPPED));
+        verify(coordinator).markReady(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_HOTEL),
+                eq(CandidateChannelCoordinator.STATUS_READY));
+        verify(coordinator, never()).putResult(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD),
+                org.mockito.ArgumentMatchers.any());
+    }
+
     private static TravelState anyStateArg() {
         return org.mockito.ArgumentMatchers.any(TravelState.class);
     }

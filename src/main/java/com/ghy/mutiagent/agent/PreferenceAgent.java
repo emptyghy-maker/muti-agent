@@ -14,8 +14,9 @@ import dev.langchain4j.service.V;
  */
 public interface PreferenceAgent {
 
-    @UserMessage("当前偏好：{{preference}}\n正在询问的字段：{{currentField}}\n用户回复：{{message}}\n\n输出格式：json")
+    @UserMessage("当前偏好：{{preference}}\n正在询问的字段：{{currentField}}\n当前问题：{{question}}\n用户回复：{{message}}\n\n输出格式：json")
     Result<String> parse(@V("preference") String preference,
                          @V("currentField") String currentField,
+                         @V("question") String question,
                          @V("message") String message);
 }

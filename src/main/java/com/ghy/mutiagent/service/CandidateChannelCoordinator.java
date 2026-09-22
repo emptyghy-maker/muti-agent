@@ -27,6 +27,9 @@ public class CandidateChannelCoordinator {
     public static final String CHANNEL_ATTRACTION = "ATTRACTION";
     public static final String CHANNEL_FOOD = "FOOD";
     public static final String CHANNEL_HOTEL = "HOTEL";
+    public static final String STATUS_READY = "READY";
+    /** 用户明确不需要该通道；它与 READY 一样是终态，但没有候选结果。 */
+    public static final String STATUS_SKIPPED = "SKIPPED";
 
     private static final Logger log = LoggerFactory.getLogger(CandidateChannelCoordinator.class);
     private static final Duration TTL = Duration.ofMinutes(30);

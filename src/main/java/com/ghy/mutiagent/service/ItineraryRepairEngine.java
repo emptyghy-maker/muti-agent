@@ -8,6 +8,7 @@ import com.ghy.mutiagent.common.ResultCode;
 import com.ghy.mutiagent.model.ItineraryPlan;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.rule.PlanNodeRef;
+import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.service.validation.ItineraryValidator;
 import dev.langchain4j.model.output.TokenUsage;
 import dev.langchain4j.service.Result;
@@ -25,7 +26,8 @@ import java.util.function.Supplier;
 public class ItineraryRepairEngine {
 
     /** 修复上下文/终止语义使用的统一违规：code 为机器可读码，nodeIds 为 PlanNodeRef 节点引用 */
-    public record RepairViolation(String code, int day, List<String> nodeIds, boolean repairable) {
+    /** 修复违规：code 修复语义码、day/nodeIds 定位、repairable 可修复性、detail 具体说明（如开放时间与超出量） */
+    public record RepairViolation(String code, int day, List<String> nodeIds, boolean repairable, String detail) {
     }
 
     private final ItineraryRepairAgent repairAgent;
@@ -147,7 +149,7 @@ public class ItineraryRepairEngine {
             // 前提下降低疲劳分，且休息节点不改变疲劳分口径——快速失败，不消耗修复轮次
             boolean repairable = !ItineraryValidator.STRUCTURE_INVALID.equals(code)
                     && !ItineraryValidator.HARD_FATIGUE_EXCEEDED.equals(code);
-            out.add(new RepairViolation(unified, day, nodes, repairable));
+            out.add(new RepairViolation(unified, day, nodes, repairable, null));
         }
         return out;
     }
@@ -165,6 +167,11 @@ public class ItineraryRepairEngine {
             item.put("code", v.code());
             item.put("day", v.day());
             item.put("targetNodeIds", v.nodeIds());
+            // 具体违规说明（如「某景区开放至 17:00，当前安排 15:00-17:30 超出 30 分钟」）：
+            // 模型不知道关门时间只会瞎猜，详情是修复能改对的唯一依据
+            if (v.detail() != null && !v.detail().isBlank()) {
+                item.put("detail", v.detail());
+            }
             vs.add(item);
         }
         ctx.put("violations", vs);
@@ -183,6 +190,7 @@ public class ItineraryRepairEngine {
                 state.getSelectedFoodIds() == null ? List.of() : state.getSelectedFoodIds());
         requirements.put("extraRequest", state.getExtraRequest());
         requirements.put("hardConstraints", hardConstraintSummary(state));
+        requirements.put("planningPolicy", PlanningPolicyResolver.resolve(state));
         ctx.put("requirements", requirements);
         ctx.put("plan", draft);
         try {

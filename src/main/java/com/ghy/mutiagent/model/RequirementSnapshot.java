@@ -13,7 +13,7 @@ import java.util.List;
  */
 @Data
 public class RequirementSnapshot {
-    private int schemaVersion = 2;
+    private int schemaVersion = 3;
     private int revision;
     private List<ConstraintEntry> constraints = new ArrayList<>();
     private BudgetSpec budget;

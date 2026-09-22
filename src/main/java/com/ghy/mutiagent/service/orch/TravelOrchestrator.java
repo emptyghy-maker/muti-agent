@@ -25,11 +25,14 @@ import com.ghy.mutiagent.model.PreferenceResult;
 import com.ghy.mutiagent.model.Question;
 import com.ghy.mutiagent.model.ResumeView;
 import com.ghy.mutiagent.model.RequirementAnalysis;
+import com.ghy.mutiagent.model.ResolvedPlanningPolicy;
 import com.ghy.mutiagent.model.TravelPreference;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.UsageChannel;
 import com.ghy.mutiagent.model.WebFoodCandidate;
 import com.ghy.mutiagent.model.enums.TravelStage;
+import com.ghy.mutiagent.model.requirement.InterpretationStatus;
+import com.ghy.mutiagent.model.requirement.RequirementScope;
 import com.ghy.mutiagent.repository.entity.Destination;
 import com.ghy.mutiagent.repository.mapper.DestinationMapper;
 import com.ghy.mutiagent.rule.DefaultsResolver;
@@ -37,6 +40,7 @@ import com.ghy.mutiagent.rule.AhpWeightCalculator;
 import com.ghy.mutiagent.rule.ChannelRouter;
 import com.ghy.mutiagent.rule.NightScorer;
 import com.ghy.mutiagent.rule.PreferenceUpdater;
+import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.rule.RequirementApplier;
 import com.ghy.mutiagent.rule.RequirementMerger;
 import com.ghy.mutiagent.rule.RuleParseResult;
@@ -203,6 +207,11 @@ public class TravelOrchestrator {
             "随便", "都行", "随意", "还没想好", "没想好", "还没定", "没定", "再想想", "不知道",
             "你定", "你决定", "无所谓", "没有", "都听你的", "按你推荐");
 
+    /** 裸否定词（整句只有这些词，无主题词）：确定性快路，不进 LLM——
+     *  问酒店答「不要」=不需要酒店；问景点=不需要景点；问其他字段=没想好按默认 */
+    private static final Set<String> BARE_NEGATION_WORDS = Set.of(
+            "不要", "不用", "不需要", "不用了", "算了", "免了");
+
     private static final Map<String, Question> QUESTION_TEMPLATES = Map.of(
             "days", q("days", "计划玩几天呢？", List.of("1天", "2天", "3天", "4天", "5天及以上", "还没想好")),
             "totalBudget", q("totalBudget", "预算大概多少？", List.of("1500以内", "1500-3000", "3000-5000", "5000以上", "还没想好")),
@@ -342,15 +351,21 @@ public class TravelOrchestrator {
         state.resetTurnUsage();
         long turnStart = System.currentTimeMillis();
         String entryStage = state.getStage().name();
-        ChatStepResult result = switch (state.getStage()) {
-            case PREFERENCE -> chatPreference(state, message);
-            case ATTRACTIONS, FOODS, HOTELS -> chatCandidateRefine(state, message);
-            case DONE -> chatDone(actor, state, message);
-            default -> {
-                sessionService.save(state);
-                yield buildResult(state, "当前步骤请先完成页面上的选择，稍后我会为你继续规划。", null);
-            }
-        };
+        ConstraintEntry scopeResolved = RequirementMerger.resolvePendingMealScope(state, message);
+        ChatStepResult result;
+        if (scopeResolved != null) {
+            result = afterMealScopeResolved(state, scopeResolved);
+        } else {
+            result = switch (state.getStage()) {
+                case PREFERENCE -> chatPreference(state, message);
+                case ATTRACTIONS, FOODS, HOTELS -> chatCandidateRefine(state, message);
+                case DONE -> chatDone(actor, state, message);
+                default -> {
+                    sessionService.save(state);
+                    yield buildResult(state, "当前步骤请先完成页面上的选择，稍后我会为你继续规划。", null);
+                }
+            };
+        }
         usageService.recordQa(state.getSessionId(), state.getUserId(), state.getUsername(),
                 entryStage, "对话", "SUCCESS",
                 state.getTurnChannel() == null ? UsageChannel.KB : state.getTurnChannel(),
@@ -358,6 +373,72 @@ public class TravelOrchestrator {
                 message, result.getMessage() == null ? "" : result.getMessage(),
                 state.getTurnInputTokens(), state.getTurnOutputTokens(),
                 System.currentTimeMillis() - turnStart);
+        return result;
+    }
+
+    /** O2：范围澄清是上一轮需求的补充，不应被当前问卷字段或候选 Agent 当成新需求。 */
+    private ChatStepResult afterMealScopeResolved(TravelState state, ConstraintEntry resolved) {
+        state.bumpConstraintRevision();
+        state.setExtraRequest(RequirementMerger.renderExtra(state));
+        candidateService.evaluateLockedConflicts(state);
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (!planning.executable()) {
+            sessionService.save(state);
+            return requirementGateResult(state, planning);
+        }
+        String scopeText = resolved.getScope() == RequirementScope.PER_DAY ? "每天" : "全程";
+        if (state.getStage() == TravelStage.DONE) {
+            RequirementApplier.invalidateDone(state);
+            sessionService.save(state);
+            return buildResult(state, "已确认：这些餐次按“" + scopeText
+                    + "”计算。原行程已失效，请重新生成后再查看。", null);
+        }
+        if (state.getStage() == TravelStage.FOODS) {
+            boolean aiOk = candidateService.generateFoods(state);
+            sessionService.save(state);
+            return buildResult(state, "已确认：这些餐次按“" + scopeText
+                    + "”计算，美食候选已按统一口径更新：" + llmNote(aiOk), null);
+        }
+        if (state.getStage() == TravelStage.PREFERENCE) {
+            Question next = nextQuestion(state);
+            if (next == null) {
+                return completePreference(state);
+            }
+            sessionService.save(state);
+            return buildResult(state, "已确认：这些餐次按“" + scopeText + "”计算。\n\n" + next.getText(), next);
+        }
+        sessionService.save(state);
+        return buildResult(state, "已确认：这些餐次按“" + scopeText
+                + "”计算。后续美食候选与行程会使用这个口径。", null);
+    }
+
+    /** 未澄清或相互冲突的硬需求不能进入候选/规划阶段。 */
+    private ChatStepResult requirementGateResult(TravelState state, ResolvedPlanningPolicy planning) {
+        boolean mealScopePending = state.getRequirementSnapshot() != null
+                && state.getRequirementSnapshot().getConstraints() != null
+                && state.getRequirementSnapshot().getConstraints().stream()
+                .anyMatch(c -> RequirementMerger.ACTIVE.equals(c.getStatus())
+                        && (c.getInterpretationStatus() == InterpretationStatus.NEEDS_CLARIFICATION
+                        || c.getInterpretationStatus() == InterpretationStatus.LEGACY_UNRESOLVED)
+                        && c.getScope() == RequirementScope.UNRESOLVED);
+        ChatStepResult result;
+        if (mealScopePending) {
+            Question question = new Question();
+            question.setField("mealScope");
+            question.setText("你说的餐次数量，是整个行程合计，还是每天都需要？");
+            question.setOptions(List.of("全程", "每天"));
+            result = buildResult(state, "餐次数量还差一个范围，确认后我才能准确安排。\n\n"
+                    + question.getText(), question);
+        } else if (!planning.getConflictCodes().isEmpty()) {
+            result = buildResult(state, "当前需求之间存在冲突，暂时不能继续规划："
+                    + String.join("、", planning.getConflictCodes())
+                    + "。请调整餐次数量或说明按全程/每天计算。", null);
+        } else {
+            result = buildResult(state, "有一条硬需求当前版本还不能可靠执行（需求编号："
+                    + String.join("、", planning.getBlockingRequirementIds())
+                    + "）。请换一种可执行的安排，或明确取消这条需求。", null);
+        }
+        result.setStatus("NEEDS_CLARIFICATION");
         return result;
     }
 
@@ -394,6 +475,31 @@ public class TravelOrchestrator {
         // 修正/衔接语不计为有效残余：规则已抽到信息时不再为口水话调 LLM（如「错了，我只要1天」即时生效）
         String residual = parsed.getUnresolvedText();
         boolean hasResidual = residual != null && !residual.isBlank();
+        // 本轮回复的补充说明（裸否定快路/重问护栏的确定性回显；null=无）
+        String negationNote = null;
+        // 裸否定词快路（零 LLM）：在快照合并前判定，命中即消费残余——
+        // 不把「不要」这类词混进需求快照/extraRequest；问酒店=不需要酒店，问景点=不需要景点，其余=按默认
+        if (hasResidual && isBareNegation(residual) && currentField != null) {
+            if ("specialRequests".equals(currentField)) {
+                updates.put("specialRequests", "UNSURE");
+            } else if ("hotelStyle".equals(currentField)) {
+                state.setNoHotelNeeded(true);
+                state.getPreference().appendFieldNote("hotelStyle", residual.trim());
+                negationNote = "好的，已记为不需要酒店，后面的行程就不安排住宿了。"
+                        + "如果理解有误（比如只是没想好酒店风格），直接告诉我。";
+            } else if ("attractionType".equals(currentField)) {
+                state.setNoAttractionNeeded(true);
+                state.getPreference().appendFieldNote("attractionType", residual.trim());
+                negationNote = "好的，已记为不需要安排景点，行程就不做景点规划了。"
+                        + "如果理解有误，直接告诉我。";
+            } else {
+                // 天数/预算/人数/口味/体力等：裸否定视为不想回答，按默认带过
+                updates.putIfAbsent(currentField, "UNSURE");
+                negationNote = "好的，这个问题我先按推荐处理，后面随时可以改。";
+            }
+            parsed.setUnresolvedText(null);
+            hasResidual = false;
+        }
         if (hasResidual && isFieldNegated(currentField, residual)) {
             // 正在问的字段被直接否定（如问酒店偏好答「不要酒店」）：该字段置 UNSURE（不再追问），
             // 原文记为该字段的特殊需求备注——与总体特殊请求分开，互不污染
@@ -406,12 +512,16 @@ public class TravelOrchestrator {
             updates.put("specialRequests", existing == null || "UNSURE".equals(existing) || existing.contains(extra)
                     ? extra : existing + "；" + extra);
         } else if (hasResidual) {
-            // 规则失手：把残余内容交给偏好解析 Agent 做客服式消解——可多字段抽取、
-            // 否定当前字段（UNSURE=置空不再追问）、原文追加特殊请求；
+            // 规则失手：把残余内容交给偏好解析 Agent 做客服式消解（带当前问题原文上下文）——
+            // 可多字段抽取、否定当前字段（UNSURE）、裸否定输出 skip（noHotel/noAttraction）；
             // 规则已命中的字段保持规则值（确定性优先），Agent 结果只补缺
-            Map<String, String> llmUpdates = llmParse(state, message, currentField);
+            PreferenceResult pr = llmParse(state, message, currentField);
+            Map<String, String> llmUpdates = pr == null || pr.getUpdates() == null
+                    ? Map.of() : pr.getUpdates();
             Map<String, String> merged = new LinkedHashMap<>(llmUpdates);
             merged.putAll(updates);
+            // LLM 输出的环节跳过标记（带问题上下文的裸否定语义）；与当前问题不符时忽略（防幻觉）
+            applyLlmSkip(state, pr, currentField);
             // 保护正在询问的字段：用户没表达「没想好/不要」时，不接受 Agent 对其置 UNSURE，
             // 避免当前问题被误跳过（如问预算时用户改天数，Agent 误判预算没想好）
             if (currentField != null && "UNSURE".equalsIgnoreCase(merged.get(currentField))
@@ -425,7 +535,32 @@ public class TravelOrchestrator {
             }
             updates = merged;
         }
+        // 重问护栏：本轮规则/LLM 都没能推进正在询问的字段，且已经是第三次问它 → 确定性带过，
+        // 任何预期外输入都不会把用户困在同一问题上
+        String guardNote = null;
+        if (currentField != null && !updates.containsKey(currentField)) {
+            if (state.askRoundOf(currentField) >= 2) {
+                updates.putIfAbsent(currentField, "UNSURE");
+                guardNote = "好的，这个问题我先按推荐处理，后面随时可以改。";
+                state.clearAskRound(currentField);
+            } else {
+                state.bumpAskRound(currentField);
+            }
+        } else if (currentField != null) {
+            state.clearAskRound(currentField);
+        }
         PreferenceUpdater.apply(state, updates);
+        // 兜底/中途写入的特殊需求不算「正式回答」：撤销已答标记，最终问题照常问
+        //（防止中途语义意外把最后的特殊需求询问吞掉；文本保留供最终问题回显与行程参考）
+        if (updates.containsKey("specialRequests") && !"specialRequests".equals(currentField)) {
+            state.getPreference().unmark("specialRequests");
+        }
+
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (!planning.executable()) {
+            sessionService.save(state);
+            return requirementGateResult(state, planning);
+        }
 
         // 信息差不多的灵活出口：任何一轮用户示意「够了」都直接交接（长句先解析再交接，不丢信息）
         if (HANDOFF_WORDS.stream().anyMatch(trimmed::endsWith)) {
@@ -450,7 +585,11 @@ public class TravelOrchestrator {
             echo = (echo.isEmpty() ? "" : echo + "；") + String.join("；", needEcho);
         }
         String reply;
-        if (!echo.isEmpty()) {
+        if (negationNote != null && !negationNote.isBlank()) {
+            reply = negationNote;
+        } else if (guardNote != null && !guardNote.isBlank()) {
+            reply = guardNote;
+        } else if (!echo.isEmpty()) {
             reply = "好的，我记下了——" + echo + "。";
         } else {
             reply = "抱歉，我刚才没能理解这部分信息。你可以换个说法（比如直接说数字），"
@@ -476,6 +615,11 @@ public class TravelOrchestrator {
 
     private ChatStepResult doCompletePreference(TravelState state) {
         fillDefaults(state);
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (!planning.executable()) {
+            sessionService.save(state);
+            return requirementGateResult(state, planning);
+        }
         state.setStage(TravelStage.ATTRACTIONS);
         state.setCurrentField(null);
         // 需求分析路由：Agent 判断走标准流程还是深度分析，并提炼贯穿全流程的关注点
@@ -541,12 +685,25 @@ public class TravelOrchestrator {
         return Boolean.TRUE.equals(parallelCandidates) && channelCoordinator != null && taskExecutor != null;
     }
 
-    /** 美食/酒店通道后台预热：克隆会话状态 → 各自生成候选池 → 结果与就绪标记写 Redis（不碰会话状态，无并发覆盖） */
+    /**
+     * 美食/酒店通道后台预热：只启动用户实际需要的通道；明确跳过的通道直接标记 SKIPPED。
+     * 每个后台任务克隆会话状态后生成候选池，再把结果与就绪标记写 Redis（不碰会话状态，无并发覆盖）。
+     */
     private void prewarmFoodAndHotel(TravelState state) {
         channelCoordinator.markReady(state.getSessionId(),
-                CandidateChannelCoordinator.CHANNEL_ATTRACTION, "READY");
-        taskExecutor.execute(() -> prewarmFood(state));
-        taskExecutor.execute(() -> prewarmHotel(state));
+                CandidateChannelCoordinator.CHANNEL_ATTRACTION, CandidateChannelCoordinator.STATUS_READY);
+        if (Boolean.TRUE.equals(state.getNoFoodNeeded())) {
+            channelCoordinator.markReady(state.getSessionId(), CandidateChannelCoordinator.CHANNEL_FOOD,
+                    CandidateChannelCoordinator.STATUS_SKIPPED);
+        } else {
+            taskExecutor.execute(() -> prewarmFood(state));
+        }
+        if (Boolean.TRUE.equals(state.getNoHotelNeeded())) {
+            channelCoordinator.markReady(state.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL,
+                    CandidateChannelCoordinator.STATUS_SKIPPED);
+        } else {
+            taskExecutor.execute(() -> prewarmHotel(state));
+        }
     }
 
     private void prewarmFood(TravelState origin) {
@@ -557,7 +714,8 @@ public class TravelOrchestrator {
                     new CandidateChannelCoordinator.FoodChannelResult(copy.getFoodPool(),
                             copy.getFoodCursor(), copy.getCandidateAdvice(),
                             copy.getWebFoodCandidates(), copy.candidateSnapshots()));
-            channelCoordinator.markReady(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_FOOD, "READY");
+            channelCoordinator.markReady(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_FOOD,
+                    CandidateChannelCoordinator.STATUS_READY);
         } catch (Exception e) {
             log.warn("[PreWarm][sessionId={}] 美食通道预热失败，回退同步懒加载: {}",
                     origin.getSessionId(), e.getMessage());
@@ -571,7 +729,8 @@ public class TravelOrchestrator {
             channelCoordinator.putResult(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL,
                     new CandidateChannelCoordinator.HotelChannelResult(copy.getHotelPool(),
                             copy.getHotelCursor(), copy.getCandidateAdvice(), copy.candidateSnapshots()));
-            channelCoordinator.markReady(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL, "READY");
+            channelCoordinator.markReady(copy.getSessionId(), CandidateChannelCoordinator.CHANNEL_HOTEL,
+                    CandidateChannelCoordinator.STATUS_READY);
         } catch (Exception e) {
             log.warn("[PreWarm][sessionId={}] 酒店通道预热失败，回退同步懒加载: {}",
                     origin.getSessionId(), e.getMessage());
@@ -651,6 +810,7 @@ public class TravelOrchestrator {
         state.setConflict(null);
         state.setExtraRequest(null);
         state.clearChannelRequests();
+        state.clearAskRounds();
         state.setRequirementSnapshot(null);
         state.setWeights(null);
         Question first = nextQuestion(state);
@@ -665,6 +825,33 @@ public class TravelOrchestrator {
     private static boolean isFieldNegated(String currentField, String residual) {
         Pattern p = currentField == null ? null : FIELD_NEGATION_PATTERNS.get(currentField);
         return p != null && residual != null && p.matcher(residual).find();
+    }
+
+    /** 整句就是裸否定词（无主题词、无修饰）——确定性快路，不进 LLM */
+    private static boolean isBareNegation(String residual) {
+        return residual != null && BARE_NEGATION_WORDS.contains(residual.trim());
+    }
+
+    /** LLM 输出的环节跳过标记：必须与正在询问的字段对应才生效（模型幻觉防护） */
+    private void applyLlmSkip(TravelState state, PreferenceResult pr, String currentField) {
+        if (pr == null || pr.getSkip() == null || pr.getSkip().isBlank()) {
+            return;
+        }
+        switch (pr.getSkip()) {
+            case "noHotel" -> {
+                if ("hotelStyle".equals(currentField)) {
+                    state.setNoHotelNeeded(true);
+                    state.getPreference().appendFieldNote("hotelStyle", "不需要酒店");
+                }
+            }
+            case "noAttraction" -> {
+                if ("attractionType".equals(currentField)) {
+                    state.setNoAttractionNeeded(true);
+                    state.getPreference().appendFieldNote("attractionType", "不需要景点");
+                }
+            }
+            default -> log.warn("[TravelAgent][stage=PREFERENCE] 偏好解析输出未知 skip 值（{}），已忽略", pr.getSkip());
+        }
     }
 
     /** 剥离残余中的修正/衔接语前缀（「错了、改成、我只要」等），返回真正值得消解的内容 */
@@ -979,6 +1166,11 @@ public class TravelOrchestrator {
             PreferenceUpdater.apply(state, parsed.getUpdates());
         }
         state.setExtraRequest(RequirementMerger.renderExtra(state));
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (!planning.executable()) {
+            sessionService.save(state);
+            return requirementGateResult(state, planning);
+        }
         // 额外要求变化时重算需求关键字（保留已有），供候选池标签匹配加权
         state.setNeedTags(deriveNeedTags(state, null));
         // 跳过信号：用户明确不需要当前环节的产物 → 清掉已选，直接进入下一环节或生成行程
@@ -1194,7 +1386,8 @@ public class TravelOrchestrator {
             parts.add("酒店「" + (p.getHotelStyle() == null ? "按推荐" : p.getHotelStyle()) + "」");
         }
         if (updates.containsKey("specialRequests")) {
-            parts.add("特殊要求已记下，规划行程时会优先考虑");
+            parts.add(p.getSpecialRequests() == null || p.getSpecialRequests().isBlank()
+                    ? "没有其他特殊要求" : "特殊要求已记下，规划行程时会优先考虑");
         }
         return String.join("；", parts);
     }
@@ -2245,13 +2438,17 @@ public class TravelOrchestrator {
     // ============ 内部逻辑 ============
 
     /** LLM 解析（带 trace），失败时返回空更新（本轮不更新，下轮重试） */
-    private Map<String, String> llmParse(TravelState state, String message, String currentField) {
+    /** 偏好解析 LLM 消解：把残余原文连同「正在询问的问题原文」交给 Agent（客服式消解，可多字段抽取）；
+     *  失败返回 null（调用方按未解析兜底，不丢信息） */
+    private PreferenceResult llmParse(TravelState state, String message, String currentField) {
         TraceContext ctx = traceService.newTrace(state.getSessionId(), "偏好解析");
         long startNs = System.nanoTime();
         try {
             String prefJson = objectMapper.writeValueAsString(state.getPreference());
+            Question q = currentField == null ? null : QUESTION_TEMPLATES.get(currentField);
             Result<String> r = preferenceAgent.parse(
-                    prefJson, currentField == null ? "" : currentField, message);
+                    prefJson, currentField == null ? "" : currentField,
+                    q == null ? "" : q.getText(), message);
             String content = recordAgent(ctx, "PreferenceAgent", startNs, r);
             PreferenceResult pr = JsonUtils.parse(content, PreferenceResult.class);
             if (pr == null) {
@@ -2268,7 +2465,7 @@ public class TravelOrchestrator {
                     (System.nanoTime() - startNs) / 1_000_000, "SUCCESS", trim50(message),
                     defaultModel, UsageChannel.AGENT, UsageService.clip(content, 2000));
             state.addTurnUsage(defaultModel, tk[0], tk[1], UsageChannel.AGENT);
-            return pr.getUpdates() == null ? Map.of() : pr.getUpdates();
+            return pr;
         } catch (Exception e) {
             log.warn("偏好解析 LLM 调用失败（{}），本轮按未解析处理", e.getClass().getName(), e);
             ctx.finish("FAILED");
@@ -2279,7 +2476,7 @@ public class TravelOrchestrator {
                     e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()),
                     defaultModel, UsageChannel.RULE_FALLBACK, null);
             state.addTurnUsage(null, 0, 0, UsageChannel.RULE_FALLBACK);
-            return Map.of();
+            return null;
         }
     }
 
@@ -2427,7 +2624,21 @@ public class TravelOrchestrator {
                 continue;
             }
             if (state.getPreference().isMissing(field)) {
-                return QUESTION_TEMPLATES.get(field);
+                Question q = QUESTION_TEMPLATES.get(field);
+                // 兜底/中途已记下一些特殊要求时，最终问题回显已记下内容（不吞信息，也不吞问题）
+                if ("specialRequests".equals(field)) {
+                    String carried = state.getPreference().getSpecialRequests();
+                    if (carried != null && !carried.isBlank()) {
+                        Question customized = new Question();
+                        customized.setField(q.getField());
+                        customized.setOptions(q.getOptions());
+                        customized.setText("目前已记下这些特殊要求：" + carried
+                                + "。除此之外，还有特别想去的地方或特殊要求吗？"
+                                + "（没有就点「没有」，也可以直接打字）");
+                        return customized;
+                    }
+                }
+                return q;
             }
         }
         return null;
@@ -2529,6 +2740,9 @@ public class TravelOrchestrator {
         r.setSessionRevision(state.getSessionRevision());
         r.setItineraryText(state.getItineraryText());
         r.setPlan(state.getPlan());
+        r.setRequirementSnapshot(state.getRequirementSnapshot());
+        r.setResolvedPlanningPolicy(state.getResolvedPlanningPolicy());
+        r.setRequirementFulfillmentReport(state.getRequirementFulfillmentReport());
         r.setCandidateAdvice(state.getCandidateAdvice());
         r.setPendingFatigueConfirm(state.getPendingFatigueConfirm());
         r.setPendingFatigueScore(state.getPendingFatigueScore());

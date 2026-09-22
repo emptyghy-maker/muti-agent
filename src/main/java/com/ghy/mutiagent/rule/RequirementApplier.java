@@ -1,7 +1,9 @@
 package com.ghy.mutiagent.rule;
 
+import com.ghy.mutiagent.model.ConstraintEntry;
 import com.ghy.mutiagent.model.RequirementSnapshot;
 import com.ghy.mutiagent.model.TravelState;
+import com.ghy.mutiagent.model.requirement.InterpretationStatus;
 import com.ghy.mutiagent.model.enums.TravelStage;
 
 import java.util.Set;
@@ -35,11 +37,27 @@ public final class RequirementApplier {
         state.setPlan(null);
         state.setItineraryText(null);
         state.setItineraryId(null);
+        state.setResolvedPlanningPolicy(null);
+        if (state.getRequirementFulfillmentReport() != null) {
+            state.getRequirementFulfillmentReport().markStale();
+        }
     }
 
-    /** 是否存在未解析原文需要澄清 */
+    /** 是否存在结构化待澄清需求或未解析原文 */
     public static boolean clarificationRequired(TravelState state) {
         RequirementSnapshot snap = state.getRequirementSnapshot();
-        return snap != null && snap.getUnparsedTexts() != null && !snap.getUnparsedTexts().isEmpty();
+        if (snap == null) {
+            return false;
+        }
+        if (snap.getConstraints() != null) {
+            for (ConstraintEntry entry : snap.getConstraints()) {
+                if (RequirementMerger.ACTIVE.equals(entry.getStatus())
+                        && (entry.getInterpretationStatus() == InterpretationStatus.NEEDS_CLARIFICATION
+                        || entry.getInterpretationStatus() == InterpretationStatus.LEGACY_UNRESOLVED)) {
+                    return true;
+                }
+            }
+        }
+        return snap.getUnparsedTexts() != null && !snap.getUnparsedTexts().isEmpty();
     }
 }

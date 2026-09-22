@@ -1,0 +1,12 @@
+{"caseId":"O2-T01","input":"全程需要2顿午餐","tripDays":4,"expected":{"lunch":{"count":2,"scope":"TRIP","unit":"MEAL_OCCASION"},"plannedLunchTotal":2}}
+{"caseId":"O2-T02","input":"每天1顿午餐","tripDays":3,"expected":{"lunch":{"count":1,"scope":"PER_DAY"},"actualByDay":{"day-1":1,"day-2":1,"day-3":1}}}
+{"caseId":"O2-T03","input":"推荐2家午餐店供选择","expected":{"candidateCount":2,"candidateUnit":"CANDIDATE_COUNT","plannedLunchCountPerDay":1}}
+{"caseId":"O2-T04","turns":["需要2顿午餐和1顿晚餐","全程"],"expected":{"before":"NEEDS_CLARIFICATION","afterScope":"TRIP","activeRequirementCount":2}}
+{"caseId":"O2-T05","input":"全程1顿午餐，要小吃","plan":"1 main lunch + 1 snack","expected":{"lunchActual":1,"hardRequirementsSatisfied":true}}
+{"caseId":"O2-T06","input":"不要小吃","plan":"no snack nodes","expected":{"candidateHasSnack":false,"reportSnackCount":0,"status":"SATISFIED"}}
+{"caseId":"O2-T07","turns":["全程2顿午餐","全程1顿午餐"],"expected":{"activeCount":1,"supersededCount":1,"activeRevision":2}}
+{"caseId":"O2-T08","input":"全程1顿午餐","plan":"restaurant node has no fact","expected":{"status":"UNVERIFIABLE","reasonCode":"RESTAURANT_FACT_MISSING"}}
+{"caseId":"O2-T09","flags":{"noFoodNeeded":true,"noHotelNeeded":true},"expected":{"mealPolicy":"NO_FOOD","defaultMealReinjected":false,"status":"SATISFIED"}}
+{"caseId":"O2-T10","input":"每天2顿午餐","expected":{"executable":false,"conflictCode":"LUNCH_PER_DAY_LIMIT_EXCEEDED"}}
+{"caseId":"O2-T11","input":"全程1顿午餐","patch":"remove lunch node","expected":{"publishable":false,"violation":"MEAL_WINDOW_UNSATISFIABLE"}}
+{"caseId":"O2-T12","before":{"snapshotRevision":1,"planRevision":3,"status":"SATISFIED"},"change":"全程午餐从1顿改成2顿","expected":{"oldReportStatus":"STALE","matchesCurrentVersion":false}}

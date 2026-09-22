@@ -16,6 +16,9 @@ import com.ghy.mutiagent.model.FeedbackRequest;
 import com.ghy.mutiagent.model.ItineraryDetail;
 import com.ghy.mutiagent.model.ItineraryPlan;
 import com.ghy.mutiagent.model.ItinerarySummary;
+import com.ghy.mutiagent.model.RequirementFulfillmentReport;
+import com.ghy.mutiagent.model.RequirementFulfillmentResult;
+import com.ghy.mutiagent.model.ResolvedPlanningPolicy;
 import com.ghy.mutiagent.model.PlaceKey;
 import com.ghy.mutiagent.model.PlaceType;
 import com.ghy.mutiagent.model.PatchOperation;
@@ -24,6 +27,10 @@ import com.ghy.mutiagent.model.StayBooking;
 import com.ghy.mutiagent.model.TravelPreference;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.UsageChannel;
+import com.ghy.mutiagent.model.requirement.FulfillmentStatus;
+import com.ghy.mutiagent.model.requirement.RequirementOperator;
+import com.ghy.mutiagent.model.requirement.RequirementScope;
+import com.ghy.mutiagent.model.requirement.RequirementSubject;
 import com.ghy.mutiagent.repository.entity.Attraction;
 import com.ghy.mutiagent.repository.mapper.AttractionMapper;
 import com.ghy.mutiagent.repository.entity.Destination;
@@ -39,16 +46,20 @@ import com.ghy.mutiagent.repository.mapper.RestaurantMapper;
 import com.ghy.mutiagent.rule.BudgetCalculator;
 import com.ghy.mutiagent.rule.FatigueScorer;
 import com.ghy.mutiagent.rule.ItineraryTextRenderer;
+import com.ghy.mutiagent.rule.MealPolicySupport;
 import com.ghy.mutiagent.rule.MealTimeChecker;
 import com.ghy.mutiagent.rule.NightScorer;
+import com.ghy.mutiagent.rule.OpeningHoursParser;
 import com.ghy.mutiagent.rule.PlaceIndex;
 import com.ghy.mutiagent.rule.PlaceKeyResolver;
 import com.ghy.mutiagent.rule.PlanNodeRef;
 import com.ghy.mutiagent.rule.PriceSnapshot;
+import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.rule.ScheduleBuilder;
 import com.ghy.mutiagent.rule.TripBilling;
 import com.ghy.mutiagent.service.validation.ItineraryValidator;
 import com.ghy.mutiagent.service.validation.PlanStructureValidator;
+import com.ghy.mutiagent.service.validation.RequirementFulfillmentValidator;
 import com.ghy.mutiagent.security.AuthenticatedUser;
 import com.ghy.mutiagent.trace.AgentTrace;
 import com.ghy.mutiagent.trace.TraceContext;
@@ -159,6 +170,16 @@ public class ItineraryService {
     private Map<String, Object> generateInternal(TravelState state, boolean persist,
                                                  CancelRegistry.CancelToken cancelToken,
                                                  com.ghy.mutiagent.trace.TraceMeta meta) {
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (!planning.executable()) {
+            throw new BizException(ResultCode.PLAN_INVALID.getCode(),
+                    "需求尚未澄清或存在冲突：blocking=" + planning.getBlockingRequirementIds()
+                            + "，conflicts=" + planning.getConflictCodes());
+        }
+        state.setPlanRevision(state.getPlanRevision() + 1);
+        if (state.getRequirementFulfillmentReport() != null) {
+            state.getRequirementFulfillmentReport().markStale();
+        }
         List<Attraction> attractions = state.getSelectedAttractionIds().isEmpty() ? List.of()
                 : attractionMapper.selectBatchIds(state.getSelectedAttractionIds());
         List<Restaurant> restaurants = state.getSelectedFoodIds().isEmpty() ? List.of()
@@ -328,6 +349,12 @@ public class ItineraryService {
                                 + (check.needsConfirmation() ? "；存在无法自动核实的硬条件，需用户确认" : ""));
             }
 
+            RequirementFulfillmentReport fulfillment = validateRequirementFulfillment(state, plan, restaurants);
+            if (!fulfillment.hardRequirementsSatisfied()) {
+                throw new BizException(ResultCode.PLAN_INVALID.getCode(),
+                        "逐需求验收未通过：" + fulfillmentFailures(fulfillment));
+            }
+
             state.setPlan(plan);
             state.setItineraryText(ItineraryTextRenderer.render(plan));
             if (persist) {
@@ -353,8 +380,12 @@ public class ItineraryService {
         for (int attempt = 0; attempt <= maxRepairs; attempt++) {
             // 调用前/修复前复查截止与取消（调用后与提交前由各自路径复查）
             checkCancelAndDeadline(budget, cancelToken);
-            List<ItineraryRepairEngine.RepairViolation> violations = validateWhole(state, draft, expectedDays,
-                    attractions, restaurants, hotels, restSpots, coords, facts);
+            // 营业时间违规附具体详情（景区名/开放时间/当前安排/超出量）——
+            // 修复上下文没有关门时间时模型只能瞎猜（422 事故根因：两轮修复只改备注不改时间）
+            List<ItineraryRepairEngine.RepairViolation> violations = withOpeningDetails(
+                    validateWhole(state, draft, expectedDays, attractions, restaurants, hotels,
+                            restSpots, coords, facts),
+                    draft, attractions, restSpots);
             List<String> codes = violations.stream().map(ItineraryRepairEngine.RepairViolation::code).toList();
             // S12：验证结果分层记录在当前草稿来源 span（provider 与 validation 分开）
             if (draftSpan != null) {
@@ -520,6 +551,8 @@ public class ItineraryService {
                 if (repairError == null) {
                     repairSpan = AgentTrace.success("ItineraryRepairAgent", cost,
                             repaired == null ? null : repaired.tokenUsage());
+                    // 修复输出留痕（此前缺失：TRACE 里修复 span 的 answer 恒为 null，无法复盘修复内容）
+                    repairSpan.setAnswer(UsageService.clip(repaired == null ? "" : repaired.content(), 2000));
                     rctx.add(repairSpan);
                     rctx.finish("SUCCESS");
                     obsRepairRound(meta, state, attempt, "SUCCESS");
@@ -820,11 +853,88 @@ public class ItineraryService {
         ItineraryValidator.ValidationResult check = ItineraryValidator.validate(draft, state.getPreference(),
                 state.getRequirementSnapshot(), state.getPreference().getTotalBudget(), bill.getKnownSubtotal(),
                 openTimes, attById, hardFatigueOverload);
+        RequirementFulfillmentReport fulfillment = validateRequirementFulfillment(state, draft, restaurants);
         if (check.needsConfirmation()) {
             return List.of(new ItineraryRepairEngine.RepairViolation(
-                    "NEEDS_CONFIRMATION", 0, List.of(), false));
+                    "NEEDS_CONFIRMATION", 0, List.of(), false, null));
         }
-        return ItineraryRepairEngine.unify(check);
+        List<ItineraryRepairEngine.RepairViolation> violations = new ArrayList<>(ItineraryRepairEngine.unify(check));
+        for (RequirementFulfillmentResult result : fulfillment.getResults()) {
+            if (!"HARD".equals(result.getHardness()) || result.getStatus() == FulfillmentStatus.SATISFIED) {
+                continue;
+            }
+            boolean repairable = result.getStatus() == FulfillmentStatus.VIOLATED;
+            violations.add(new ItineraryRepairEngine.RepairViolation(
+                    repairable ? "REQUIREMENT_VIOLATED" : "REQUIREMENT_UNVERIFIABLE",
+                    0, result.getNodeIds(), repairable,
+                    "requirement=" + result.getRequirementId() + " expected=" + result.getExpectedCount()
+                            + " scope=" + result.getScope() + " actual=" + result.getActual()
+                            + " reason=" + result.getReasonCode()));
+        }
+        return violations;
+    }
+
+    private RequirementFulfillmentReport validateRequirementFulfillment(TravelState state, ItineraryPlan plan,
+                                                                          List<Restaurant> restaurants) {
+        Map<Long, Restaurant> byId = restaurants.stream()
+                .collect(Collectors.toMap(Restaurant::getId, r -> r, (a, b) -> a));
+        RequirementFulfillmentReport report = RequirementFulfillmentValidator.validate(plan,
+                PlanningPolicyResolver.resolve(state), state.getRequirementSnapshot(), state.getPlanRevision(), byId);
+        state.setRequirementFulfillmentReport(report);
+        return report;
+    }
+
+    private static String fulfillmentFailures(RequirementFulfillmentReport report) {
+        return report.getResults().stream()
+                .filter(r -> "HARD".equals(r.getHardness()) && r.getStatus() != FulfillmentStatus.SATISFIED)
+                .map(r -> r.getRequirementId() + ":" + r.getReasonCode() + " actual=" + r.getActual())
+                .collect(Collectors.joining("；"));
+    }
+
+    /**
+     * 营业时间违规附具体详情：对每个被定位节点给出「景点名 + 开放时间 + 当前安排 + 超出量」。
+     * 修复模型看不到关门时间就修不对（只改备注不改时间）；详情是它唯一可靠的修复依据。
+     */
+    static List<ItineraryRepairEngine.RepairViolation> withOpeningDetails(
+            List<ItineraryRepairEngine.RepairViolation> violations, ItineraryPlan draft,
+            List<Attraction> attractions, List<Attraction> restSpots) {
+        Map<Long, String> openById = new HashMap<>();
+        attractions.forEach(a -> openById.put(a.getId(), a.getOpenTime()));
+        restSpots.forEach(a -> openById.putIfAbsent(a.getId(), a.getOpenTime()));
+        return violations.stream().map(v -> {
+            if (!"OPENING_HOURS_VIOLATION".equals(v.code())) {
+                return v;
+            }
+            List<String> details = new ArrayList<>();
+            for (DailyPlan d : draft.getDays()) {
+                if (d.getNodes() == null) {
+                    continue;
+                }
+                List<String> refs = PlanNodeRef.refs(d.getNodes(), d.getDayIndex());
+                for (int i = 0; i < d.getNodes().size(); i++) {
+                    if (!v.nodeIds().contains(refs.get(i))) {
+                        continue;
+                    }
+                    PlanNode n = d.getNodes().get(i);
+                    Integer arrival = toMin(n.getTime());
+                    Integer dur = n.getDurationMinutes();
+                    String open = n.getPlaceId() == null ? null : openById.get(n.getPlaceId());
+                    if (arrival == null || dur == null || open == null) {
+                        continue;
+                    }
+                    for (int[] it : OpeningHoursParser.parse(open)) {
+                        if (arrival >= it[0] && arrival < it[1] && arrival + dur > it[1]) {
+                            details.add("「" + (n.getName() == null ? refs.get(i) : n.getName())
+                                    + "」开放时间 " + open + "，当前安排 " + toHm(arrival) + "-"
+                                    + toHm(arrival + dur) + "，超出 " + (arrival + dur - it[1]) + " 分钟");
+                            break;
+                        }
+                    }
+                }
+            }
+            return details.isEmpty() ? v : new ItineraryRepairEngine.RepairViolation(
+                    v.code(), v.day(), v.nodeIds(), v.repairable(), String.join("；", details));
+        }).toList();
     }
 
     // ==================== S09：局部补丁调整（白名单操作 + 稳定 nodeId + 全局复验） ====================
@@ -1106,6 +1216,31 @@ public class ItineraryService {
                     "调整后发布检查未通过：" + String.join("；", check.violations())
                             + (check.needsConfirmation() ? "；存在无法自动核实的硬条件" : ""));
         }
+        // Patch 只能改局部，但发布必须复验整份计划的逐条需求；防止用小吃替代正餐等
+        // “结构看似合法、需求实际被破坏”的补丁绕过生成阶段验收。
+        com.ghy.mutiagent.model.RequirementSnapshot requirementSnapshot =
+                sessionState == null ? adjState.getRequirementSnapshot() : sessionState.getRequirementSnapshot();
+        boolean noFood = Boolean.TRUE.equals(adjState.getNoFoodNeeded())
+                || sessionState != null && Boolean.TRUE.equals(sessionState.getNoFoodNeeded());
+        ResolvedPlanningPolicy policy = PlanningPolicyResolver.resolve(
+                requirementSnapshot, adjState.getPreference(), noFood);
+        if (!policy.executable()) {
+            throw new PatchRejectException(ItineraryPatchEngine.ERR_PATCH_VALIDATION_FAILED,
+                    "调整所用需求尚未澄清或存在冲突");
+        }
+        int nextPlanRevision = Math.max(adjState.getPlanRevision(),
+                sessionState == null ? 0 : sessionState.getPlanRevision()) + 1;
+        Map<Long, Restaurant> restaurantFacts = restaurants.stream()
+                .collect(Collectors.toMap(Restaurant::getId, r -> r, (a, b) -> a));
+        RequirementFulfillmentReport report = RequirementFulfillmentValidator.validate(patched, policy,
+                requirementSnapshot, nextPlanRevision, restaurantFacts);
+        if (!report.hardRequirementsSatisfied()) {
+            throw new PatchRejectException(ItineraryPatchEngine.ERR_PATCH_VALIDATION_FAILED,
+                    "调整后逐需求验收未通过：" + fulfillmentFailures(report));
+        }
+        adjState.setPlanRevision(nextPlanRevision);
+        adjState.setResolvedPlanningPolicy(policy);
+        adjState.setRequirementFulfillmentReport(report);
     }
 
     /** 候选休息点：低强度（≤2）景点，休闲类优先 */
@@ -1143,7 +1278,15 @@ public class ItineraryService {
         if (Boolean.TRUE.equals(state.getNoFoodNeeded())) {
             sb.append("- 用户不需要美食推荐：不要安排 restaurant 节点，用餐由用户自行解决、不产生餐费。\n");
         } else {
-            sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐），各至多 1 个、不得多排；车程中不安排用餐；同一餐厅一天最多出现 1 次（午餐用过的店不能再当晚餐）。\n");
+            ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+            sb.append("- 餐次执行策略（").append(planning.getPolicyVersion()).append("，需求快照 r")
+                    .append(planning.getRequirementSnapshotRevision()).append("）：")
+                    .append(renderMealRule(planning.getMeal().getLunch(), "午餐", "11:30-13:30"))
+                    .append("；")
+                    .append(renderMealRule(planning.getMeal().getDinner(), "晚餐", "17:30-19:30"))
+                    .append("；小吃/夜宵")
+                    .append(planning.getMeal().isSnacksAllowed() ? "允许作为额外节点，但不得充当正餐" : "不得安排")
+                    .append("。restaurant 的 note 必须标注午餐或晚餐；同一餐厅全程最多出现 1 次。\n");
         }
         sb.append("- 带「夜景」标签的景点安排在 18:30 之后（晚餐后最佳），不得排到白天；确需白天安排时必须在 note 写明理由。\n");
         sb.append("- 晚餐结束后仍可安排 1-2 个夜景/娱乐节点（酒吧、夜市、夜游等）；返程 transport 必须是当天最后一个节点，时间为最后活动结束后。\n");
@@ -1205,6 +1348,21 @@ public class ItineraryService {
                     .append("把多出的时间合理分配给各节点（延长停留、更从容的用餐），并优先补回此前未安排的已选景点；不要只改动一个节点。");
         }
         return sb.toString();
+    }
+
+    private static String renderMealRule(ResolvedPlanningPolicy.MealRule rule, String label, String window) {
+        if (rule == null) {
+            return label + "不安排";
+        }
+        String operator = switch (rule.getOperator() == null ? RequirementOperator.EQ : rule.getOperator()) {
+            case EQ -> "恰好";
+            case AT_LEAST -> "至少";
+            case AT_MOST -> "最多";
+            case ALLOW -> "允许";
+            case FORBID -> "禁止";
+        };
+        String scope = rule.getScope() == RequirementScope.PER_DAY ? "每天" : "全程";
+        return scope + operator + rule.getCount() + "顿" + label + "（安排在" + window + "）";
     }
 
     /** 景点时段分配模板：按已选景点数与活动倾向给出「上午/下午/晚上」分配建议（每行规则文本） */
@@ -1286,8 +1444,14 @@ public class ItineraryService {
                 }
             }
             d.setNodes(valid);
-            // 2. 饭点兜底：缺午餐/晚餐 → 插入最近顺路的已选饭店
-            injectMeals(d, restaurants, coords);
+        }
+
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (planning.getMeal().isNoFood()) {
+            plan.getDays().forEach(d -> d.getNodes().removeIf(n -> "restaurant".equals(n.getType())));
+        } else if (!planning.getMeal().isSnacksAllowed()) {
+            plan.getDays().forEach(d -> d.getNodes().removeIf(n -> "restaurant".equals(n.getType())
+                    && n.getPlaceId() != null && MealPolicySupport.isSnack(foodById.get(n.getPlaceId()))));
         }
 
         // 3. 劳累度预判：需要休息则先插入（时间后续统一重算）。
@@ -1312,6 +1476,11 @@ public class ItineraryService {
         // 3.5 跨天去重：同一景点/餐厅/休息点全行程只出现一次（LLM 输出与自动补点都可能重复；
         // 酒店是每天驻地、交通节点是行程骨架，不受此限；同一天内可重复）
         dedupAcrossDays(plan, attById, foodById, restById, attractions, restaurants, restSpots);
+
+        // 3.6 同一份策略确定性校正餐次：先去掉超额，再按范围补足；小吃永远不能补正餐。
+        if (!planning.getMeal().isNoFood()) {
+            reconcileMealPolicy(plan, planning, restaurants, foodById, coords);
+        }
 
         // 4. 时间轴确定性重算：通勤 + 停留时长 + 饭点锚定（LLM 时间仅作顺序参考；S10 起通勤走共享路线事实）
         int deadlineMin = ItineraryValidator.deadlineMinutes(state.getPreference());
@@ -1657,6 +1826,129 @@ public class ItineraryService {
             // S04：补餐必须插到窗口内的正确位置（如午餐在晚间节点之前），不能一律追加在队尾
             d.getNodes().sort(Comparator.comparing(n -> n.getTime() == null ? "99:99" : n.getTime()));
         }
+    }
+
+    private void reconcileMealPolicy(ItineraryPlan plan, ResolvedPlanningPolicy planning,
+                                     List<Restaurant> foods, Map<Long, Restaurant> foodById,
+                                     Map<PlaceKey, double[]> coords) {
+        reconcileMealRule(plan, planning.getMeal().getLunch(), foods, foodById, coords);
+        reconcileMealRule(plan, planning.getMeal().getDinner(), foods, foodById, coords);
+    }
+
+    /** 对一个餐次执行“去超额 → 补不足”，scope 与 operator 均来自统一策略。 */
+    private void reconcileMealRule(ItineraryPlan plan, ResolvedPlanningPolicy.MealRule rule,
+                                   List<Restaurant> foods, Map<Long, Restaurant> foodById,
+                                   Map<PlaceKey, double[]> coords) {
+        if (rule == null) {
+            return;
+        }
+        RequirementOperator operator = rule.getOperator() == null ? RequirementOperator.EQ : rule.getOperator();
+        if (rule.getScope() == RequirementScope.PER_DAY) {
+            for (DailyPlan day : plan.getDays()) {
+                if (!MealPolicySupport.eligible(day, rule.getSubject())) {
+                    continue;
+                }
+                List<PlanNode> matches = mainMealNodes(day, rule.getSubject(), foodById);
+                if (operator == RequirementOperator.EQ || operator == RequirementOperator.AT_MOST) {
+                    removeMealExcess(day, matches, rule.getCount());
+                    matches = mainMealNodes(day, rule.getSubject(), foodById);
+                }
+                if (operator != RequirementOperator.AT_MOST) {
+                    injectMealShortage(plan, day, rule.getSubject(), rule.getCount() - matches.size(),
+                            foods, foodById, coords);
+                }
+            }
+            return;
+        }
+
+        List<MealNodeLocation> matches = new ArrayList<>();
+        for (DailyPlan day : plan.getDays()) {
+            if (!MealPolicySupport.eligible(day, rule.getSubject())) {
+                continue;
+            }
+            for (PlanNode node : mainMealNodes(day, rule.getSubject(), foodById)) {
+                matches.add(new MealNodeLocation(day, node));
+            }
+        }
+        if (operator == RequirementOperator.EQ || operator == RequirementOperator.AT_MOST) {
+            for (int i = matches.size() - 1; i >= rule.getCount(); i--) {
+                MealNodeLocation extra = matches.get(i);
+                extra.day().getNodes().remove(extra.node());
+            }
+            matches = matches.subList(0, Math.min(matches.size(), rule.getCount()));
+        }
+        if (operator == RequirementOperator.AT_MOST) {
+            return;
+        }
+        int missing = rule.getCount() - matches.size();
+        for (DailyPlan day : plan.getDays()) {
+            if (missing <= 0) {
+                break;
+            }
+            if (!MealPolicySupport.eligible(day, rule.getSubject())
+                    || !mainMealNodes(day, rule.getSubject(), foodById).isEmpty()) {
+                continue;
+            }
+            int before = mainMealNodes(day, rule.getSubject(), foodById).size();
+            injectMealShortage(plan, day, rule.getSubject(), 1, foods, foodById, coords);
+            int after = mainMealNodes(day, rule.getSubject(), foodById).size();
+            if (after > before) {
+                missing--;
+            }
+        }
+    }
+
+    private static List<PlanNode> mainMealNodes(DailyPlan day, RequirementSubject subject,
+                                                 Map<Long, Restaurant> foodById) {
+        if (day.getNodes() == null) {
+            return List.of();
+        }
+        return day.getNodes().stream()
+                .filter(n -> MealPolicySupport.isMealNode(n, subject))
+                .filter(n -> n.getPlaceId() != null && foodById.containsKey(n.getPlaceId()))
+                .filter(n -> !MealPolicySupport.isSnack(foodById.get(n.getPlaceId())))
+                .toList();
+    }
+
+    private static void removeMealExcess(DailyPlan day, List<PlanNode> nodes, int max) {
+        for (int i = nodes.size() - 1; i >= max; i--) {
+            day.getNodes().remove(nodes.get(i));
+        }
+    }
+
+    private void injectMealShortage(ItineraryPlan plan, DailyPlan day, RequirementSubject subject, int missing,
+                                    List<Restaurant> foods, Map<Long, Restaurant> foodById,
+                                    Map<PlaceKey, double[]> coords) {
+        if (missing <= 0) {
+            return;
+        }
+        Set<Long> used = plan.getDays().stream()
+                .flatMap(d -> d.getNodes() == null ? java.util.stream.Stream.<PlanNode>empty() : d.getNodes().stream())
+                .filter(n -> "restaurant".equals(n.getType()) && n.getPlaceId() != null)
+                .map(PlanNode::getPlaceId).collect(Collectors.toSet());
+        for (int i = 0; i < missing; i++) {
+            List<Restaurant> available = foods.stream()
+                    .filter(r -> !used.contains(r.getId()))
+                    .filter(r -> !MealPolicySupport.isSnack(r))
+                    .toList();
+            if (available.isEmpty()) {
+                return;
+            }
+            Restaurant nearest = nearestRestaurant(day, available, coords);
+            PlanNode meal = new PlanNode();
+            String label = subject == RequirementSubject.DINNER ? "晚餐" : "午餐";
+            meal.setType("restaurant");
+            meal.setPlaceId(nearest.getId());
+            meal.setName(nearest.getName());
+            meal.setTime(MealTimeChecker.defaultMealTime(label));
+            meal.setNote(label + "（按需求补齐）");
+            day.getNodes().add(meal);
+            day.getNodes().sort(Comparator.comparing(n -> n.getTime() == null ? "99:99" : n.getTime()));
+            used.add(nearest.getId());
+        }
+    }
+
+    private record MealNodeLocation(DailyPlan day, PlanNode node) {
     }
 
     private Restaurant nearestRestaurant(DailyPlan d, List<Restaurant> foods, Map<PlaceKey, double[]> coords) {

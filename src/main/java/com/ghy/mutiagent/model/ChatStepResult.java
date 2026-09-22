@@ -30,6 +30,12 @@ public class ChatStepResult {
     private Long sessionRevision;
     private String itineraryText;
     private ItineraryPlan plan;
+    /** O2：当前权威需求快照，提供“用户原话 → 结构化理解”的可审计关联。 */
+    private RequirementSnapshot requirementSnapshot;
+    /** O2：候选、规划、后处理与验证共同消费的策略版本。 */
+    private ResolvedPlanningPolicy resolvedPlanningPolicy;
+    /** O2：最终计划对每条需求的状态、实际值和节点/事实证据。 */
+    private RequirementFulfillmentReport requirementFulfillmentReport;
     /** Agent 针对用户特殊要求给出的「推荐方法」建议文本 */
     private String candidateAdvice;
     /**

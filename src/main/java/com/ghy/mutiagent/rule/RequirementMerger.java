@@ -3,10 +3,13 @@ package com.ghy.mutiagent.rule;
 import com.ghy.mutiagent.model.ConstraintEntry;
 import com.ghy.mutiagent.model.RequirementSnapshot;
 import com.ghy.mutiagent.model.TravelState;
+import com.ghy.mutiagent.model.requirement.InterpretationStatus;
+import com.ghy.mutiagent.model.requirement.RequirementScope;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -20,6 +23,7 @@ public final class RequirementMerger {
 
     public static final String ACTIVE = "ACTIVE";
     public static final String REVOKED = "REVOKED";
+    public static final String SUPERSEDED = "SUPERSEDED";
 
     private RequirementMerger() {
     }
@@ -36,6 +40,9 @@ public final class RequirementMerger {
         }
         boolean changed = false;
         for (ConstraintEntry e : parsed.getConstraints() == null ? List.<ConstraintEntry>of() : parsed.getConstraints()) {
+            if (e != null && e.getSourceTurnId() == null) {
+                e.setSourceTurnId("session:" + state.getSessionId() + ":snapshot:" + (snap.getRevision() + 1));
+            }
             changed |= applyEntry(snap, e);
         }
         if (parsed.getBudget() != null) {
@@ -49,6 +56,11 @@ public final class RequirementMerger {
         }
         if (changed) {
             snap.setRevision(snap.getRevision() + 1);
+            // 旧策略/旧验收报告绑定的是旧快照版本，需求一变立即失效。
+            state.setResolvedPlanningPolicy(null);
+            if (state.getRequirementFulfillmentReport() != null) {
+                state.getRequirementFulfillmentReport().markStale();
+            }
         }
     }
 
@@ -70,14 +82,16 @@ public final class RequirementMerger {
         }
         for (ConstraintEntry old : list) {
             if (old.getKey().equals(e.getKey()) && ACTIVE.equals(old.getStatus())) {
-                if (java.util.Objects.equals(old.getValue(), e.getValue())) {
+                if (semanticEquals(old, e)) {
                     return false; // 完全相同，去重
                 }
-                old.setStatus(REVOKED); // 单值字段更改：旧值保留历史，新值生效
+                old.setStatus(SUPERSEDED); // 新版本替代旧版本，历史仍可追踪
+                e.setSupersedesId(old.getId());
+                e.setRevision(Math.max(1, old.getRevision() + 1));
             }
         }
         if (e.getId() == null) {
-            e.setId("c-" + String.format("%03d", list.size() + 1));
+            e.setId("REQ-" + String.format("%04d", list.size() + 1));
         }
         if (e.getStatus() == null) {
             e.setStatus(ACTIVE);
@@ -87,6 +101,91 @@ public final class RequirementMerger {
         }
         list.add(e);
         return true;
+    }
+
+    private static boolean semanticEquals(ConstraintEntry left, ConstraintEntry right) {
+        return Objects.equals(left.getKey(), right.getKey())
+                && Objects.equals(left.getValue(), right.getValue())
+                && Objects.equals(left.getSubject(), right.getSubject())
+                && Objects.equals(left.getCount(), right.getCount())
+                && Objects.equals(left.getOperator(), right.getOperator())
+                && Objects.equals(left.getUnit(), right.getUnit())
+                && Objects.equals(left.getScope(), right.getScope())
+                && Objects.equals(left.getInterpretationStatus(), right.getInterpretationStatus());
+    }
+
+    /**
+     * 把单独一轮的范围回答（例如“全程”或“每天”）应用到最近一条待澄清餐次需求。
+     * 返回新版本需求；若消息不是纯范围回答或没有待澄清需求则返回 null。
+     */
+    public static ConstraintEntry resolvePendingMealScope(TravelState state, String message) {
+        if (state == null || message == null) {
+            return null;
+        }
+        String normalized = message.replaceAll("[，,。.、；;！!？?\\s]", "");
+        RequirementScope scope;
+        if (normalized.matches("全程|整个行程|整个旅程|这趟旅行|这趟行程|一共|总共")) {
+            scope = RequirementScope.TRIP;
+        } else if (normalized.matches("每天|每日|每一天|天天")) {
+            scope = RequirementScope.PER_DAY;
+        } else {
+            return null;
+        }
+        RequirementSnapshot snapshot = state.getRequirementSnapshot();
+        if (snapshot == null || snapshot.getConstraints() == null) {
+            return null;
+        }
+        ConstraintEntry pending = null;
+        for (ConstraintEntry entry : snapshot.getConstraints()) {
+            if (ACTIVE.equals(entry.getStatus())
+                    && (entry.getInterpretationStatus() == InterpretationStatus.NEEDS_CLARIFICATION
+                    || entry.getInterpretationStatus() == InterpretationStatus.LEGACY_UNRESOLVED)) {
+                pending = entry;
+            }
+        }
+        if (pending == null) {
+            return null;
+        }
+        String pendingTurn = pending.getSourceTurnId();
+        RuleParseResult parsed = new RuleParseResult();
+        ConstraintEntry lastResolved = null;
+        for (ConstraintEntry entry : snapshot.getConstraints()) {
+            if (!ACTIVE.equals(entry.getStatus())
+                    || (entry.getInterpretationStatus() != InterpretationStatus.NEEDS_CLARIFICATION
+                    && entry.getInterpretationStatus() != InterpretationStatus.LEGACY_UNRESOLVED)
+                    || !Objects.equals(pendingTurn, entry.getSourceTurnId())) {
+                continue;
+            }
+            ConstraintEntry resolved = copyOf(entry);
+            resolved.setId(null);
+            resolved.setScope(scope);
+            resolved.setInterpretationStatus(InterpretationStatus.CONFIRMED);
+            resolved.setReasonCode(null);
+            resolved.setSourceTurnId(null);
+            resolved.setOriginalText(entry.getOriginalText() + "（范围确认：" + normalized + "）");
+            parsed.getConstraints().add(resolved);
+            lastResolved = resolved;
+        }
+        mergeInto(state, parsed);
+        return lastResolved;
+    }
+
+    private static ConstraintEntry copyOf(ConstraintEntry source) {
+        ConstraintEntry target = new ConstraintEntry();
+        target.setKey(source.getKey());
+        target.setValue(source.getValue());
+        target.setHardness(source.getHardness());
+        target.setStatus(source.getStatus());
+        target.setSource(source.getSource());
+        target.setOriginalText(source.getOriginalText());
+        target.setSubject(source.getSubject());
+        target.setCount(source.getCount());
+        target.setOperator(source.getOperator());
+        target.setUnit(source.getUnit());
+        target.setScope(source.getScope());
+        target.setInterpretationStatus(source.getInterpretationStatus());
+        target.setRevision(source.getRevision());
+        return target;
     }
 
     /** key 是否有 ACTIVE 约束 */

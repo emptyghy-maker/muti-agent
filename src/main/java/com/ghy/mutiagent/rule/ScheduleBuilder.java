@@ -125,7 +125,9 @@ public final class ScheduleBuilder {
     }
 
     /** 节点停留分钟：景点按建议时长（最少 1 小时）、餐厅 90、休息点 60、交通/酒店 0。
-     * 夜景时段（18:30 后到访的夜景标签景点）游览按 2 小时封顶（用户口径：晚餐后约 20:00-22:00 夜景）。 */
+     * 夜景时段（18:30 后到访的夜景标签景点）游览按 2 小时封顶（用户口径：晚餐后约 20:00-22:00 夜景）。
+     * 开放时间封顶（确定性修复的根）：营业时间覆盖不了建议时长时压缩停留（不能排到闭馆之后）；
+     * 压缩后不足最短停留则保持原时长——发布检查拦截，走修复循环换序/换点。 */
     private static int durationOf(PlanNode n, Map<Long, Attraction> attById, int arrivalMin) {
         return switch (n.getType() == null ? "" : n.getType()) {
             case "attraction" -> {
@@ -134,6 +136,16 @@ public final class ScheduleBuilder {
                 int dur = Math.max(MIN_ATTRACTION_MIN, (int) Math.round(hours * 60));
                 if (arrivalMin >= NIGHT_START_MIN && a != null && NightScorer.isNight(a.getTags())) {
                     dur = Math.min(dur, NIGHT_VISIT_MAX_MIN);
+                }
+                if (a != null) {
+                    for (int[] it : OpeningHoursParser.parse(a.getOpenTime())) {
+                        if (arrivalMin >= it[0] && arrivalMin < it[1]
+                                && arrivalMin + dur > it[1]
+                                && it[1] - arrivalMin >= MIN_ATTRACTION_MIN) {
+                            dur = it[1] - arrivalMin;
+                        }
+                        break;
+                    }
                 }
                 yield dur;
             }

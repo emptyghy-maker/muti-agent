@@ -98,6 +98,12 @@ public class TravelState {
     private Map<String, String> channelRequests;
     /** S02 跨轮需求快照：有效约束/撤销记录/预算口径/未解析残余，每轮合并同一份 */
     private RequirementSnapshot requirementSnapshot;
+    /** O2：当前需求快照解析出的统一执行策略；所有消费者必须核对同一 revision。 */
+    private ResolvedPlanningPolicy resolvedPlanningPolicy;
+    /** O2：最近一次计划验收报告；需求或计划版本变化后必须作废并重算。 */
+    private RequirementFulfillmentReport requirementFulfillmentReport;
+    /** O2：会话内计划草稿版本；每次生成/Repair/Patch 产出新草稿时递增。 */
+    private int planRevision;
     /** Agent 针对特殊要求给出的「推荐方法」建议文本（展示在前端候选区） */
     private String candidateAdvice;
     /** 阶段2：联网检索的美食候选（知识库外，仅参考展示，未经审核不入知识库、暂不进行程） */
@@ -200,6 +206,35 @@ public class TravelState {
     public void clearChannelRequests() {
         if (channelRequests != null) {
             channelRequests.clear();
+        }
+    }
+
+    /**
+     * 偏好问询重问护栏计数：同一字段连续几轮都没能推进（字段 → 轮数）。
+     * 达到阈值后该字段确定性带过（默认值），保证任何预期外输入都不会把用户困在同一问题上。
+     */
+    private Map<String, Integer> fieldAskRounds;
+
+    public int askRoundOf(String field) {
+        return fieldAskRounds == null ? 0 : fieldAskRounds.getOrDefault(field, 0);
+    }
+
+    public void bumpAskRound(String field) {
+        if (fieldAskRounds == null) {
+            fieldAskRounds = new LinkedHashMap<>();
+        }
+        fieldAskRounds.merge(field, 1, Integer::sum);
+    }
+
+    public void clearAskRound(String field) {
+        if (fieldAskRounds != null) {
+            fieldAskRounds.remove(field);
+        }
+    }
+
+    public void clearAskRounds() {
+        if (fieldAskRounds != null) {
+            fieldAskRounds.clear();
         }
     }
 }

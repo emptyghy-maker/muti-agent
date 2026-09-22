@@ -3,6 +3,11 @@ package com.ghy.mutiagent.rule;
 import com.ghy.mutiagent.model.BudgetSpec;
 import com.ghy.mutiagent.model.ConstraintEntry;
 import com.ghy.mutiagent.model.TravelPreference;
+import com.ghy.mutiagent.model.requirement.InterpretationStatus;
+import com.ghy.mutiagent.model.requirement.RequirementOperator;
+import com.ghy.mutiagent.model.requirement.RequirementScope;
+import com.ghy.mutiagent.model.requirement.RequirementSubject;
+import com.ghy.mutiagent.model.requirement.RequirementUnit;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -282,39 +287,191 @@ public class RulePreferenceParser {
 
     // ==================== 餐次结构抽取 ====================
 
-    /** 餐次需求：「N顿午饭/晚饭/早饭」「不要早餐」「不要小吃」等；命中即消费原文区间 */
+    /**
+     * O2 餐次需求：数量必须同时携带 unit 与 scope。
+     * 无范围的「2顿午餐」进入 NEEDS_CLARIFICATION，不能再猜成 lunchPerDay。
+     */
     private void extractMealPlan(String m, RuleParseResult r, List<int[]> spans) {
+        RequirementScope scope = mealScope(m);
+        List<int[]> local = new ArrayList<>();
+        boolean matched = false;
+
+        // 候选店数量先于餐次匹配，避免「推荐2家午餐店」被当成吃2顿。
+        Matcher candidate = Pattern.compile("((?:至少|最少|最多|不超过|至多)?)([一二两三四五六七八九十\\d]+)\\s*家(?:适合)?(午餐|午饭|中饭|晚餐|晚饭)(?:店|餐厅|饭店)?")
+                .matcher(m);
+        while (candidate.find()) {
+            int count = chineseNumber(candidate.group(2));
+            RequirementSubject subject = candidate.group(3).startsWith("晚")
+                    ? RequirementSubject.DINNER_RESTAURANT : RequirementSubject.LUNCH_RESTAURANT;
+            r.getConstraints().add(structuredRequirement(
+                    "candidate." + subject.name(), subject, count, operatorOf(candidate.group(1)),
+                    RequirementUnit.CANDIDATE_COUNT, RequirementScope.NONE,
+                    InterpretationStatus.CONFIRMED, "SOFT", candidate.group(), null));
+            addSpan(local, candidate);
+            addSpan(spans, candidate);
+            matched = true;
+        }
+
+        // 菜品数量属于尚未支持的菜品层，明确记录而不是映射成餐厅或餐次。
+        Matcher dish = Pattern.compile("((?:至少|最少|最多|不超过|至多)?)([一二两三四五六七八九十\\d]+)\\s*道(?:菜|菜品)")
+                .matcher(m);
+        while (dish.find()) {
+            int count = chineseNumber(dish.group(2));
+            r.getConstraints().add(structuredRequirement(
+                    "dish.count", RequirementSubject.DISH, count, operatorOf(dish.group(1)),
+                    RequirementUnit.DISH_COUNT, RequirementScope.NONE,
+                    InterpretationStatus.UNSUPPORTED, "SOFT", dish.group(), "DISH_LEVEL_NOT_SUPPORTED"));
+            addSpan(local, dish);
+            addSpan(spans, dish);
+            matched = true;
+        }
+
         Matcher bfNeg = Pattern.compile("(不要|不吃|不需要|不用|免|取消|省了)\\s*(早(饭|餐))").matcher(m);
         if (bfNeg.find()) {
             r.getUpdates().put("breakfastPerDay", "0");
+            r.getConstraints().add(structuredRequirement("meal.BREAKFAST", RequirementSubject.BREAKFAST, 0,
+                    RequirementOperator.EQ, RequirementUnit.MEAL_OCCASION,
+                    scope == RequirementScope.UNRESOLVED ? RequirementScope.TRIP : scope,
+                    InterpretationStatus.CONFIRMED, "HARD", bfNeg.group(), null));
             addSpan(spans, bfNeg);
+            matched = true;
         }
-        Matcher bf = Pattern.compile("(\\d+)\\s*顿?\\s*早(饭|餐)").matcher(m);
-        if (bf.find()) {
-            r.getUpdates().putIfAbsent("breakfastPerDay", bf.group(1));
-            addSpan(spans, bf);
-        }
-        Matcher lu = Pattern.compile("(\\d+)\\s*顿?\\s*(午|中)(饭|餐)").matcher(m);
-        if (lu.find()) {
-            r.getUpdates().putIfAbsent("lunchPerDay", lu.group(1));
-            addSpan(spans, lu);
-        }
-        Matcher dn = Pattern.compile("(\\d+)\\s*顿?\\s*晚(饭|餐)").matcher(m);
-        if (dn.find()) {
-            r.getUpdates().putIfAbsent("dinnerPerDay", dn.group(1));
-            addSpan(spans, dn);
+        Matcher meal = Pattern.compile("((?:至少|最少|最多|不超过|至多)?)([一二两三四五六七八九十\\d]+)\\s*顿?\\s*(早(?:饭|餐)|午(?:饭|餐)|中(?:饭|餐)|晚(?:饭|餐))")
+                .matcher(m);
+        while (meal.find()) {
+            if (overlaps(local, meal.start(), meal.end())) {
+                continue;
+            }
+            int count = chineseNumber(meal.group(2));
+            RequirementSubject subject = mealSubject(meal.group(3));
+            InterpretationStatus interpretation = scope == RequirementScope.UNRESOLVED
+                    ? InterpretationStatus.NEEDS_CLARIFICATION
+                    : subject == RequirementSubject.BREAKFAST && count > 0
+                    ? InterpretationStatus.UNSUPPORTED : InterpretationStatus.CONFIRMED;
+            String reason = interpretation == InterpretationStatus.NEEDS_CLARIFICATION
+                    ? "MEAL_SCOPE_REQUIRED"
+                    : interpretation == InterpretationStatus.UNSUPPORTED ? "BREAKFAST_PLANNING_NOT_SUPPORTED" : null;
+            r.getConstraints().add(structuredRequirement(
+                    "meal." + subject.name(), subject, count, operatorOf(meal.group(1)),
+                    RequirementUnit.MEAL_OCCASION, scope, interpretation, "HARD", meal.group(), reason));
+            // 只有明确 PER_DAY 才写旧投影字段；TRIP 和 UNRESOLVED 绝不能进入 *PerDay。
+            if (scope == RequirementScope.PER_DAY && interpretation == InterpretationStatus.CONFIRMED) {
+                String field = switch (subject) {
+                    case BREAKFAST -> "breakfastPerDay";
+                    case LUNCH -> "lunchPerDay";
+                    case DINNER -> "dinnerPerDay";
+                    default -> null;
+                };
+                if (field != null) {
+                    r.getUpdates().put(field, String.valueOf(count));
+                }
+            }
+            addSpan(spans, meal);
+            matched = true;
         }
         Matcher snNeg = Pattern.compile("(不要|不吃|不需要|不用|免|取消|省了)\\s*(小吃|夜宵)").matcher(m);
         if (snNeg.find()) {
             r.getUpdates().put("snacksAllowed", "false");
+            r.getConstraints().add(structuredRequirement("meal.SNACK_ALLOWED", RequirementSubject.SNACK_ALLOWED,
+                    null, RequirementOperator.FORBID, RequirementUnit.BOOLEAN, RequirementScope.TRIP,
+                    InterpretationStatus.CONFIRMED, "HARD", snNeg.group(), null));
+            r.getConstraints().get(r.getConstraints().size() - 1).setValue("FALSE");
             addSpan(spans, snNeg);
+            matched = true;
         }
         // 正向表达不得与已消费的否定区间重叠（如「不要小吃」里的「要小吃」不是要小吃）
         Matcher snPos = Pattern.compile("(要|想吃|想尝|加|来|带|留|想要)\\s*点?\\s*(小吃|夜宵)").matcher(m);
         if (snPos.find() && !overlaps(spans, snPos.start(), snPos.end())) {
             r.getUpdates().put("snacksAllowed", "true");
+            r.getConstraints().add(structuredRequirement("meal.SNACK_ALLOWED", RequirementSubject.SNACK_ALLOWED,
+                    null, RequirementOperator.ALLOW, RequirementUnit.BOOLEAN, RequirementScope.TRIP,
+                    InterpretationStatus.CONFIRMED, "SOFT", snPos.group(), null));
+            r.getConstraints().get(r.getConstraints().size() - 1).setValue("TRUE");
             addSpan(spans, snPos);
+            matched = true;
         }
+        if (matched) {
+            consumeScopeWords(m, spans);
+        }
+    }
+
+    private static ConstraintEntry structuredRequirement(String key, RequirementSubject subject, Integer count,
+                                                         RequirementOperator operator, RequirementUnit unit,
+                                                         RequirementScope scope, InterpretationStatus interpretation,
+                                                         String hardness, String text, String reasonCode) {
+        ConstraintEntry c = new ConstraintEntry();
+        c.setKey(key);
+        c.setValue(count == null ? null : String.valueOf(count));
+        c.setSubject(subject);
+        c.setCount(count);
+        c.setOperator(operator);
+        c.setUnit(unit);
+        c.setScope(scope);
+        c.setInterpretationStatus(interpretation);
+        c.setHardness(hardness);
+        c.setStatus("ACTIVE");
+        c.setSource("USER");
+        c.setOriginalText(text);
+        c.setReasonCode(reasonCode);
+        return c;
+    }
+
+    private static RequirementScope mealScope(String text) {
+        if (Pattern.compile("全程|整个(?:行程|旅程)|这趟(?:旅行|行程)|一共|总共").matcher(text).find()) {
+            return RequirementScope.TRIP;
+        }
+        if (Pattern.compile("每天|每日|每一天|天天").matcher(text).find()) {
+            return RequirementScope.PER_DAY;
+        }
+        return RequirementScope.UNRESOLVED;
+    }
+
+    private static void consumeScopeWords(String text, List<int[]> spans) {
+        Matcher scope = Pattern.compile("全程|整个(?:行程|旅程)|这趟(?:旅行|行程)|一共|总共|每天|每日|每一天|天天")
+                .matcher(text);
+        while (scope.find()) {
+            addSpan(spans, scope);
+        }
+    }
+
+    private static RequirementOperator operatorOf(String prefix) {
+        if (prefix == null) {
+            return RequirementOperator.EQ;
+        }
+        return switch (prefix) {
+            case "至少", "最少" -> RequirementOperator.AT_LEAST;
+            case "最多", "不超过", "至多" -> RequirementOperator.AT_MOST;
+            default -> RequirementOperator.EQ;
+        };
+    }
+
+    private static RequirementSubject mealSubject(String raw) {
+        if (raw.startsWith("早")) {
+            return RequirementSubject.BREAKFAST;
+        }
+        if (raw.startsWith("晚")) {
+            return RequirementSubject.DINNER;
+        }
+        return RequirementSubject.LUNCH;
+    }
+
+    private static int chineseNumber(String raw) {
+        if (raw.matches("\\d+")) {
+            return Integer.parseInt(raw);
+        }
+        return switch (raw) {
+            case "一" -> 1;
+            case "二", "两" -> 2;
+            case "三" -> 3;
+            case "四" -> 4;
+            case "五" -> 5;
+            case "六" -> 6;
+            case "七" -> 7;
+            case "八" -> 8;
+            case "九" -> 9;
+            case "十" -> 10;
+            default -> 0;
+        };
     }
 
     private static boolean overlaps(List<int[]> spans, int start, int end) {
