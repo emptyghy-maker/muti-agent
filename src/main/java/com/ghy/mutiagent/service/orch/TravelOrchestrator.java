@@ -44,6 +44,7 @@ import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.rule.RequirementApplier;
 import com.ghy.mutiagent.rule.RequirementMerger;
 import com.ghy.mutiagent.rule.RuleParseResult;
+import com.ghy.mutiagent.rule.SessionControlIntentParser;
 import com.ghy.mutiagent.security.AuthenticatedUser;
 import org.springframework.beans.factory.annotation.Autowired;
 import com.ghy.mutiagent.service.AgentOutputParser;
@@ -314,12 +315,19 @@ public class TravelOrchestrator {
             throw new BizException(ResultCode.PARAM_ERROR);
         }
 
+        return createSessionInternal(actor, destinationId, dest.getName(), null);
+    }
+
+    private ChatStepResult createSessionInternal(AuthenticatedUser actor, Long destinationId,
+                                                 String destinationName, String parentSessionId) {
+
         TravelState state = new TravelState();
         state.setSessionId(UUID.randomUUID().toString().replace("-", "").substring(0, 16));
+        state.setParentSessionId(parentSessionId);
         state.setUserId(actor.id());
         state.setUsername(actor.username());
         state.setDestinationId(destinationId);
-        state.setDestinationName(dest.getName());
+        state.setDestinationName(destinationName);
         state.setStage(TravelStage.PREFERENCE);
         state.setCreatedAt(LocalDateTime.now());
         state.getPreference().setDestinationId(destinationId);
@@ -328,8 +336,11 @@ public class TravelOrchestrator {
         state.setCurrentField(first.getField());
         sessionService.save(state);
         usageService.recordOp(state.getSessionId(), state.getUserId(), state.getUsername(),
-                "PREFERENCE", "创建会话", "SUCCESS", "目的地：" + dest.getName(), UsageChannel.OP);
-        log.info("[TravelAgent][stage=PREFERENCE][sessionId={}] 会话创建，目的地={}", state.getSessionId(), dest.getName());
+                "PREFERENCE", parentSessionId == null ? "创建会话" : "重新开始-创建新会话", "SUCCESS",
+                "目的地：" + destinationName + (parentSessionId == null ? "" : "，父会话：" + parentSessionId),
+                UsageChannel.OP);
+        log.info("[TravelAgent][stage=PREFERENCE][sessionId={}] 会话创建，目的地={}，父会话={}",
+                state.getSessionId(), destinationName, parentSessionId);
         return buildResult(state, GREETING + "\n\n" + first.getText(), first);
     }
 
@@ -351,20 +362,25 @@ public class TravelOrchestrator {
         state.resetTurnUsage();
         long turnStart = System.currentTimeMillis();
         String entryStage = state.getStage().name();
-        ConstraintEntry scopeResolved = RequirementMerger.resolvePendingMealScope(state, message);
+        SessionControlIntentParser.Intent control = SessionControlIntentParser.parse(message);
         ChatStepResult result;
-        if (scopeResolved != null) {
-            result = afterMealScopeResolved(state, scopeResolved);
+        if (control.type() != SessionControlIntentParser.Type.NONE) {
+            result = handleControlIntent(actor, state, control);
         } else {
-            result = switch (state.getStage()) {
-                case PREFERENCE -> chatPreference(state, message);
-                case ATTRACTIONS, FOODS, HOTELS -> chatCandidateRefine(state, message);
-                case DONE -> chatDone(actor, state, message);
-                default -> {
-                    sessionService.save(state);
-                    yield buildResult(state, "当前步骤请先完成页面上的选择，稍后我会为你继续规划。", null);
-                }
-            };
+            ConstraintEntry scopeResolved = RequirementMerger.resolvePendingMealScope(state, message);
+            if (scopeResolved != null) {
+                result = afterMealScopeResolved(state, scopeResolved);
+            } else {
+                result = switch (state.getStage()) {
+                    case PREFERENCE -> chatPreference(state, message);
+                    case ATTRACTIONS, FOODS, HOTELS -> chatCandidateRefine(state, message);
+                    case DONE -> chatDone(actor, state, message);
+                    default -> {
+                        sessionService.save(state);
+                        yield buildResult(state, "当前步骤请先完成页面上的选择，稍后我会为你继续规划。", null);
+                    }
+                };
+            }
         }
         usageService.recordQa(state.getSessionId(), state.getUserId(), state.getUsername(),
                 entryStage, "对话", "SUCCESS",
@@ -374,6 +390,253 @@ public class TravelOrchestrator {
                 state.getTurnInputTokens(), state.getTurnOutputTokens(),
                 System.currentTimeMillis() - turnStart);
         return result;
+    }
+
+    /**
+     * 从头规划创建全新会话。新会话沿用用户与目的地，旧会话只增加幂等映射并保留完整历史；
+     * 因 sessionId 隔离，旧候选预热或旧生成的晚到结果不会写入新会话。
+     */
+    public ChatStepResult restartSession(AuthenticatedUser actor, String sessionId,
+                                         String requestId, Long expectedRevision) {
+        TravelState old = sessionService.loadOwned(sessionId, actor.id());
+        requireExpectedRevision(old, expectedRevision);
+        String key = requestId == null ? null : requestId.trim();
+        if (key != null && !key.isBlank()) {
+            String existing = old.restartResults().get(key);
+            if (existing != null) {
+                TravelState replay = sessionService.loadOwned(existing, actor.id());
+                Question q = replay.getStage() == TravelStage.PREFERENCE ? nextQuestion(replay) : null;
+                return buildResult(replay, "已恢复本次重新开始创建的新规划。"
+                        + (q == null ? "" : "\n\n" + q.getText()), q);
+            }
+        }
+        if (parallelOn()) {
+            channelCoordinator.clear(old.getSessionId());
+        }
+        ChatStepResult created = createSessionInternal(actor, old.getDestinationId(),
+                old.getDestinationName(), old.getSessionId());
+        if (key != null && !key.isBlank()) {
+            old.restartResults().put(key, created.getSessionId());
+            sessionService.save(old);
+        }
+        usageService.recordOp(old.getSessionId(), old.getUserId(), old.getUsername(),
+                old.getStage().name(), "重新开始", "SUCCESS",
+                "新会话：" + created.getSessionId(), UsageChannel.OP);
+        return created;
+    }
+
+    /** 阶段回退公开入口：保留偏好与需求，只作废目标阶段和下游选择、候选及计划。 */
+    public ChatStepResult rewindSession(AuthenticatedUser actor, String sessionId,
+                                        String targetStage, Long expectedRevision) {
+        TravelState state = sessionService.loadOwned(sessionId, actor.id());
+        requireExpectedRevision(state, expectedRevision);
+        TravelStage target;
+        try {
+            target = TravelStage.valueOf(targetStage == null ? "" : targetStage.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            throw new BizException(ResultCode.PARAM_ERROR);
+        }
+        return rewindState(state, target);
+    }
+
+    private ChatStepResult handleControlIntent(AuthenticatedUser actor, TravelState state,
+                                               SessionControlIntentParser.Intent intent) {
+        return switch (intent.type()) {
+            case RESTART -> restartSession(actor, state.getSessionId(), null, null);
+            case RESELECT_STAGE -> rewindState(state, intent.targetStage());
+            case RESELECT_CURRENT -> {
+                if (state.getStage() == TravelStage.PREFERENCE) {
+                    yield stepBack(state);
+                }
+                yield rewindState(state, currentSelectionStage(state));
+            }
+            case GO_BACK -> {
+                if (state.getStage() == TravelStage.PREFERENCE) {
+                    yield stepBack(state);
+                }
+                yield rewindState(state, previousSelectionStage(state));
+            }
+            default -> throw new BizException(ResultCode.PARAM_ERROR);
+        };
+    }
+
+    private void requireExpectedRevision(TravelState state, Long expectedRevision) {
+        if (expectedRevision == null) {
+            return;
+        }
+        long actual = state.getSessionRevision() == null ? 0L : state.getSessionRevision();
+        if (expectedRevision != actual) {
+            throw new BizException(ResultCode.STATE_CONFLICT);
+        }
+    }
+
+    private ChatStepResult rewindState(TravelState state, TravelStage target) {
+        if (!List.of(TravelStage.ATTRACTIONS, TravelStage.FOODS,
+                TravelStage.HOTELS, TravelStage.PLAN_QUIZ).contains(target)) {
+            throw new BizException(ResultCode.PARAM_ERROR);
+        }
+        if ((generationRegistry != null && generationRegistry.isGenerating(state.getSessionId()))
+                || sessionService.hasActiveOperation(state.getSessionId())) {
+            throw new BizException(ResultCode.STATE_CONFLICT);
+        }
+        if (stageRank(target) > stageRank(state.getStage())) {
+            throw new BizException(ResultCode.STATE_CONFLICT);
+        }
+        if ((target == TravelStage.FOODS && Boolean.TRUE.equals(state.getNoFoodNeeded()))
+                || (target == TravelStage.HOTELS && Boolean.TRUE.equals(state.getNoHotelNeeded()))
+                || (target == TravelStage.ATTRACTIONS && Boolean.TRUE.equals(state.getNoAttractionNeeded()))) {
+            throw new BizException(ResultCode.PARAM_ERROR);
+        }
+
+        if (parallelOn()) {
+            channelCoordinator.clear(state.getSessionId());
+        }
+        if (target == TravelStage.ATTRACTIONS) {
+            clearAttractionSelection(state);
+            clearFoodSelectionAndPool(state);
+            clearHotelSelectionAndPool(state);
+        } else if (target == TravelStage.FOODS) {
+            clearFoodSelection(state);
+            clearHotelSelectionAndPool(state);
+        } else if (target == TravelStage.HOTELS) {
+            clearHotelSelection(state);
+        } else {
+            resetPlanQuiz(state);
+        }
+        invalidatePlan(state);
+        state.setStage(target);
+        state.setCurrentField(null);
+        state.setCandidateAdvice(null);
+        sessionService.save(state);
+        usageService.recordOp(state.getSessionId(), state.getUserId(), state.getUsername(),
+                target.name(), "返回重选", "SUCCESS", "目标阶段：" + target.name(), UsageChannel.OP);
+        log.info("[TravelAgent][sessionId={}] 用户返回重选，目标阶段={}", state.getSessionId(), target);
+        return buildResult(state, rewindMessage(target), null);
+    }
+
+    private TravelStage currentSelectionStage(TravelState state) {
+        if (List.of(TravelStage.ATTRACTIONS, TravelStage.FOODS, TravelStage.HOTELS)
+                .contains(state.getStage())) {
+            return state.getStage();
+        }
+        return previousSelectionStage(state);
+    }
+
+    private TravelStage previousSelectionStage(TravelState state) {
+        if (state.getStage() == TravelStage.ATTRACTIONS) {
+            return TravelStage.ATTRACTIONS;
+        }
+        if (state.getStage() == TravelStage.FOODS) {
+            return Boolean.TRUE.equals(state.getNoAttractionNeeded()) ? TravelStage.FOODS : TravelStage.ATTRACTIONS;
+        }
+        if (state.getStage() == TravelStage.HOTELS) {
+            if (!Boolean.TRUE.equals(state.getNoFoodNeeded())) return TravelStage.FOODS;
+            if (!Boolean.TRUE.equals(state.getNoAttractionNeeded())) return TravelStage.ATTRACTIONS;
+            return TravelStage.HOTELS;
+        }
+        if (!Boolean.TRUE.equals(state.getNoHotelNeeded())) return TravelStage.HOTELS;
+        if (!Boolean.TRUE.equals(state.getNoFoodNeeded())) return TravelStage.FOODS;
+        if (!Boolean.TRUE.equals(state.getNoAttractionNeeded())) return TravelStage.ATTRACTIONS;
+        return TravelStage.PLAN_QUIZ;
+    }
+
+    private int stageRank(TravelStage stage) {
+        return switch (stage) {
+            case INIT -> 0;
+            case PREFERENCE, CONFLICT -> 1;
+            case ATTRACTIONS -> 2;
+            case FOODS -> 3;
+            case HOTELS -> 4;
+            case PLAN_QUIZ -> 5;
+            case ITINERARY, DONE, ADJUST -> 6;
+        };
+    }
+
+    private void clearAttractionSelection(TravelState state) {
+        state.getSelectedAttractionIds().clear();
+        state.getPickedAttractionIds().clear();
+        clearLocked(state, "ATTRACTION:");
+        state.candidateSnapshots().remove("ATTRACTION");
+        state.setAttractionCursor(0);
+        if (state.getAttractionPool() != null) candidateService.nextAttractionBatch(state);
+    }
+
+    private void clearFoodSelection(TravelState state) {
+        state.getSelectedFoodIds().clear();
+        state.getPickedFoodIds().clear();
+        clearLocked(state, "FOOD:");
+        state.candidateSnapshots().remove("FOOD");
+        state.setFoodCursor(0);
+        if (state.getFoodPool() != null) candidateService.nextFoodBatch(state);
+    }
+
+    private void clearFoodSelectionAndPool(TravelState state) {
+        clearFoodSelection(state);
+        state.setFoodCandidates(null);
+        state.setFoodPool(null);
+        state.setWebFoodCandidates(null);
+    }
+
+    private void clearHotelSelection(TravelState state) {
+        state.getSelectedHotelIds().clear();
+        state.getPickedHotelIds().clear();
+        clearLocked(state, "HOTEL:");
+        state.candidateSnapshots().remove("HOTEL");
+        state.setHotelCursor(0);
+        if (state.getHotelPool() != null) candidateService.nextHotelBatch(state);
+    }
+
+    private void clearHotelSelectionAndPool(TravelState state) {
+        clearHotelSelection(state);
+        state.setHotelCandidates(null);
+        state.setHotelPool(null);
+        state.setWebHotelCandidates(null);
+    }
+
+    private void clearLocked(TravelState state, String prefix) {
+        LockedSelection locked = state.getLockedSelection();
+        if (locked == null) return;
+        locked.getOrderedKeys().removeIf(k -> k != null && k.startsWith(prefix));
+        locked.getSources().keySet().removeIf(k -> k != null && k.startsWith(prefix));
+        locked.getConflictCodes().clear();
+    }
+
+    private void resetPlanQuiz(TravelState state) {
+        state.setPlanQuizAnswered(false);
+        TravelPreference p = state.getPreference();
+        p.setWakeTime(null);
+        p.setReturnDeadline(null);
+        p.setActivityBias(null);
+        p.setNightPlan(null);
+        p.unmark("wakeTime");
+        p.unmark("returnDeadline");
+        p.unmark("activityBias");
+        p.unmark("nightPlan");
+    }
+
+    private void invalidatePlan(TravelState state) {
+        state.setPlan(null);
+        state.setItineraryText(null);
+        state.setItineraryId(null);
+        state.setPendingPlan(null);
+        state.setPendingFatigueConfirm(false);
+        state.setPendingFatigueScore(null);
+        state.setPendingBudgetConfirm(false);
+        state.setPendingBudgetOver(null);
+        state.setFatigueOverrideAccepted(false);
+        state.setBudgetOverrideAccepted(false);
+        state.setAdjustContext(null);
+        state.setRequirementFulfillmentReport(null);
+    }
+
+    private String rewindMessage(TravelStage target) {
+        return switch (target) {
+            case ATTRACTIONS -> "已返回景点选择。原景点选择和下游美食、酒店、行程已作废，请重新勾选景点。";
+            case FOODS -> "已返回美食选择。景点选择已保留，原美食选择和下游酒店、行程已作废，请重新勾选餐厅。";
+            case HOTELS -> "已返回酒店选择。景点和美食选择已保留，原酒店选择与行程已作废，请重新勾选酒店。";
+            case PLAN_QUIZ -> "已返回行程偏好设置。候选选择已保留，请重新确认时间与活动安排。";
+            default -> "已返回上一步。";
+        };
     }
 
     /** O2：范围澄清是上一轮需求的补充，不应被当前问卷字段或候选 Agent 当成新需求。 */

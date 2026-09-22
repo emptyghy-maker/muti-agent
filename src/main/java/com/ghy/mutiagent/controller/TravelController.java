@@ -19,6 +19,7 @@ import com.ghy.mutiagent.model.ItinerarySummary;
 import com.ghy.mutiagent.model.PlanQuizRequest;
 import com.ghy.mutiagent.model.ResumeView;
 import com.ghy.mutiagent.model.RouteResult;
+import com.ghy.mutiagent.model.SessionTransitionRequest;
 import com.ghy.mutiagent.repository.entity.Destination;
 import com.ghy.mutiagent.service.route.RouteService;
 import com.ghy.mutiagent.security.AuthenticatedUser;
@@ -73,6 +74,26 @@ public class TravelController {
         requireWritable();
         AuthenticatedUser u = requireActor();
         return Result.ok(orchestrator.createSession(u, request.getDestinationId()));
+    }
+
+    /** 从头规划：创建隔离的新会话，旧会话保留用于审计与历史查询。 */
+    @PostMapping("/session/{sessionId}/restart")
+    public Result<ChatStepResult> restartSession(@PathVariable String sessionId,
+                                                 @RequestBody SessionTransitionRequest request) {
+        requireWritable();
+        return Result.ok(orchestrator.restartSession(requireActor(), sessionId,
+                request == null ? null : request.getRequestId(),
+                request == null ? null : request.getExpectedRevision()));
+    }
+
+    /** 返回候选节点重新选择；只清理目标节点及其下游状态，不改偏好与需求快照。 */
+    @PostMapping("/session/{sessionId}/rewind")
+    public Result<ChatStepResult> rewindSession(@PathVariable String sessionId,
+                                                @RequestBody SessionTransitionRequest request) {
+        requireWritable();
+        return Result.ok(orchestrator.rewindSession(requireActor(), sessionId,
+                request == null ? null : request.getTargetStage(),
+                request == null ? null : request.getExpectedRevision()));
     }
 
     /** 同步对话：推进偏好问询状态机 */

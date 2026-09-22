@@ -124,6 +124,25 @@ const candidates = computed(() => {
 
 const isDone = computed(() => stage.value === 'DONE')
 
+const previousSelectionTarget = computed(() => {
+  if (stage.value === 'FOODS') return attractionCandidates.value.length ? 'ATTRACTIONS' : 'FOODS'
+  if (stage.value === 'HOTELS') {
+    if (foodCandidates.value.length) return 'FOODS'
+    return attractionCandidates.value.length ? 'ATTRACTIONS' : 'HOTELS'
+  }
+  if (hotelCandidates.value.length) return 'HOTELS'
+  if (foodCandidates.value.length) return 'FOODS'
+  if (attractionCandidates.value.length) return 'ATTRACTIONS'
+  return 'PLAN_QUIZ'
+})
+
+const previousSelectionLabel = computed(() => ({
+  ATTRACTIONS: '返回重新选景点',
+  FOODS: '返回重新选美食',
+  HOTELS: '返回重新选酒店',
+  PLAN_QUIZ: '重新填写行程偏好'
+})[previousSelectionTarget.value] || '返回修改选择')
+
 // 美食候选分组：有餐次标注（餐次需求存在）按早餐/午餐/晚餐/小吃分组，否则按风味分组
 const MEAL_ORDER = { 早餐: 0, 午餐: 1, 晚餐: 2, 小吃: 3 }
 const foodGroups = computed(() => {
@@ -234,10 +253,11 @@ function applyStep(s) {
   else if (s.stage === 'FOODS') selectedIds.value = [...(s.selectedFoodIds || [])]
   else if (s.stage === 'HOTELS') selectedIds.value = [...(s.selectedHotelIds || [])]
   else selectedIds.value = []
-  if (s.itineraryId) itineraryId.value = s.itineraryId
-  if (s.sessionRevision != null) sessionRevision.value = s.sessionRevision
-  if (s.itineraryText) itineraryText.value = s.itineraryText
-  if (s.plan) plan.value = s.plan
+  // 服务端返回 null 表示旧结果已被明确作废；必须同步清空，不能继续展示回退前的行程。
+  itineraryId.value = s.itineraryId ?? null
+  sessionRevision.value = s.sessionRevision ?? 0
+  itineraryText.value = s.itineraryText || ''
+  plan.value = s.plan || null
   aiAdvice.value = s.candidateAdvice || ''
   // B 方案：待确认标记（后端快照与步进结果均携带该字段，null 即未进入待确认）
   if (s.pendingFatigueConfirm !== undefined) {
@@ -458,7 +478,12 @@ async function sendChat(text, onFail) {
   else agentWorking.value = (agentLabel.value || 'AI') + ' 正在结合你的想法进行分析…'
   const dropAck = () => { chatHistory.value = chatHistory.value.filter(m => !m.pending) }
   try {
+    const previousSessionId = sessionId.value
     const resp = await api.post('/travel/chat/sync', { sessionId: sessionId.value, message: t })
+    if (resp.sessionId && resp.sessionId !== previousSessionId) {
+      resetForNewSession()
+      replaceSessionUrl(resp.sessionId)
+    }
     applyStep(resp)
     dropAck()
   } catch (e) {
@@ -478,6 +503,80 @@ async function sendChat(text, onFail) {
     }
     error.value = e.message
     if (onFail) onFail()
+  } finally {
+    loading.value = false
+  }
+}
+
+function newRequestId() {
+  return (globalThis.crypto && globalThis.crypto.randomUUID && globalThis.crypto.randomUUID())
+    || ('req-' + Date.now() + '-' + Math.random().toString(16).slice(2))
+}
+
+function replaceSessionUrl(id) {
+  const q = new URLSearchParams({ sessionId: id })
+  if (destinationId) q.set('destinationId', String(destinationId))
+  if (destinationName) q.set('name', destinationName)
+  history.replaceState(null, '', '#/plan?' + q.toString())
+}
+
+function resetForNewSession() {
+  chatHistory.value = []
+  selectedIds.value = []
+  attractionCandidates.value = []
+  foodCandidates.value = []
+  hotelCandidates.value = []
+  channelStatus.value = {}
+  plan.value = null
+  itineraryId.value = null
+  itineraryText.value = ''
+  pendingFatigue.value = false
+  pendingBudget.value = false
+  planQuiz.value = null
+  aiAdvice.value = ''
+}
+
+/** 从头规划：后端创建新 session，旧 session 留作审计，页面切换到新 session。 */
+async function restartPlanning() {
+  if (!sessionId.value || loading.value) return
+  loading.value = true
+  error.value = ''
+  agentWorking.value = '正在创建新的规划会话…'
+  try {
+    const resp = await api.post('/travel/session/' + sessionId.value + '/restart', {
+      requestId: newRequestId(),
+      expectedRevision: sessionRevision.value ?? 0
+    })
+    resetForNewSession()
+    replaceSessionUrl(resp.sessionId)
+    applyStep(resp)
+  } catch (e) {
+    if (e.status === 409) {
+      try { applyStep(await api.get('/travel/session/' + sessionId.value)) } catch (ignored) { /* 保留原错误 */ }
+    }
+    error.value = e.message
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 返回指定候选节点；后端负责清理目标节点和下游状态，前端只应用权威快照。 */
+async function rewindTo(target) {
+  if (!sessionId.value || loading.value) return
+  loading.value = true
+  error.value = ''
+  agentWorking.value = '正在返回选择环节…'
+  try {
+    applyStep(await api.post('/travel/session/' + sessionId.value + '/rewind', {
+      requestId: newRequestId(),
+      expectedRevision: sessionRevision.value ?? 0,
+      targetStage: target
+    }))
+  } catch (e) {
+    if (e.status === 409) {
+      try { applyStep(await api.get('/travel/session/' + sessionId.value)) } catch (ignored) { /* 保留原错误 */ }
+    }
+    error.value = e.message
   } finally {
     loading.value = false
   }
@@ -670,6 +769,9 @@ function openRoute(payload) {
         酒店：{{ preference.hotelStyle ?? '-' }}
         <template v-if="mealPlanText"> ｜ 餐次：{{ mealPlanText }}</template>
       </p>
+      <div class="toolbar" v-if="sessionId && !resumeExpired">
+        <button class="btn ghost" :disabled="loading" @click="restartPlanning">重新开始规划</button>
+      </div>
     </div>
 
     <!-- 对话历史 -->
@@ -749,6 +851,9 @@ function openRoute(payload) {
           确认选择（{{ selectedIds.length }}）
         </button>
         <button class="btn ghost" :disabled="loading" @click="confirmSelection(true)">换一批（秒出）</button>
+        <button class="btn ghost" :disabled="!selectedIds.length || loading" @click="selectedIds = []">清空本页勾选</button>
+        <button v-if="stage !== 'ATTRACTIONS'" class="btn ghost" :disabled="loading"
+                @click="rewindTo(previousSelectionTarget)">{{ previousSelectionLabel }}</button>
       </div>
     </div>
 
@@ -798,6 +903,9 @@ function openRoute(payload) {
 
       <div class="toolbar">
         <button class="btn" :disabled="quizSubmitting" @click="submitQuiz">提交并生成行程</button>
+        <button class="btn ghost" :disabled="loading" @click="rewindTo(previousSelectionTarget)">
+          {{ previousSelectionLabel }}
+        </button>
       </div>
     </div>
 
@@ -839,6 +947,9 @@ function openRoute(payload) {
       <ItineraryTimeline :plan="plan" mode="session" :session-id="sessionId" @open-route="openRoute" />
       <div class="toolbar">
         <button class="btn ghost" :disabled="loading" @click="regenerateItinerary">重新生成</button>
+        <button class="btn ghost" :disabled="loading" @click="rewindTo(previousSelectionTarget)">
+          {{ previousSelectionLabel }}
+        </button>
         <a class="btn" href="#/list">查看我的行程</a>
         <a class="btn ghost" href="#/">换个目的地</a>
       </div>

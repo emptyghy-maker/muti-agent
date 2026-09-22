@@ -160,6 +160,16 @@ public class TravelState {
     private String adjustContext;
     private LocalDateTime createdAt;
 
+    /** “重新开始”请求幂等记录：requestId → 新会话 ID。保存在旧会话中，网络重试不重复创建会话。 */
+    private Map<String, String> restartResults = new LinkedHashMap<>();
+
+    public Map<String, String> restartResults() {
+        if (restartResults == null) {
+            restartResults = new LinkedHashMap<>();
+        }
+        return restartResults;
+    }
+
     // ============ 本轮对话的临时用量归集（仅内存，不序列化进 Redis） ============
 
     @JsonIgnore

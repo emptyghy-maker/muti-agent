@@ -160,6 +160,20 @@ public class TravelSessionService {
         return state.get();
     }
 
+    /** 会话是否被持久化异步操作占用；阶段回退据此拒绝与在途提交并发写同一快照。 */
+    public boolean hasActiveOperation(String sessionId) {
+        if (!dbAuthoritative || sessionId == null) {
+            return false;
+        }
+        try {
+            TravelSessionState row = sessionStateMapper.selectById(sessionId);
+            return row != null && row.getActiveOperationId() != null && !row.getActiveOperationId().isBlank();
+        } catch (Exception e) {
+            log.error("会话操作占用状态读取失败: {}", e.getMessage());
+            throw new BizException(ResultCode.STORAGE_UNAVAILABLE);
+        }
+    }
+
     /**
      * 断点恢复：查找当前用户最近一条可恢复的未结束会话。
      * - 未结束 = stage 非 DONE，或存在进行中操作（重新生成/调整中）；
