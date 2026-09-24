@@ -102,6 +102,30 @@ observability:
   retention:
     days: 30
 
+# 短期上下文优化：基线只记录大小/Hash/版本，不记录原文；TurnContext 先影子比较再启用。
+context:
+  baseline:
+    enabled: ${CONTEXT_BASELINE_ENABLED:false}
+    log-enabled: ${CONTEXT_BASELINE_LOG_ENABLED:true}
+    hash-enabled: true
+    estimate-method: MIXED_TEXT_HEURISTIC_V1
+    max-key-count: 64
+  turn:
+    enabled: ${TURN_CONTEXT_ENABLED:false}
+    shadow-enabled: ${TURN_CONTEXT_SHADOW_ENABLED:true}
+    use-new-parser: ${TURN_CONTEXT_USE_NEW_PARSER:false}
+  # 第三/四阶段：默认只构造并比较新上下文；只有 rollout-roles 中的角色会改变模型入参。
+  optimization:
+    enabled: ${CONTEXT_OPTIMIZATION_ENABLED:false}
+    shadow-enabled: ${CONTEXT_OPTIMIZATION_SHADOW_ENABLED:true}
+    policy-version: ${CONTEXT_BUDGET_POLICY_VERSION:context-budget-v1}
+    rollout-roles: ${CONTEXT_OPTIMIZATION_ROLLOUT_ROLES:}
+    max-section-bytes: ${CONTEXT_MAX_SECTION_BYTES:1048576}
+    candidate-k:
+      attraction: ${CONTEXT_ATTRACTION_K:12}
+      food: ${CONTEXT_FOOD_K:16}
+      hotel: ${CONTEXT_HOTEL_K:8}
+
 # POI 推荐计数与自动晋升（网搜店 → 知识库）：
 # 推荐=被纳入候选池展示、勾选=用户确认选择，均按不同会话数计；达到任一阈值且质量门槛通过 → KB_PROMOTED。
 food-promotion:

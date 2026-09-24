@@ -30,6 +30,11 @@ public final class RequirementMerger {
 
     /** 把本轮解析结果并入状态快照；revision 只在有实际变化时递增 */
     public static void mergeInto(TravelState state, RuleParseResult parsed) {
+        mergeInto(state, parsed, null);
+    }
+
+    /** 带真实轮次 ID 的合并入口；旧调用方未提供 turnId 时保持兼容的快照标识。 */
+    public static void mergeInto(TravelState state, RuleParseResult parsed, String turnId) {
         if (parsed == null) {
             return;
         }
@@ -41,7 +46,9 @@ public final class RequirementMerger {
         boolean changed = false;
         for (ConstraintEntry e : parsed.getConstraints() == null ? List.<ConstraintEntry>of() : parsed.getConstraints()) {
             if (e != null && e.getSourceTurnId() == null) {
-                e.setSourceTurnId("session:" + state.getSessionId() + ":snapshot:" + (snap.getRevision() + 1));
+                e.setSourceTurnId(turnId == null || turnId.isBlank()
+                        ? "session:" + state.getSessionId() + ":snapshot:" + (snap.getRevision() + 1)
+                        : turnId);
             }
             changed |= applyEntry(snap, e);
         }

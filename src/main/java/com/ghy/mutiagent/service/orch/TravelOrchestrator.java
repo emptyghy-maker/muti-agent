@@ -9,6 +9,20 @@ import com.ghy.mutiagent.common.OpAbortException;
 import com.ghy.mutiagent.common.PatchRejectException;
 import com.ghy.mutiagent.common.ResultCode;
 import com.ghy.mutiagent.config.LlmRouteContext;
+import com.ghy.mutiagent.context.baseline.ContextBaselineRecorder;
+import com.ghy.mutiagent.context.baseline.ContextCaptureRequest;
+import com.ghy.mutiagent.context.baseline.ContextObservation;
+import com.ghy.mutiagent.context.baseline.ContextSectionNames;
+import com.ghy.mutiagent.context.agent.AgentContextInvocation;
+import com.ghy.mutiagent.context.agent.AgentContextRole;
+import com.ghy.mutiagent.context.agent.AgentContextRuntime;
+import com.ghy.mutiagent.context.turn.PreferenceTurnInterpreter;
+import com.ghy.mutiagent.context.turn.TurnChangePlanner;
+import com.ghy.mutiagent.context.turn.TurnContext;
+import com.ghy.mutiagent.context.turn.TurnContextFactory;
+import com.ghy.mutiagent.context.turn.TurnContextProperties;
+import com.ghy.mutiagent.context.turn.TurnContextShadowComparator;
+import com.ghy.mutiagent.context.turn.TurnInterpretation;
 import com.ghy.mutiagent.model.AttractionCandidate;
 import com.ghy.mutiagent.model.CandidateAdviceRef;
 import com.ghy.mutiagent.model.CandidateSnapshot;
@@ -281,6 +295,23 @@ public class TravelOrchestrator {
     @Autowired(required = false)
     private com.ghy.mutiagent.observability.collection.ObsInstrumentation obsInstrumentation;
 
+    /** 短期上下文基线和单轮上下文均为可回退薄层；手动构造测试默认走 No-op/旧解析。 */
+    @Autowired(required = false)
+    private ContextBaselineRecorder contextBaselineRecorder = ContextBaselineRecorder.noop();
+    @Autowired(required = false)
+    private TurnContextFactory turnContextFactory = new TurnContextFactory();
+    @Autowired(required = false)
+    private PreferenceTurnInterpreter preferenceTurnInterpreter;
+    @Autowired(required = false)
+    private TurnChangePlanner turnChangePlanner;
+    @Autowired(required = false)
+    private TurnContextShadowComparator turnContextShadowComparator;
+    @Autowired(required = false)
+    private TurnContextProperties turnContextProperties = new TurnContextProperties();
+    /** 角色级上下文 DTO/预算接线；未装配时保持旧参数。 */
+    @Autowired(required = false)
+    private AgentContextRuntime agentContextRuntime;
+
     /** 同步生成进行中注册表（可空：手动装配的测试进程为 null 时守卫不生效，行为与旧版一致） */
     @Autowired(required = false)
     GenerationRegistry generationRegistry;
@@ -372,6 +403,7 @@ public class TravelOrchestrator {
         state.resetTurnUsage();
         long turnStart = System.currentTimeMillis();
         String entryStage = state.getStage().name();
+        TurnContext turn = turnContextFactory.create(state, message, null, QUESTION_TEMPLATES);
         SessionControlIntentParser.Intent control = SessionControlIntentParser.parse(message);
         ChatStepResult result;
         if (control.type() != SessionControlIntentParser.Type.NONE) {
@@ -382,7 +414,7 @@ public class TravelOrchestrator {
                 result = afterMealScopeResolved(state, scopeResolved);
             } else {
                 result = switch (state.getStage()) {
-                    case PREFERENCE -> chatPreference(state, message);
+                    case PREFERENCE -> chatPreference(state, turn);
                     case ATTRACTIONS, FOODS, HOTELS -> chatCandidateRefine(state, message);
                     case DONE -> chatDone(actor, state, message);
                     default -> {
@@ -724,8 +756,18 @@ public class TravelOrchestrator {
         return result;
     }
 
-    /** 偏好问询：规则解析 → 残余交 LLM 客服式消解 → 完成时需求分析交接；回复回显理解内容 */
+    /**
+     * 保留原有入口签名，供已有反射测试和内部调用兼容；
+     * 新增的单轮上下文仍统一由工厂创建。
+     */
     private ChatStepResult chatPreference(TravelState state, String message) {
+        TurnContext turn = turnContextFactory.create(state, message, null, QUESTION_TEMPLATES);
+        return chatPreference(state, turn);
+    }
+
+    /** 偏好问询：规则解析 → 残余交 LLM 客服式消解 → 完成时需求分析交接；回复回显理解内容 */
+    private ChatStepResult chatPreference(TravelState state, TurnContext turn) {
+        String message = turn == null ? "" : turn.getRawMessage();
         String trimmed = message == null ? "" : message.trim();
         // 用户示意「重新开始」：清空已收集偏好，从头再问（先于一切解析，秒回）
         if (trimmed.length() <= 12 && RESTART_WORDS.stream().anyMatch(trimmed::contains)) {
@@ -737,7 +779,7 @@ public class TravelOrchestrator {
         }
         // 用户示意信息已足够：剩余字段按默认补齐，直接交接候选阶段（智能问答的灵活出口）
         if (trimmed.length() <= 12 && HANDOFF_WORDS.stream().anyMatch(trimmed::contains)) {
-            return completePreference(state);
+            return completePreference(state, turn == null ? null : turn.getTurnId());
         }
         // 字段级特殊需求先抽取（命中原文从消息移除，防规则误解析：如「美食要人均50以内」不得当总预算）
         FieldNeedsResult fieldNeeds = extractFieldNeeds(trimmed);
@@ -745,12 +787,28 @@ public class TravelOrchestrator {
         RuleParseResult parsed = rulePreferenceParser.parseResult(fieldNeeds.cleaned(), currentField, state.getPreference());
         // 修正/衔接语不进需求快照：避免「错了、是」这类口水话混入 extraRequest
         parsed.setUnresolvedText(stripResidualScaffolding(parsed.getUnresolvedText()));
+        if (turnContextProperties.isEnabled() && preferenceTurnInterpreter != null) {
+            TurnInterpretation turnInterpretation = preferenceTurnInterpreter.interpret(turn, state);
+            if (turnChangePlanner != null) {
+                turnChangePlanner.plan(turn, state, turnInterpretation);
+            }
+            if (turnContextProperties.isShadowEnabled() && turnContextShadowComparator != null) {
+                turnContextShadowComparator.compare(turn, parsed.getUpdates());
+            }
+            if (turnContextProperties.isUseNewParser()) {
+                // 新解析器只补旧规则的缺口，不覆盖确定性旧结果；便于分阶段启用和快速回滚。
+                turnInterpretation.getPreferenceUpdates()
+                        .forEach((field, value) -> parsed.getUpdates().putIfAbsent(field, value));
+            }
+        }
         Map<String, String> updates = new LinkedHashMap<>(parsed.getUpdates());
         // 字段级需求并入快照与字段备注；针对当前字段时该字段置 UNSURE（不再追问，
         // 总体特殊要求最后仍会单独询问一遍，两个口径互不污染）；noHotel/noFood 置跳过标记
         applyFieldNeeds(state, parsed, fieldNeeds, updates, currentField);
         // 每轮把约束/预算口径/残余并入同一份快照（S02）
-        RequirementMerger.mergeInto(state, parsed);
+        String requirementTurnId = turnContextProperties.isEnabled() && turn != null
+                ? turn.getTurnId() : null;
+        RequirementMerger.mergeInto(state, parsed, requirementTurnId);
         // S07：约束合并后推进约束版本，并评估锁定项与新约束的冲突（锁定为空时无操作）
         state.bumpConstraintRevision();
         candidateService.evaluateLockedConflicts(state);
@@ -797,7 +855,7 @@ public class TravelOrchestrator {
             // 规则失手：把残余内容交给偏好解析 Agent 做客服式消解（带当前问题原文上下文）——
             // 可多字段抽取、否定当前字段（UNSURE）、裸否定输出 skip（noHotel/noAttraction）；
             // 规则已命中的字段保持规则值（确定性优先），Agent 结果只补缺
-            PreferenceResult pr = llmParse(state, message, currentField);
+            PreferenceResult pr = llmParse(state, turn, currentField);
             Map<String, String> llmUpdates = pr == null || pr.getUpdates() == null
                     ? Map.of() : pr.getUpdates();
             Map<String, String> merged = new LinkedHashMap<>(llmUpdates);
@@ -846,12 +904,12 @@ public class TravelOrchestrator {
 
         // 信息差不多的灵活出口：任何一轮用户示意「够了」都直接交接（长句先解析再交接，不丢信息）
         if (HANDOFF_WORDS.stream().anyMatch(trimmed::endsWith)) {
-            return completePreference(state);
+            return completePreference(state, turn == null ? null : turn.getTurnId());
         }
 
         Question next = nextQuestion(state);
         if (next == null) {
-            return completePreference(state);
+            return completePreference(state, turn == null ? null : turn.getTurnId());
         }
 
         state.setCurrentField(next.getField());
@@ -882,12 +940,16 @@ public class TravelOrchestrator {
 
     /** 偏好收集完成：默认补齐剩余字段 → 需求分析路由 → 生成景点备选池，交接给候选阶段 */
     private ChatStepResult completePreference(TravelState state) {
+        return completePreference(state, null);
+    }
+
+    private ChatStepResult completePreference(TravelState state, String turnId) {
         // 需求分析为同步长任务：占用生成租约，恢复端据此显示「分析中」并轮询快照，
         // 避免用户中途离开后回来页面无反馈（前端只能靠 resumable.generating 感知进行中）
         GenerationRegistry registry = generationRegistry;
         boolean lease = registry == null || registry.begin(state.getSessionId(), GENERATING_LEASE_MS);
         try {
-            return doCompletePreference(state);
+            return doCompletePreference(state, turnId);
         } finally {
             if (registry != null && lease) {
                 registry.end(state.getSessionId());
@@ -895,7 +957,12 @@ public class TravelOrchestrator {
         }
     }
 
+    /** 保留原有反射测试入口；无当前轮次时不强行伪造 turnId。 */
     private ChatStepResult doCompletePreference(TravelState state) {
+        return doCompletePreference(state, null);
+    }
+
+    private ChatStepResult doCompletePreference(TravelState state, String turnId) {
         fillDefaults(state);
         ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
         if (!planning.executable()) {
@@ -909,7 +976,7 @@ public class TravelOrchestrator {
                 LocationConstraintSupport.FOOD,
                 LocationConstraintSupport.HOTEL));
         // 需求分析路由：Agent 判断走标准流程还是深度分析，并提炼贯穿全流程的关注点
-        RequirementAnalysis analysis = analyzeRequirement(state);
+        RequirementAnalysis analysis = analyzeRequirement(state, turnId);
         reconcileAnalysisWithEnergy(state, analysis);
         Map<String, Double> weights = AhpWeightCalculator.adjust(analysis.getNeeds());
         state.setWeights(weights);
@@ -2857,18 +2924,45 @@ public class TravelOrchestrator {
     /** LLM 解析（带 trace），失败时返回空更新（本轮不更新，下轮重试） */
     /** 偏好解析 LLM 消解：把残余原文连同「正在询问的问题原文」交给 Agent（客服式消解，可多字段抽取）；
      *  失败返回 null（调用方按未解析兜底，不丢信息） */
-    private PreferenceResult llmParse(TravelState state, String message, String currentField) {
+    private PreferenceResult llmParse(TravelState state, TurnContext turn, String currentField) {
+        String message = turn == null ? "" : turn.getRawMessage();
         TraceContext ctx = traceService.newTrace(state.getSessionId(), "偏好解析");
         long startNs = System.nanoTime();
         String actualModel = defaultModel;
+        ContextObservation observation = ContextObservation.disabled();
+        boolean providerCompleted = false;
         try {
             String prefJson = objectMapper.writeValueAsString(state.getPreference());
             Question q = currentField == null ? null : QUESTION_TEMPLATES.get(currentField);
+            String fieldArg = currentField == null ? "" : currentField;
+            String questionArg = q == null ? "" : q.getText();
+            AgentContextInvocation invocation = agentContextRuntime == null
+                    || !agentContextRuntime.isActive(AgentContextRole.PREFERENCE) ? null
+                    : agentContextRuntime.preference(state, turn == null ? null : turn.getTurnId(),
+                    prefJson, fieldArg, questionArg, message);
+            if (invocation != null) {
+                prefJson = invocation.argument("preference");
+                fieldArg = invocation.argument("currentField");
+                questionArg = invocation.argument("question");
+                message = invocation.argument("message");
+            }
+            Map<String, Object> sections = new LinkedHashMap<>();
+            sections.put(ContextSectionNames.PREFERENCE, prefJson);
+            sections.put(ContextSectionNames.CURRENT_QUESTION, Map.of(
+                    "field", fieldArg,
+                    "question", questionArg));
+            sections.put(ContextSectionNames.CURRENT_TURN, message);
+            if (invocation != null) sections.put("AGENT_CONTEXT", invocation.observationSections());
+            observation = beginContext(state, turn == null ? null : turn.getTurnId(),
+                    null, "PreferenceAgent", invocation == null ? "preference-context-v1"
+                            : invocation.schemaVersion(), sections);
             Result<String> r = preferenceAgent.parse(
-                    prefJson, currentField == null ? "" : currentField,
-                    q == null ? "" : q.getText(), message);
+                    prefJson, fieldArg, questionArg, message);
             actualModel = LlmRouteContext.consume("fast", defaultModel);
             String content = recordAgent(ctx, "PreferenceAgent", startNs, r);
+            contextBaselineRecorder.providerFinished(observation, r.tokenUsage(),
+                    (System.nanoTime() - startNs) / 1_000_000, "SUCCESS");
+            providerCompleted = true;
             PreferenceResult pr = JsonUtils.parse(content, PreferenceResult.class);
             if (pr == null) {
                 throw new IllegalStateException("偏好解析结果为空");
@@ -2876,6 +2970,7 @@ public class TravelOrchestrator {
             if (pr.getConflict() != null && !pr.getConflict().isBlank()) {
                 state.setConflict(pr.getConflict());
             }
+            contextBaselineRecorder.parseFinished(observation, "SUCCESS", "NOT_APPLICABLE", null);
             ctx.finish("SUCCESS");
             traceService.finish(ctx);
             int[] tk = tokenCounts(r.tokenUsage());
@@ -2886,6 +2981,12 @@ public class TravelOrchestrator {
             state.addTurnUsage(actualModel, tk[0], tk[1], UsageChannel.AGENT);
             return pr;
         } catch (Exception e) {
+            if (!providerCompleted) {
+                contextBaselineRecorder.providerFinished(observation, null,
+                        (System.nanoTime() - startNs) / 1_000_000, "FAILED");
+            }
+            contextBaselineRecorder.parseFinished(observation, "FAILED", "NOT_APPLICABLE",
+                    e.getClass().getSimpleName());
             actualModel = LlmRouteContext.consume("fast", actualModel);
             log.warn("偏好解析 LLM 调用失败（{}），本轮按未解析处理", e.getClass().getName(), e);
             ctx.finish("FAILED");
@@ -2901,15 +3002,29 @@ public class TravelOrchestrator {
     }
 
     /** 需求分析路由（带 trace + 用量记录）：Agent 判定 workflow/agent 路径；失败按标准流程处理 */
-    private RequirementAnalysis analyzeRequirement(TravelState state) {
+    private RequirementAnalysis analyzeRequirement(TravelState state, String turnId) {
         TraceContext ctx = traceService.newTrace(state.getSessionId(), "需求分析");
         long startNs = System.nanoTime();
         String actualModel = defaultModel;
+        ContextObservation observation = ContextObservation.disabled();
+        boolean providerCompleted = false;
         try {
             String prefJson = objectMapper.writeValueAsString(state.getPreference());
+            AgentContextInvocation invocation = agentContextRuntime == null
+                    || !agentContextRuntime.isActive(AgentContextRole.REQUIREMENT) ? null
+                    : agentContextRuntime.requirement(state, turnId, prefJson);
+            if (invocation != null) prefJson = invocation.argument("preference");
+            Map<String, Object> sections = new LinkedHashMap<>();
+            sections.put(ContextSectionNames.PREFERENCE, prefJson);
+            if (invocation != null) sections.put("AGENT_CONTEXT", invocation.observationSections());
+            observation = beginContext(state, turnId, null, "RequirementAgent",
+                    invocation == null ? "requirement-context-v1" : invocation.schemaVersion(), sections);
             Result<String> r = requirementAgent.analyze(prefJson);
             actualModel = LlmRouteContext.consume("fast", defaultModel);
             String content = recordAgent(ctx, "RequirementAgent", startNs, r);
+            contextBaselineRecorder.providerFinished(observation, r.tokenUsage(),
+                    (System.nanoTime() - startNs) / 1_000_000, "SUCCESS");
+            providerCompleted = true;
             RequirementAnalysis a = JsonUtils.parse(content, RequirementAnalysis.class);
             if (a == null || a.getMode() == null || a.getMode().isBlank()) {
                 // 模型偶发把结果包在别的键里：统一解析层泛化查找含 mode 字段的对象
@@ -2919,6 +3034,7 @@ public class TravelOrchestrator {
                 log.warn("需求分析路由 LLM 输出不符合模板，原始输出前300字：{}", UsageService.clip(content, 300));
                 throw new IllegalStateException("需求分析结果为空");
             }
+            contextBaselineRecorder.parseFinished(observation, "SUCCESS", "NOT_APPLICABLE", null);
             ctx.finish("SUCCESS");
             traceService.finish(ctx);
             int[] tk = tokenCounts(r.tokenUsage());
@@ -2930,6 +3046,12 @@ public class TravelOrchestrator {
             state.addTurnUsage(actualModel, tk[0], tk[1], UsageChannel.AGENT);
             return a;
         } catch (Exception e) {
+            if (!providerCompleted) {
+                contextBaselineRecorder.providerFinished(observation, null,
+                        (System.nanoTime() - startNs) / 1_000_000, "FAILED");
+            }
+            contextBaselineRecorder.parseFinished(observation, "FAILED", "NOT_APPLICABLE",
+                    e.getClass().getSimpleName());
             actualModel = LlmRouteContext.consume("fast", actualModel);
             log.warn("需求分析路由 LLM 失败（{}），改用关键词规则分析", e.getClass().getName(), e);
             ctx.finish("FAILED");
@@ -2942,6 +3064,17 @@ public class TravelOrchestrator {
             state.addTurnUsage(null, 0, 0, UsageChannel.RULE_FALLBACK);
             return fallbackAnalysis(state);
         }
+    }
+
+    private ContextObservation beginContext(TravelState state, String turnId, String operationId,
+                                            String agent, String schemaVersion,
+                                            Map<String, Object> sections) {
+        int requirementRevision = state.getRequirementSnapshot() == null
+                ? 0 : state.getRequirementSnapshot().getRevision();
+        return contextBaselineRecorder.begin(new ContextCaptureRequest(
+                state.getSessionId(), state.getUserId(), turnId, operationId, agent,
+                state.getStage() == null ? null : state.getStage().name(), schemaVersion,
+                requirementRevision, state.getConstraintRevision(), state.getPlanRevision(), sections));
     }
 
     /** LLM 不可用时的关键词规则兜底：从特殊需求文字推断主导需求，保证权重调整可用 */

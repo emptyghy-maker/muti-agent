@@ -10,6 +10,13 @@ import com.ghy.mutiagent.common.OpAbortException;
 import com.ghy.mutiagent.common.PatchRejectException;
 import com.ghy.mutiagent.common.ResultCode;
 import com.ghy.mutiagent.config.LlmRouteContext;
+import com.ghy.mutiagent.context.baseline.ContextBaselineRecorder;
+import com.ghy.mutiagent.context.baseline.ContextCaptureRequest;
+import com.ghy.mutiagent.context.baseline.ContextObservation;
+import com.ghy.mutiagent.context.baseline.ContextSectionNames;
+import com.ghy.mutiagent.context.agent.AgentContextInvocation;
+import com.ghy.mutiagent.context.agent.AgentContextRole;
+import com.ghy.mutiagent.context.agent.AgentContextRuntime;
 import com.ghy.mutiagent.model.AdjustPatchIntent;
 import com.ghy.mutiagent.model.DailyPlan;
 import com.ghy.mutiagent.model.BudgetBreakdown;
@@ -121,6 +128,10 @@ public class ItineraryService {
     /** Observability 薄埋点（可空：手动装配的测试进程为 null；模块关闭时内部 noop） */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.ghy.mutiagent.observability.collection.ObsInstrumentation obsInstrumentation;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ContextBaselineRecorder contextBaselineRecorder = ContextBaselineRecorder.noop();
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private AgentContextRuntime agentContextRuntime;
     /** S08 修复引擎（可选装配）：未装配时保持 P0 语义（违规直接拒绝发布，不进入修复循环） */
     private ItineraryRepairEngine repairEngine;
     /** S09 补丁 Agent（可选装配）：模型提出白名单局部补丁，服务端逐项验证 */
@@ -210,16 +221,32 @@ public class ItineraryService {
                 state.getAttractionPool(), state.getFoodPool(), state.getHotelPool());
         String usageStage = state.getAdjustContext() == null ? "ITINERARY" : "ADJUST";
         try {
-            String prefJson = objectMapper.writeValueAsString(planningPreference(state));
-            String attrJson = objectMapper.writeValueAsString(attractions.stream()
+            String legacyPrefJson = objectMapper.writeValueAsString(planningPreference(state));
+            String legacyAttrJson = objectMapper.writeValueAsString(attractions.stream()
                     .map(ItineraryService::planningAttraction)
-                    .toList());            String foodJson = objectMapper.writeValueAsString(restaurants.stream()
+                    .toList());
+            String legacyFoodJson = objectMapper.writeValueAsString(restaurants.stream()
                     .map(ItineraryService::planningRestaurant)
                     .toList());
-            String hotelJson = objectMapper.writeValueAsString(hotels.stream()
+            String legacyHotelJson = objectMapper.writeValueAsString(hotels.stream()
                     .map(ItineraryService::planningHotel)
                     .toList());
-            String rules = buildRules(state, restSpots, attractions);
+            String legacyRules = buildRules(state, restSpots, attractions);
+            AgentContextInvocation planningInvocation = agentContextRuntime == null
+                    || !agentContextRuntime.isActive(AgentContextRole.PLANNING) ? null
+                    : agentContextRuntime.planning(state, meta == null ? null : meta.operationId(),
+                    legacyPrefJson, legacyAttrJson, legacyFoodJson, legacyHotelJson, legacyRules,
+                    restaurants.stream().map(ItineraryService::planningRestaurantFacts).toList());
+            final String prefJson = planningInvocation == null ? legacyPrefJson
+                    : planningInvocation.argument("preference");
+            final String attrJson = planningInvocation == null ? legacyAttrJson
+                    : planningInvocation.argument("attractions");
+            final String foodJson = planningInvocation == null ? legacyFoodJson
+                    : planningInvocation.argument("restaurants");
+            final String hotelJson = planningInvocation == null ? legacyHotelJson
+                    : planningInvocation.argument("hotel");
+            final String rules = planningInvocation == null ? legacyRules
+                    : planningInvocation.argument("rules");
 
             Integer prefDays = state.getPreference().getDays();
             if (repairEngine == null) {
@@ -227,16 +254,24 @@ public class ItineraryService {
                 TraceContext ctx = traceService.newTrace(state.getSessionId(), "行程规划");
                 long startNs = System.nanoTime();
                 String actualModel = sqlModel;
+                ContextObservation observation = beginPlannerContext(state, null,
+                        prefJson, attrJson, foodJson, hotelJson, rules, planningInvocation);
+                boolean providerCompleted = false;
                 try {
                     Result<String> r = itineraryAgent.plan(prefJson, attrJson, foodJson, hotelJson, rules);
                     actualModel = LlmRouteContext.consume("plan", sqlModel);
                     long cost = (System.nanoTime() - startNs) / 1_000_000;
+                    contextBaselineRecorder.providerFinished(observation, r.tokenUsage(), cost, "SUCCESS");
+                    providerCompleted = true;
                     // S03：提供方调用成功——此后输出不合格一律拒绝发布，不静默替换为规则方案
                     providerOk = true;
                     String raw = r.content();
                     if (raw != null) {
                         plan = parsePlanJson(raw);
                     }
+                    contextBaselineRecorder.parseFinished(observation,
+                            plan == null ? "FAILED" : "SUCCESS", "NOT_ATTEMPTED",
+                            plan == null ? "PLAN_JSON_INVALID" : null);
                     ctx.add(AgentTrace.success("ItineraryAgent", cost, r.tokenUsage()));
                     ctx.finish("SUCCESS");
                     int[] tk = tokenCounts(r.tokenUsage());
@@ -247,6 +282,11 @@ public class ItineraryService {
                 } catch (Exception e) {
                     actualModel = LlmRouteContext.consume("plan", actualModel);
                     long cost = (System.nanoTime() - startNs) / 1_000_000;
+                    if (!providerCompleted) {
+                        contextBaselineRecorder.providerFinished(observation, null, cost, "FAILED");
+                    }
+                    contextBaselineRecorder.parseFinished(observation, "FAILED", "NOT_ATTEMPTED",
+                            e.getClass().getSimpleName());
                     ctx.add(AgentTrace.failure("ItineraryAgent", cost,
                             e.getClass().getName() + ": " + e.getMessage()));
                     ctx.finish("FAILED");
@@ -266,11 +306,11 @@ public class ItineraryService {
                     // S11：长行程按天分块——每块一次规划调用（请求天数 ≤ chunkDays）；
                     // 截断/缺块 = INCOMPLETE_PLAN（不字符串修补），块级重试消耗共享预算
                     plan = chunkedPlan(state, budget, usageStage, prefJson, attrJson, foodJson,
-                            hotelJson, rules, prefDays, cancelToken, meta);
+                            hotelJson, rules, prefDays, cancelToken, meta, planningInvocation);
                     providerOk = true;
                 } else {
                     PlannerInvocation inv = invokePlanner(budget, state, usageStage,
-                            prefJson, attrJson, foodJson, hotelJson, rules, meta);
+                            prefJson, attrJson, foodJson, hotelJson, rules, meta, planningInvocation);
                     plannerSpan = inv == null ? null : inv.span();
                     if (inv != null && inv.result() != null) {
                         providerOk = true;
@@ -284,6 +324,9 @@ public class ItineraryService {
                             // S12：解析结果分层记录（provider=SUCCESS 与 parse=FAILED 分开）
                             inv.span().setParseStatus(plan == null ? AgentTrace.FAILED : AgentTrace.SUCCESS);
                         }
+                        contextBaselineRecorder.parseFinished(inv.observation(),
+                                plan == null ? "FAILED" : "SUCCESS", "NOT_ATTEMPTED",
+                                plan == null ? "PLAN_JSON_INVALID" : null);
                         if (plan == null) {
                             // S12：提供方成功但输出无法解析——不进入验证循环，持久化保持 NOT_ATTEMPTED
                             throw new BizException(ResultCode.PLAN_INVALID.getCode(),
@@ -497,6 +540,10 @@ public class ItineraryService {
             }
             // 修复：只拿受影响计划、可修复 violations 与不可变条件；调用进共享预算（预留不足 → 终止）
             String repairContext = repairEngine.buildRepairContext(draft, repairableViolations, state);
+            AgentContextInvocation repairInvocation = agentContextRuntime == null
+                    || !agentContextRuntime.isActive(AgentContextRole.REPAIR) ? null
+                    : agentContextRuntime.repair(state, meta == null ? null : meta.operationId(), repairContext);
+            if (repairInvocation != null) repairContext = repairInvocation.argument("repairContext");
             TraceContext rctx = traceService.newTrace(state.getSessionId(), "行程修复");
             // S12：修复是同一 operation 的新 provider attempt（重试共享 operation，attemptId 递增）
             if (meta != null) {
@@ -518,6 +565,9 @@ public class ItineraryService {
             Result<String> repaired = null;
             Exception repairError = null;
             AgentTrace repairSpan = null;
+            ContextObservation repairObservation = beginRepairContext(state,
+                    meta == null ? null : meta.operationId(), repairContext, repairableViolations,
+                    repairInvocation);
             // 首轮修复用快模型（秒级出稿），仍不过再升级强模型兜底一轮
             boolean heavyRepair = attempt > 0;
             String configuredRepairModel = heavyRepair ? sqlModel : repairModel;
@@ -539,6 +589,8 @@ public class ItineraryService {
             } finally {
                 long cost = (System.nanoTime() - rstartNs) / 1_000_000;
                 if (repairError == null) {
+                    contextBaselineRecorder.providerFinished(repairObservation,
+                            repaired == null ? null : repaired.tokenUsage(), cost, "SUCCESS");
                     repairSpan = AgentTrace.success("ItineraryRepairAgent", cost,
                             repaired == null ? null : repaired.tokenUsage());
                     // 修复输出留痕（此前缺失：TRACE 里修复 span 的 answer 恒为 null，无法复盘修复内容）
@@ -551,6 +603,9 @@ public class ItineraryService {
                             repaired == null ? null : repaired.tokenUsage(), cost, "SUCCESS", null,
                             actualRepairModel, UsageChannel.AGENT, UsageService.clip(repairContext, 2000));
                 } else {
+                    contextBaselineRecorder.providerFinished(repairObservation, null, cost, "FAILED");
+                    contextBaselineRecorder.parseFinished(repairObservation, "NOT_ATTEMPTED",
+                            "NOT_ATTEMPTED", repairError.getClass().getSimpleName());
                     repairSpan = AgentTrace.failure("ItineraryRepairAgent", cost,
                             repairError.getClass().getName() + ": " + repairError.getMessage());
                     rctx.add(repairSpan);
@@ -572,6 +627,9 @@ public class ItineraryService {
             }
             // 修复输出必须重新过全局验证（下一轮循环）——合法 JSON 之外的一律视为无进展
             ItineraryPlan next = parsePlanJson(repaired.content());
+            contextBaselineRecorder.parseFinished(repairObservation,
+                    next == null ? "FAILED" : "SUCCESS", "NOT_ATTEMPTED",
+                    next == null ? "PLAN_JSON_INVALID" : null);
             if (repairSpan != null) {
                 repairSpan.setParseStatus(next == null ? AgentTrace.FAILED : AgentTrace.SUCCESS);
             }
@@ -604,7 +662,8 @@ public class ItineraryService {
     }
 
     /** S12 规划调用结果：结果 + 本次调用的 span/ctx（解析与验证分层状态由调用方回填） */
-    private record PlannerInvocation(Result<String> result, TraceContext ctx, AgentTrace span) {
+    private record PlannerInvocation(Result<String> result, TraceContext ctx, AgentTrace span,
+                                     ContextObservation observation) {
     }
 
     /**
@@ -614,7 +673,7 @@ public class ItineraryService {
      */
     private PlannerInvocation invokePlanner(OperationBudget budget, TravelState state, String usageStage,
             String prefJson, String attrJson, String foodJson, String hotelJson, String rules,
-            com.ghy.mutiagent.trace.TraceMeta meta) {
+            com.ghy.mutiagent.trace.TraceMeta meta, AgentContextInvocation planningInvocation) {
         TraceContext ctx = traceService.newTrace(state.getSessionId(), "行程规划");
         // S12：规划是同一 operation 的新 provider attempt（重试共享 operation，attemptId 递增）
         if (meta != null) {
@@ -634,6 +693,9 @@ public class ItineraryService {
         }
         long startNs = System.nanoTime();
         String actualModel = sqlModel;
+        ContextObservation observation = beginPlannerContext(state,
+                meta == null ? null : meta.operationId(), prefJson, attrJson, foodJson, hotelJson, rules,
+                planningInvocation);
         try {
             // S08：规划调用进共享预算——调用前原子预留（输入估计+最大输出），不足不发请求
             Result<String> r = repairEngine.plannerCall(budget, ItineraryRepairEngine.estimateTokens(
@@ -641,6 +703,7 @@ public class ItineraryService {
                     () -> itineraryAgent.plan(prefJson, attrJson, foodJson, hotelJson, rules));
             actualModel = LlmRouteContext.consume("plan", sqlModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
+            contextBaselineRecorder.providerFinished(observation, r.tokenUsage(), cost, "SUCCESS");
             AgentTrace span = AgentTrace.success("ItineraryAgent", cost, r.tokenUsage());
             span.setAnswer(UsageService.clip(r.content(), 2000));
             ctx.add(span);
@@ -650,7 +713,7 @@ public class ItineraryService {
                     usageStage, "行程规划", "ItineraryAgent", r.tokenUsage(), cost, "SUCCESS", null,
                     actualModel, UsageChannel.AGENT, UsageService.clip(r.content(), 2000));
             state.addTurnUsage(actualModel, tk[0], tk[1], UsageChannel.AGENT);
-            return new PlannerInvocation(r, ctx, span);
+            return new PlannerInvocation(r, ctx, span, observation);
         } catch (OpAbortException abort) {
             // 预算预留失败（截止/配额/token）：终止语义直达上层，不兜底、不重试
             AgentTrace span = AgentTrace.failure("ItineraryAgent",
@@ -658,12 +721,19 @@ public class ItineraryService {
                     abort.getOpStatus() + ":" + abort.getReasonCodes());
             ctx.add(span);
             ctx.finish("FAILED");
+            contextBaselineRecorder.providerFinished(observation, null,
+                    (System.nanoTime() - startNs) / 1_000_000, "NOT_ATTEMPTED");
+            contextBaselineRecorder.parseFinished(observation, "NOT_ATTEMPTED", "NOT_ATTEMPTED",
+                    abort.getOpStatus());
             throw abort;
         } catch (Exception e) {
             actualModel = LlmRouteContext.consume("plan", actualModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
             AgentTrace span = AgentTrace.failure("ItineraryAgent", cost,
                     e.getClass().getName() + ": " + e.getMessage());
+            contextBaselineRecorder.providerFinished(observation, null, cost, "FAILED");
+            contextBaselineRecorder.parseFinished(observation, "NOT_ATTEMPTED", "NOT_ATTEMPTED",
+                    e.getClass().getSimpleName());
             ctx.add(span);
             ctx.finish("FAILED");
             usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
@@ -691,7 +761,7 @@ public class ItineraryService {
     private ItineraryPlan chunkedPlan(TravelState state, OperationBudget budget, String usageStage,
             String prefJson, String attrJson, String foodJson, String hotelJson, String baseRules,
             int totalDays, CancelRegistry.CancelToken cancelToken,
-            com.ghy.mutiagent.trace.TraceMeta meta) {
+            com.ghy.mutiagent.trace.TraceMeta meta, AgentContextInvocation planningInvocation) {
         int chunkDays = repairEngine.config().chunkDays();
         List<DailyPlan> merged = new ArrayList<>();
         try {
@@ -702,7 +772,7 @@ public class ItineraryService {
                 while (wanted.isEmpty()) {
                     checkCancelAndDeadline(budget, cancelToken);
                     PlannerInvocation inv = invokePlanner(budget, state, usageStage,
-                            prefJson, attrJson, foodJson, hotelJson, rules, meta);
+                            prefJson, attrJson, foodJson, hotelJson, rules, meta, planningInvocation);
                     Result<String> r = inv == null ? null : inv.result();
                     if (r == null) {
                         // 提供方故障且未越截止：重试该块（预留失败/越截止已在 invokePlanner 中终止）
@@ -716,6 +786,10 @@ public class ItineraryService {
                         inv.span().setParseStatus(parsed == null ? AgentTrace.FAILED : AgentTrace.SUCCESS);
                     }
                     wanted = parsed == null ? List.of() : daysInRange(parsed, start, end);
+                    contextBaselineRecorder.parseFinished(inv.observation(),
+                            parsed == null ? "FAILED" : "SUCCESS",
+                            wanted.isEmpty() ? "FAILED" : "SUCCESS",
+                            wanted.isEmpty() ? "INCOMPLETE_PLAN" : null);
                     if (wanted.isEmpty()) {
                         // 截断/缺块：不完整——不以字符串补括号恢复，块级重试（消耗总调用数）
                         log.warn("[Itinerary] 第{}天分块输出不完整（截断或缺失），重试该块（共享预算）", start);
@@ -1121,20 +1195,37 @@ public class ItineraryService {
         TraceContext ctx = traceService.newTrace(state.getSessionId(), "行程补丁");
         long startNs = System.nanoTime();
         String actualModel = patchModel;
+        AgentContextInvocation patchInvocation = agentContextRuntime == null
+                || !agentContextRuntime.isActive(AgentContextRole.PATCH) ? null
+                : agentContextRuntime.patch(state, patchContext);
+        if (patchInvocation != null) patchContext = patchInvocation.argument("patchContext");
+        ContextObservation observation = beginPatchContext(state, patchContext, patchInvocation);
+        boolean providerCompleted = false;
         try {
             dev.langchain4j.service.Result<String> r = patchAgent.propose(patchContext);
             actualModel = LlmRouteContext.consume("fast", patchModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
+            contextBaselineRecorder.providerFinished(observation, r.tokenUsage(), cost, "SUCCESS");
+            providerCompleted = true;
             ctx.add(AgentTrace.success("ItineraryPatchAgent", cost, r.tokenUsage()));
             ctx.finish("SUCCESS");
             obsPatchEvent(null, state, true, "PROPOSED", Map.of());
             usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                     "ADJUST", "行程补丁", "ItineraryPatchAgent", r.tokenUsage(), cost, "SUCCESS", null,
                     actualModel, UsageChannel.AGENT, UsageService.clip(patchContext, 2000));
-            return JsonUtils.parse(r.content(), AdjustPatchIntent.class);
+            AdjustPatchIntent intent = JsonUtils.parse(r.content(), AdjustPatchIntent.class);
+            contextBaselineRecorder.parseFinished(observation,
+                    intent == null ? "FAILED" : "SUCCESS", "NOT_ATTEMPTED",
+                    intent == null ? "PATCH_JSON_INVALID" : null);
+            return intent;
         } catch (Exception e) {
             actualModel = LlmRouteContext.consume("fast", actualModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
+            if (!providerCompleted) {
+                contextBaselineRecorder.providerFinished(observation, null, cost, "FAILED");
+            }
+            contextBaselineRecorder.parseFinished(observation, "FAILED", "NOT_ATTEMPTED",
+                    e.getClass().getSimpleName());
             ctx.add(AgentTrace.failure("ItineraryPatchAgent", cost,
                     e.getClass().getName() + ": " + e.getMessage()));
             ctx.finish("FAILED");
@@ -1325,6 +1416,57 @@ public class ItineraryService {
                 .toList();
     }
 
+    private ContextObservation beginPlannerContext(TravelState state, String operationId,
+                                                    String preferenceJson, String attractionJson,
+                                                    String restaurantJson, String hotelJson,
+                                                    String rules,
+                                                    AgentContextInvocation invocation) {
+        Map<String, Object> sections = new LinkedHashMap<>();
+        sections.put(ContextSectionNames.PREFERENCE, preferenceJson);
+        sections.put(ContextSectionNames.SELECTED_ITEMS, Map.of(
+                "attractions", attractionJson,
+                "restaurants", restaurantJson,
+                "hotel", hotelJson));
+        sections.put(ContextSectionNames.DERIVED_POLICY, rules);
+        if (invocation != null) sections.put("AGENT_CONTEXT", invocation.observationSections());
+        return beginContext(state, operationId, "ItineraryAgent",
+                invocation == null ? "itinerary-context-v1" : invocation.schemaVersion(), sections);
+    }
+
+    private ContextObservation beginRepairContext(TravelState state, String operationId,
+                                                   String repairContext,
+                                                   List<ItineraryRepairEngine.RepairViolation> violations,
+                                                   AgentContextInvocation invocation) {
+        Map<String, Object> sections = new LinkedHashMap<>();
+        sections.put(ContextSectionNames.PLAN_DRAFT, repairContext);
+        sections.put(ContextSectionNames.VIOLATIONS,
+                violations == null ? List.of() : violations.stream()
+                        .map(v -> Map.of("code", String.valueOf(v.code()),
+                                "repairable", v.repairable())).toList());
+        if (invocation != null) sections.put("AGENT_CONTEXT", invocation.observationSections());
+        return beginContext(state, operationId, "ItineraryRepairAgent",
+                invocation == null ? "repair-context-v1" : invocation.schemaVersion(), sections);
+    }
+
+    private ContextObservation beginPatchContext(TravelState state, String patchContext,
+                                                 AgentContextInvocation invocation) {
+        Map<String, Object> sections = new LinkedHashMap<>();
+        sections.put(ContextSectionNames.PLAN_DRAFT, patchContext);
+        if (invocation != null) sections.put("AGENT_CONTEXT", invocation.observationSections());
+        return beginContext(state, null, "ItineraryPatchAgent",
+                invocation == null ? "patch-context-v1" : invocation.schemaVersion(), sections);
+    }
+
+    private ContextObservation beginContext(TravelState state, String operationId, String agent,
+                                            String schemaVersion, Map<String, Object> sections) {
+        int requirementRevision = state.getRequirementSnapshot() == null
+                ? 0 : state.getRequirementSnapshot().getRevision();
+        return contextBaselineRecorder.begin(new ContextCaptureRequest(
+                state.getSessionId(), state.getUserId(), null, operationId, agent,
+                state.getStage() == null ? null : state.getStage().name(), schemaVersion,
+                requirementRevision, state.getConstraintRevision(), state.getPlanRevision(), sections));
+    }
+
     /** 规划模型只接收会改变“分天/顺序”的字段，预算、人数、展示状态等由 Java 使用。 */
     static Map<String, Object> planningPreference(TravelState state) {
         TravelPreference pref = state == null ? null : state.getPreference();
@@ -1358,6 +1500,19 @@ public class ItineraryService {
         putIfPresent(out, "id", restaurant.getId());
         putIfPresent(out, "name", restaurant.getName());
         putIfPresent(out, "cuisine", restaurant.getCuisine());
+        return out;
+    }
+
+    /** 第四阶段必要事实候选；只有 PLANNING 灰度启用时才会进入模型参数。 */
+    private static Map<String, Object> planningRestaurantFacts(Restaurant restaurant) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        putIfPresent(out, "id", restaurant.getId());
+        putIfPresent(out, "avgPrice", restaurant.getAvgPrice());
+        putIfPresent(out, "businessHours", restaurant.getBusinessHours());
+        putIfPresent(out, "address", restaurant.getAddress());
+        putIfPresent(out, "lng", restaurant.getLng());
+        putIfPresent(out, "lat", restaurant.getLat());
+        putIfPresent(out, "source", restaurant.getSource());
         return out;
     }
 

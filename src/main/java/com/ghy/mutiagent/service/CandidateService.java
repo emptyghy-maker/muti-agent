@@ -11,6 +11,13 @@ import com.ghy.mutiagent.common.GeoUtils;
 import com.ghy.mutiagent.common.JsonUtils;
 import com.ghy.mutiagent.config.LlmRouteContext;
 import com.ghy.mutiagent.config.CandidateFoodConfig;
+import com.ghy.mutiagent.context.baseline.ContextBaselineRecorder;
+import com.ghy.mutiagent.context.baseline.ContextCaptureRequest;
+import com.ghy.mutiagent.context.baseline.ContextObservation;
+import com.ghy.mutiagent.context.baseline.ContextSectionNames;
+import com.ghy.mutiagent.context.agent.AgentContextInvocation;
+import com.ghy.mutiagent.context.agent.AgentContextRole;
+import com.ghy.mutiagent.context.agent.AgentContextRuntime;
 import com.ghy.mutiagent.model.AttractionCandidate;
 import com.ghy.mutiagent.model.CandidateSnapshot;
 import com.ghy.mutiagent.model.ConstraintEntry;
@@ -387,6 +394,11 @@ public class CandidateService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.ghy.mutiagent.observability.collection.ObsInstrumentation obsInstrumentation;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ContextBaselineRecorder contextBaselineRecorder = ContextBaselineRecorder.noop();
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private AgentContextRuntime agentContextRuntime;
+
     /** 阶段2 联网检索客户端（可空：未装配/关闭时功能降级为跳过，不阻塞主流程） */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private DashScopeSearchClient dashScopeSearchClient;
@@ -438,7 +450,8 @@ public class CandidateService {
      * 同时落用量记录并归集到本轮。S12：provider 结果与解析/验证结果分层——此处只记录 providerStatus，
      * parseStatus/validationStatus/fallbackReason 由调用方在各自步骤回填。
      */
-    private <T> Traced<T> withTrace(TravelState state, String agentName, String action, Supplier<Result<T>> call) {
+    private <T> Traced<T> withTrace(TravelState state, String agentName, String action,
+                                    ContextObservation observation, Supplier<Result<T>> call) {
         TraceContext ctx = traceService.newTrace(state.getSessionId(), agentName);
         // S12：候选调用也进入 span 注册表（分层状态可被观测；未装配注册表时为空操作）
         ctx.setSpanId(agentName + "-" + UUID.randomUUID());
@@ -451,6 +464,7 @@ public class CandidateService {
             String actualModel = LlmRouteContext.consume("fast", defaultModel);
             long cost = (System.nanoTime() - t0) / 1_000_000;
             AgentTrace span = AgentTrace.success(agentName, cost, r.tokenUsage());
+            contextBaselineRecorder.providerFinished(observation, r.tokenUsage(), cost, "SUCCESS");
             span.setAnswer(UsageService.clip(String.valueOf(r.content()), 2000));
             ctx.add(span);
             ctx.finish("SUCCESS");
@@ -466,6 +480,7 @@ public class CandidateService {
             String actualModel = LlmRouteContext.consume("fast", defaultModel);
             long cost = (System.nanoTime() - t0) / 1_000_000;
             AgentTrace span = AgentTrace.failure(agentName, cost, e.getMessage());
+            contextBaselineRecorder.providerFinished(observation, null, cost, "FAILED");
             ctx.add(span);
             ctx.finish("FAILED");
             obsNodeEnded(null, state, "refine-" + agentName, "FAILED", Map.of(
@@ -819,13 +834,29 @@ public class CandidateService {
     private List<Attraction> refineAttractionsByAi(TravelState state, List<Attraction> poolEntities,
                                                    List<AttractionCandidate> pool, String request) {
         String raw = null;
+        ContextObservation observation = ContextObservation.disabled();
         try {
             String poolJson = objectMapper.writeValueAsString(
                     poolEntities.stream().map(a -> attractionPoolItem(state, a)).toList());
             int target = Math.min(LLM_SELECT_MAX, poolEntities.size());
             String prefJson = prefJson(state, request);
+            AgentContextInvocation invocation = agentContextRuntime == null
+                    || !agentContextRuntime.isActive(AgentContextRole.ATTRACTION) ? null
+                    : agentContextRuntime.candidate(state, AgentContextRole.ATTRACTION,
+                    poolJson, prefJson, target);
+            if (invocation != null) {
+                poolJson = invocation.argument("pool");
+                prefJson = invocation.argument("preference");
+                target = Integer.parseInt(invocation.argument("target"));
+            }
+            observation = beginCandidateContext(state, "AttractionAgent", "candidate-attraction-v1",
+                    poolJson, prefJson, invocation);
+            final String poolArg = poolJson;
+            final String prefArg = prefJson;
+            final int targetArg = target;
             Traced<String> traced = withTrace(state, "AttractionAgent", "景点AI重筛",
-                    () -> attractionAgent.select(poolJson, prefJson, target));
+                    observation,
+                    () -> attractionAgent.select(poolArg, prefArg, targetArg));
             raw = traced.content();
             AgentTrace span = traced.span();
             JsonNode node = JsonUtils.readTree(raw);
@@ -867,6 +898,8 @@ public class CandidateService {
                 span.setFallbackReason("HARD_CONSTRAINT_VIOLATION");
                 traced.ctx().setBusinessStatus("DEGRADED");
                 state.setCandidateAdvice(null);
+                contextBaselineRecorder.parseFinished(observation, "SUCCESS", "FAILED",
+                        "HARD_CONSTRAINT_VIOLATION");
                 log.warn("景点候选 AI 输出解析后有效项为 0（输出形状或 id 与池不符），原始输出前300字：{}", snippet(raw));
                 return null;
             }
@@ -876,6 +909,7 @@ public class CandidateService {
                 span.setValidationStatus(AgentTrace.SUCCESS);
                 span.setFallbackReason("POOL_NO_MATCH");
                 traced.ctx().setBusinessStatus("DEGRADED");
+                contextBaselineRecorder.parseFinished(observation, "SUCCESS", "SUCCESS", "POOL_NO_MATCH");
                 log.warn("景点候选 AI 表示池内无匹配（items 为空），将保留规则池并尝试联网检索。原始输出前300字：{}", snippet(raw));
                 return new ArrayList<>();
             }
@@ -884,8 +918,11 @@ public class CandidateService {
             state.setCandidateAdvice(AgentOutputParser.adviceOf(node));
             pool.clear();
             pool.addAll(refined);
+            contextBaselineRecorder.parseFinished(observation, "SUCCESS", "SUCCESS", null);
             return refinedEntities;
         } catch (Exception e) {
+            contextBaselineRecorder.parseFinished(observation, "FAILED", "UNKNOWN",
+                    e.getClass().getSimpleName());
             state.setCandidateAdvice(null);
             log.warn("景点候选 AI 重筛失败（{}），沿用知识库规则池", e.getClass().getName(), e);
             log.warn("  AttractionAgent 原始输出前300字：{}", snippet(raw));
@@ -1246,12 +1283,28 @@ public class CandidateService {
     private List<Restaurant> refineFoodsByAi(TravelState state, List<Restaurant> poolEntities,
                                              int target, Map<Long, String> mealTypes, String request) {
         String raw = null;
+        ContextObservation observation = ContextObservation.disabled();
         try {
             String poolJson = objectMapper.writeValueAsString(
                     poolEntities.stream().map(r -> restaurantPoolItem(state, r)).toList());
             String prefJson = prefJson(state, request);
+            AgentContextInvocation invocation = agentContextRuntime == null
+                    || !agentContextRuntime.isActive(AgentContextRole.FOOD) ? null
+                    : agentContextRuntime.candidate(state, AgentContextRole.FOOD,
+                    poolJson, prefJson, target);
+            if (invocation != null) {
+                poolJson = invocation.argument("pool");
+                prefJson = invocation.argument("preference");
+                target = Integer.parseInt(invocation.argument("target"));
+            }
+            observation = beginCandidateContext(state, "FoodAgent", "candidate-food-v1",
+                    poolJson, prefJson, invocation);
+            final String poolArg = poolJson;
+            final String prefArg = prefJson;
+            final int targetArg = target;
             Traced<String> traced = withTrace(state, "FoodAgent", "美食AI重筛",
-                    () -> foodAgent.select(poolJson, prefJson, target));
+                    observation,
+                    () -> foodAgent.select(poolArg, prefArg, targetArg));
             raw = traced.content();
             AgentTrace span = traced.span();
             JsonNode node = JsonUtils.readTree(raw);
@@ -1295,13 +1348,17 @@ public class CandidateService {
                 span.setValidationStatus(AgentTrace.SUCCESS);
                 span.setFallbackReason("POOL_NO_MATCH");
                 traced.ctx().setBusinessStatus("DEGRADED");
+                contextBaselineRecorder.parseFinished(observation, "SUCCESS", "SUCCESS", "POOL_NO_MATCH");
                 log.warn("美食候选 AI 表示池内无匹配（items 为空），将保留规则池并尝试联网检索。原始输出前300字：{}", snippet(raw));
                 return new ArrayList<>();
             }
             span.setValidationStatus(AgentTrace.SUCCESS);
             traced.ctx().setBusinessStatus("COMMITTED");
+            contextBaselineRecorder.parseFinished(observation, "SUCCESS", "SUCCESS", null);
             return refinedEntities;
         } catch (Exception e) {
+            contextBaselineRecorder.parseFinished(observation, "FAILED", "UNKNOWN",
+                    e.getClass().getSimpleName());
             state.setCandidateAdvice(null);
             log.warn("美食候选 AI 重筛失败（{}），沿用知识库规则池", e.getClass().getName(), e);
             log.warn("  FoodAgent 原始输出前300字：{}", snippet(raw));
@@ -2548,12 +2605,26 @@ public class CandidateService {
     private List<Hotel> refineHotelsByAi(TravelState state, List<Hotel> poolEntities,
                                          List<HotelCandidate> pool, double[] center, String request) {
         String raw = null;
+        ContextObservation observation = ContextObservation.disabled();
         try {
             String poolJson = objectMapper.writeValueAsString(
                     poolEntities.stream().map(h -> hotelPoolItem(state, h, center)).toList());
             String prefJson = prefJson(state, request);
+            AgentContextInvocation invocation = agentContextRuntime == null
+                    || !agentContextRuntime.isActive(AgentContextRole.HOTEL) ? null
+                    : agentContextRuntime.candidate(state, AgentContextRole.HOTEL,
+                    poolJson, prefJson, 0);
+            if (invocation != null) {
+                poolJson = invocation.argument("pool");
+                prefJson = invocation.argument("preference");
+            }
+            observation = beginCandidateContext(state, "HotelAgent", "candidate-hotel-v1",
+                    poolJson, prefJson, invocation);
+            final String poolArg = poolJson;
+            final String prefArg = prefJson;
             Traced<String> traced = withTrace(state, "HotelAgent", "酒店AI重筛",
-                    () -> hotelAgent.select(poolJson, prefJson));
+                    observation,
+                    () -> hotelAgent.select(poolArg, prefArg));
             raw = traced.content();
             AgentTrace span = traced.span();
             JsonNode node = JsonUtils.readTree(raw);
@@ -2593,6 +2664,8 @@ public class CandidateService {
                 span.setValidationStatus(AgentTrace.FAILED);
                 span.setFallbackReason("HARD_CONSTRAINT_VIOLATION");
                 traced.ctx().setBusinessStatus("DEGRADED");
+                contextBaselineRecorder.parseFinished(observation, "SUCCESS", "FAILED",
+                        "HARD_CONSTRAINT_VIOLATION");
                 log.warn("酒店候选 AI 输出解析后有效项为 0（输出形状或 id 与池不符），原始输出前300字：{}", snippet(raw));
                 return null;
             }
@@ -2602,6 +2675,7 @@ public class CandidateService {
                 span.setValidationStatus(AgentTrace.SUCCESS);
                 span.setFallbackReason("POOL_NO_MATCH");
                 traced.ctx().setBusinessStatus("DEGRADED");
+                contextBaselineRecorder.parseFinished(observation, "SUCCESS", "SUCCESS", "POOL_NO_MATCH");
                 log.warn("酒店候选 AI 表示池内无匹配（items 为空），将保留规则池并尝试联网检索。原始输出前300字：{}", snippet(raw));
                 return new ArrayList<>();
             }
@@ -2609,13 +2683,33 @@ public class CandidateService {
             traced.ctx().setBusinessStatus("COMMITTED");
             pool.clear();
             pool.addAll(refined);
+            contextBaselineRecorder.parseFinished(observation, "SUCCESS", "SUCCESS", null);
             return refinedEntities;
         } catch (Exception e) {
+            contextBaselineRecorder.parseFinished(observation, "FAILED", "UNKNOWN",
+                    e.getClass().getSimpleName());
             state.setCandidateAdvice(null);
             log.warn("酒店候选 AI 重筛失败（{}），沿用知识库规则池", e.getClass().getName(), e);
             log.warn("  HotelAgent 原始输出前300字：{}", snippet(raw));
             return null;
         }
+    }
+
+    private ContextObservation beginCandidateContext(TravelState state, String agent,
+                                                      String schemaVersion, String poolJson,
+                                                      String preferenceJson,
+                                                      AgentContextInvocation invocation) {
+        int requirementRevision = state.getRequirementSnapshot() == null
+                ? 0 : state.getRequirementSnapshot().getRevision();
+        Map<String, Object> sections = new LinkedHashMap<>();
+        sections.put(ContextSectionNames.CANDIDATE_POOL, poolJson);
+        sections.put(ContextSectionNames.PREFERENCE, preferenceJson);
+        if (invocation != null) sections.put("AGENT_CONTEXT", invocation.observationSections());
+        return contextBaselineRecorder.begin(new ContextCaptureRequest(
+                state.getSessionId(), state.getUserId(), null, null, agent,
+                state.getStage() == null ? null : state.getStage().name(),
+                invocation == null ? schemaVersion : invocation.schemaVersion(),
+                requirementRevision, state.getConstraintRevision(), state.getPlanRevision(), sections));
     }
 
     /** 换一批：从备选池翻下一页（已勾选置顶、不重复）；返回 0=新页 1=翻完一轮从头再来 */
