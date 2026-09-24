@@ -9,6 +9,7 @@ import com.ghy.mutiagent.agent.FoodAgent;
 import com.ghy.mutiagent.agent.HotelAgent;
 import com.ghy.mutiagent.common.GeoUtils;
 import com.ghy.mutiagent.common.JsonUtils;
+import com.ghy.mutiagent.config.LlmRouteContext;
 import com.ghy.mutiagent.config.CandidateFoodConfig;
 import com.ghy.mutiagent.model.AttractionCandidate;
 import com.ghy.mutiagent.model.CandidateSnapshot;
@@ -16,6 +17,7 @@ import com.ghy.mutiagent.model.ConstraintEntry;
 import com.ghy.mutiagent.model.FoodCandidate;
 import com.ghy.mutiagent.model.HotelCandidate;
 import com.ghy.mutiagent.model.LockedSelection;
+import com.ghy.mutiagent.model.LocationConstraint;
 import com.ghy.mutiagent.model.RequirementSnapshot;
 import com.ghy.mutiagent.model.ResolvedPlanningPolicy;
 import com.ghy.mutiagent.model.TravelPreference;
@@ -35,6 +37,7 @@ import com.ghy.mutiagent.repository.mapper.WebFoodAuditMapper;
 import com.ghy.mutiagent.rule.AhpWeightCalculator;
 import com.ghy.mutiagent.rule.CandidateScorer;
 import com.ghy.mutiagent.rule.HardConstraintEvaluator;
+import com.ghy.mutiagent.rule.LocationConstraintSupport;
 import com.ghy.mutiagent.rule.MealPolicySupport;
 import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.rule.TagMatcher;
@@ -64,6 +67,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -80,6 +85,9 @@ import java.util.stream.Collectors;
 public class CandidateService {
 
     private static final Logger log = LoggerFactory.getLogger(CandidateService.class);
+    private static final Pattern VERIFIED_ADVICE_SUFFIX = Pattern.compile(
+            "(已(?:联网检索扩充|复用历史网搜结果补充)\\s*\\d+\\s*[^。]+。|"
+                    + "（(?:本次未获取到新的联网结果|联网检索暂不可用)[^）]*）)");
 
     /** 备选池与每批展示数量 */
     private static final int ATTRACTION_POOL_MAX = 16;
@@ -140,8 +148,14 @@ public class CandidateService {
         List<String> keys = new ArrayList<>();
         int scanned = 0;
         int unknown = 0;
+        int locationRejected = 0;
         for (Attraction a : orderAttractions(all, state.getPreference())) {
             scanned++;
+            if (!locationEligible(state, LocationConstraintSupport.ATTRACTION,
+                    a.getName(), a.getAddress(), a.getLng(), a.getLat())) {
+                locationRejected++;
+                continue;
+            }
             HardConstraintEvaluator.Verdict v = HardConstraintEvaluator.evaluate(attractionFact(a, city), policy);
             if (v.status() == HardConstraintEvaluator.Status.ELIGIBLE) {
                 keys.add(placeKey("ATTRACTION", a.getId()));
@@ -156,6 +170,7 @@ public class CandidateService {
         evidence.put("scannedCount", scanned);
         evidence.put("eligibleCount", keys.size());
         evidence.put("unknownCount", unknown);
+        evidence.put("locationRejectedCount", locationRejected);
         int shortage = Math.max(0, target - keys.size());
         evidence.put("shortage", shortage);
         List<String> reasonCodes = new ArrayList<>();
@@ -231,6 +246,11 @@ public class CandidateService {
         HardConstraintEvaluator.HardPolicy policy = buildHardPolicy(state);
         String city = state.getDestinationName();
         for (String key : locked.getOrderedKeys()) {
+            if (!locationEligibleKey(state, key)) {
+                locked.getConflictCodes().add(LockedSelection.CONFLICT_LOCKED_CONSTRAINT);
+                log.warn("[Candidate] 锁定项 {} 超出位置约束范围，标记冲突待用户处理", key);
+                continue;
+            }
             HardConstraintEvaluator.HardFact fact = factOfKey(key, city);
             if (fact == null) {
                 // 锁定项已下架（查无此实体）：同样标记冲突，阻止静默提交
@@ -243,6 +263,36 @@ public class CandidateService {
                 locked.getConflictCodes().add(LockedSelection.CONFLICT_LOCKED_CONSTRAINT);
                 log.warn("[Candidate] 锁定项 {} 与新约束冲突（{}），阻止直接提交", key, v.reasonCode());
             }
+        }
+    }
+
+    private boolean locationEligibleKey(TravelState state, String key) {
+        int sep = key == null ? -1 : key.indexOf(':');
+        if (sep <= 0 || sep >= key.length() - 1) {
+            return true;
+        }
+        try {
+            long id = Long.parseLong(key.substring(sep + 1));
+            return switch (key.substring(0, sep)) {
+                case "ATTRACTION" -> {
+                    Attraction a = attractionMapper.selectById(id);
+                    yield a == null || locationEligible(state, LocationConstraintSupport.ATTRACTION,
+                            a.getName(), a.getAddress(), a.getLng(), a.getLat());
+                }
+                case "FOOD" -> {
+                    Restaurant r = restaurantMapper.selectById(id);
+                    yield r == null || locationEligible(state, LocationConstraintSupport.FOOD,
+                            r.getName(), r.getAddress(), r.getLng(), r.getLat());
+                }
+                case "HOTEL" -> {
+                    Hotel h = hotelMapper.selectById(id);
+                    yield h == null || locationEligible(state, LocationConstraintSupport.HOTEL,
+                            h.getName(), h.getAddress(), h.getLng(), h.getLat());
+                }
+                default -> true;
+            };
+        } catch (NumberFormatException ignored) {
+            return true;
         }
     }
 
@@ -398,6 +448,7 @@ public class CandidateService {
         long t0 = System.nanoTime();
         try {
             Result<T> r = call.get();
+            String actualModel = LlmRouteContext.consume("fast", defaultModel);
             long cost = (System.nanoTime() - t0) / 1_000_000;
             AgentTrace span = AgentTrace.success(agentName, cost, r.tokenUsage());
             span.setAnswer(UsageService.clip(String.valueOf(r.content()), 2000));
@@ -408,10 +459,11 @@ public class CandidateService {
             int[] tk = tokenCounts(r.tokenUsage());
             usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
                     state.getStage().name(), action, agentName, r.tokenUsage(), cost, "SUCCESS", null,
-                    defaultModel, UsageChannel.AGENT, UsageService.clip(String.valueOf(r.content()), 2000));
-            state.addTurnUsage(defaultModel, tk[0], tk[1], UsageChannel.AGENT);
+                    actualModel, UsageChannel.AGENT, UsageService.clip(String.valueOf(r.content()), 2000));
+            state.addTurnUsage(actualModel, tk[0], tk[1], UsageChannel.AGENT);
             return new Traced<>(r.content(), ctx, span);
         } catch (Exception e) {
+            String actualModel = LlmRouteContext.consume("fast", defaultModel);
             long cost = (System.nanoTime() - t0) / 1_000_000;
             AgentTrace span = AgentTrace.failure(agentName, cost, e.getMessage());
             ctx.add(span);
@@ -421,7 +473,7 @@ public class CandidateService {
             usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
                     state.getStage().name(), action, agentName, null, cost, "FAILED",
                     e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()),
-                    defaultModel, UsageChannel.RULE_FALLBACK, null);
+                    actualModel, UsageChannel.RULE_FALLBACK, null);
             state.addTurnUsage(null, 0, 0, UsageChannel.RULE_FALLBACK);
             throw e;
         } finally {
@@ -472,14 +524,29 @@ public class CandidateService {
             extra.append("\n\n需求匹配关键字：").append(String.join("、", state.getNeedTags()))
                     .append("\n请优先推荐同时命中多个关键字的候选。");
         }
+        LocationConstraint location = state.getLocationConstraint();
+        if (location != null) {
+            extra.append("\n\n位置约束：").append(LocationConstraintSupport.summary(location))
+                    .append("；适用通道=").append(location.getScopes());
+            if (LocationConstraint.RESOLVED.equals(location.getStatus())) {
+                extra.append("。候选已由 Java 按距离过滤，distanceToAnchorKm 是可验证距离。");
+            } else {
+                extra.append("。锚点尚未解析，禁止宣称距离要求已满足。");
+            }
+        }
         ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
         if (isExplicitMeal(planning.getMeal().getLunch()) || isExplicitMeal(planning.getMeal().getDinner())
+                || planning.getMeal().isExplicitMealComposition()
                 || planning.getMeal().getLunchCandidateCount() != null
                 || planning.getMeal().getDinnerCandidateCount() != null
                 || !planning.getMeal().isSnacksAllowed()) {
             List<String> parts = new ArrayList<>();
             parts.add(mealRuleSummary(planning.getMeal().getLunch(), "午餐"));
             parts.add(mealRuleSummary(planning.getMeal().getDinner(), "晚餐"));
+            if (planning.getMeal().isExplicitMealComposition()) {
+                parts.add(mealRuleSummary(planning.getMeal().getSnack(), "小吃"));
+                parts.add(mealRuleSummary(planning.getMeal().getMainMeal(), "正餐"));
+            }
             if (planning.getMeal().getLunchCandidateCount() != null) {
                 parts.add("午餐候选店 " + planning.getMeal().getLunchCandidateCount() + " 家");
             }
@@ -516,12 +583,18 @@ public class CandidateService {
         return state.getWeights() == null ? AhpWeightCalculator.defaultWeights() : state.getWeights();
     }
 
-    /** 已选景点的几何中心（未选景点时为 null，路径分取中性值） */
+    /** 已选景点的几何中心（未选景点或所选景点均无坐标时为 null，路径分取中性值） */
     private double[] selectedAttractionCentroid(TravelState state) {
         List<double[]> pts = new ArrayList<>();
         if (state.getSelectedAttractionIds() != null && !state.getSelectedAttractionIds().isEmpty()) {
             attractionMapper.selectBatchIds(state.getSelectedAttractionIds())
-                    .forEach(a -> pts.add(new double[]{a.getLng(), a.getLat()}));
+                    .forEach(a -> {
+                        // 联网扩充景点只有名称和地址时允许暂缺坐标。此类景点仍可参与候选与
+                        // 地点文本约束，但不能参与几何中心计算，否则 Double 拆箱会触发 NPE。
+                        if (a.getLng() != null && a.getLat() != null) {
+                            pts.add(new double[]{a.getLng(), a.getLat()});
+                        }
+                    });
         }
         if (pts.isEmpty()) {
             return null;
@@ -568,8 +641,19 @@ public class CandidateService {
         List<String> sqlAccepted = new ArrayList<>();
         int scanned = 0;
         int unknown = 0;
-        for (Attraction a : orderAttractions(all, state.getPreference()).stream().sorted(needFirst).toList()) {
+        int locationRejected = 0;
+        Comparator<Attraction> anchorFirst = Comparator.comparingDouble(a ->
+                locationDistance(state, LocationConstraintSupport.ATTRACTION, a.getLng(), a.getLat()) == null
+                        ? Double.MAX_VALUE
+                        : locationDistance(state, LocationConstraintSupport.ATTRACTION, a.getLng(), a.getLat()));
+        for (Attraction a : orderAttractions(all, state.getPreference()).stream()
+                .sorted(needFirst.thenComparing(anchorFirst)).toList()) {
             scanned++;
+            if (!locationEligible(state, LocationConstraintSupport.ATTRACTION,
+                    a.getName(), a.getAddress(), a.getLng(), a.getLat())) {
+                locationRejected++;
+                continue;
+            }
             HardConstraintEvaluator.Verdict v = HardConstraintEvaluator.evaluate(attractionFact(a, city), policy);
             if (v.status() == HardConstraintEvaluator.Status.ELIGIBLE) {
                 poolEntities.add(a);
@@ -583,7 +667,7 @@ public class CandidateService {
         }
         acceptedByOrigin.put("SQL", sqlAccepted);
         List<AttractionCandidate> pool = poolEntities.stream()
-                .map(a -> attractionOf(a, "综合推荐")).collect(Collectors.toCollection(ArrayList::new));
+                .map(a -> attractionOf(state, a, "综合推荐")).collect(Collectors.toCollection(ArrayList::new));
 
         boolean aiOk = true;
         List<Attraction> finalEntities = poolEntities;
@@ -595,12 +679,14 @@ public class CandidateService {
                 if (refined.isEmpty()) {
                     // AI 表示池内无匹配（如地点限制）：保留规则池兜底展示，同时自动联网检索补候选
                     evidence.put("aiNoMatch", true);
-                    suppressed = triggerWebSearchForAttractions(state);
+                    suppressed = triggerWebSearchForAttractions(state, Set.of(), ATTRACTION_SEARCH_FLOOR);
                 } else if (refined.size() < ATTRACTION_SEARCH_FLOOR) {
                     // 确定性触发：AI 精挑数量低于下限即视为覆盖不足，直接联网检索扩充——
                     // 不依赖 advice 文本措辞（措辞多变会漏触发）
                     evidence.put("aiInsufficient", true);
-                    suppressed = triggerWebSearchForAttractions(state);
+                    Set<Long> refinedIds = refined.stream().map(Attraction::getId).collect(Collectors.toSet());
+                    suppressed = triggerWebSearchForAttractions(state, refinedIds,
+                            ATTRACTION_SEARCH_FLOOR - refined.size());
                 }
                 // AI 精挑通常只有几家：先并入本会话已通过校验入库的网搜景点（与 KB 景点同等对待），
                 // 仍不足下限时再用规则池补足（补足项同样已经过硬过滤）
@@ -626,9 +712,14 @@ public class CandidateService {
                     if (finalEntities.size() >= ATTRACTION_SEARCH_FLOOR) {
                         break;
                     }
+                    if (!locationEligible(state, LocationConstraintSupport.ATTRACTION,
+                            w.getName(), w.getAddress(), w.getLng(), w.getLat())) {
+                        locationRejected++;
+                        continue;
+                    }
                     if (chosenIds.add(w.getId())) {
                         finalEntities.add(w);
-                        extraPool.add(attractionOf(w, "联网检索补充"));
+                        extraPool.add(attractionOf(state, w, "联网检索补充"));
                         webAccepted.add(placeKey("ATTRACTION", w.getId()));
                         if (promotion != null) {
                             // 晋升计数是旁路功能：任何异常都不阻断候选主流程
@@ -663,7 +754,7 @@ public class CandidateService {
                     }
                     if (chosenIds.add(a.getId())) {
                         finalEntities.add(a);
-                        extraPool.add(attractionOf(a, "综合推荐"));
+                        extraPool.add(attractionOf(state, a, "综合推荐"));
                         backfillAccepted.add(placeKey("ATTRACTION", a.getId()));
                     }
                 }
@@ -676,7 +767,7 @@ public class CandidateService {
                 extraPool.forEach(c -> whyById.putIfAbsent(c.getAttractionId(), c));
                 pool.clear();
                 for (Attraction a : finalEntities) {
-                    pool.add(whyById.getOrDefault(a.getId(), attractionOf(a, "综合推荐")));
+                    pool.add(whyById.getOrDefault(a.getId(), attractionOf(state, a, "综合推荐")));
                 }
             } else {
                 aiOk = false;
@@ -690,7 +781,8 @@ public class CandidateService {
         Map<Long, Double> scores = CandidateScorer.scoreAttractions(finalEntities, state.getPreference(), w);
         for (AttractionCandidate c : pool) {
             double bonus = tagEval.bonus().getOrDefault(c.getAttractionId(), 0.0);
-            c.setScore(round(scores.getOrDefault(c.getAttractionId(), 0.0) + bonus));
+            c.setScore(round(scores.getOrDefault(c.getAttractionId(), 0.0) + bonus
+                    + locationBonus(state, LocationConstraintSupport.ATTRACTION, c.getDistanceToAnchor())));
             String note = tagEval.notes().get(c.getAttractionId());
             if (note != null && !note.isBlank()) {
                 c.setTagNote(note);
@@ -711,11 +803,14 @@ public class CandidateService {
         evidence.put("scannedCount", scanned);
         evidence.put("eligibleCount", finalEntities.size());
         evidence.put("unknownCount", unknown);
+        evidence.put("locationRejectedCount", locationRejected);
         evidence.put("acceptedByOrigin", acceptedByOrigin);
+        sanitizeCandidateAdvice(state, "景点");
         newSnapshot(state, "ATTRACTION",
                 finalEntities.stream().map(a -> placeKey("ATTRACTION", a.getId())).toList(), evidence);
         obsRecall(null, state, "ATTRACTION", evidence);
         nextAttractionBatch(state);
+        state.rememberCandidateAdvice(CandidateChannelCoordinator.CHANNEL_ATTRACTION);
         log.info("[Candidate] 景点备选池 {} 个（会话 {}，AI失败={}）", pool.size(), state.getSessionId(), !aiOk);
         return aiOk;
     }
@@ -726,7 +821,7 @@ public class CandidateService {
         String raw = null;
         try {
             String poolJson = objectMapper.writeValueAsString(
-                    poolEntities.stream().map(this::attractionPoolItem).toList());
+                    poolEntities.stream().map(a -> attractionPoolItem(state, a)).toList());
             int target = Math.min(LLM_SELECT_MAX, poolEntities.size());
             String prefJson = prefJson(state, request);
             Traced<String> traced = withTrace(state, "AttractionAgent", "景点AI重筛",
@@ -757,7 +852,7 @@ public class CandidateService {
                     log.warn("景点候选 AI 输出项 {} 未通过硬过滤（{}），已剔除", a.getId(), v.reasonCode());
                     continue;
                 }
-                AttractionCandidate full = attractionOf(a,
+                AttractionCandidate full = attractionOf(state, a,
                         c.getWhy() == null || c.getWhy().isBlank() ? "AI 推荐" : c.getWhy());
                 refined.add(full);
                 refinedEntities.add(a);
@@ -826,6 +921,35 @@ public class CandidateService {
         return wrapped;
     }
 
+    /** 当前候选阶段是否确实还有未展示条目，供前端决定是否显示“换一批”。 */
+    public boolean hasMoreCandidates(TravelState state) {
+        if (state == null || state.getStage() == null) {
+            return false;
+        }
+        return switch (state.getStage()) {
+            case ATTRACTIONS -> {
+                List<AttractionCandidate> pool = state.getAttractionPool() == null
+                        ? List.of() : state.getAttractionPool();
+                long remaining = pool.stream()
+                        .filter(c -> !state.getPickedAttractionIds().contains(c.getAttractionId())).count();
+                yield state.getAttractionCursor() < remaining;
+            }
+            case FOODS -> {
+                List<FoodCandidate> pool = state.getFoodPool() == null ? List.of() : state.getFoodPool();
+                long remaining = pool.stream().flatMap(g -> g.getRestaurants().stream())
+                        .filter(c -> !state.getPickedFoodIds().contains(c.getRestaurantId())).count();
+                yield state.getFoodCursor() < remaining;
+            }
+            case HOTELS -> {
+                List<HotelCandidate> pool = state.getHotelPool() == null ? List.of() : state.getHotelPool();
+                long remaining = pool.stream()
+                        .filter(c -> !state.getPickedHotelIds().contains(c.getHotelId())).count();
+                yield state.getHotelCursor() < remaining;
+            }
+            default -> false;
+        };
+    }
+
     private List<Attraction> orderAttractions(List<Attraction> all, TravelPreference p) {
         List<String> preferred = switch (p.getAttractionType() == null ? "" : p.getAttractionType()) {
             case "打卡拍照" -> List.of("打卡拍照", "文化历史");
@@ -838,7 +962,7 @@ public class CandidateService {
         return all.stream().sorted(cmp).toList();
     }
 
-    private Map<String, Object> attractionPoolItem(Attraction a) {
+    private Map<String, Object> attractionPoolItem(TravelState state, Attraction a) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", a.getId());
         m.put("name", a.getName());
@@ -848,16 +972,21 @@ public class CandidateService {
         m.put("hours", a.getSuggestHours());
         m.put("price", a.getTicketPrice());
         m.put("rating", a.getRating());
+        m.put("address", a.getAddress() == null ? "" : a.getAddress());
+        m.put("distanceToAnchorKm",
+                locationDistance(state, LocationConstraintSupport.ATTRACTION, a.getLng(), a.getLat()));
         return m;
     }
 
-    private AttractionCandidate attractionOf(Attraction a, String why) {
+    private AttractionCandidate attractionOf(TravelState state, Attraction a, String why) {
         AttractionCandidate c = new AttractionCandidate();
         c.setAttractionId(a.getId());
         c.setName(a.getName());
         c.setFeature(a.getFeatures());
         c.setTags(a.getTags());
         c.setWhy(why);
+        c.setDistanceToAnchor(
+                locationDistance(state, LocationConstraintSupport.ATTRACTION, a.getLng(), a.getLat()));
         return c;
     }
 
@@ -874,6 +1003,7 @@ public class CandidateService {
         ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
         boolean mealActive = isExplicitMeal(planning.getMeal().getLunch())
                 || isExplicitMeal(planning.getMeal().getDinner())
+                || planning.getMeal().isExplicitMealComposition()
                 || planning.getMeal().getLunchCandidateCount() != null
                 || planning.getMeal().getDinnerCandidateCount() != null;
         // 明确提出餐次/正餐需求（如「2顿午饭1顿晚饭」「不要小吃」）→ 默认不含小吃；显式「要小吃」可覆盖
@@ -887,8 +1017,14 @@ public class CandidateService {
         int scanned = 0;
         int unknown = 0;
         int overCap = 0;
+        int locationRejected = 0;
         for (Restaurant r : orderRestaurants(all, pref)) {
             scanned++;
+            if (!locationEligible(state, LocationConstraintSupport.FOOD,
+                    r.getName(), r.getAddress(), r.getLng(), r.getLat())) {
+                locationRejected++;
+                continue;
+            }
             if (excludeSnacks && MealPolicySupport.isSnack(r)) {
                 continue;
             }
@@ -922,7 +1058,7 @@ public class CandidateService {
         if (mealActive) {
             assignMealTypes(poolEntities, planning, daysOf(state), excludeSnacks, mealTypes);
         }
-        List<FoodCandidate> pool = new ArrayList<>(groupItems(poolEntities, mealTypes));
+        List<FoodCandidate> pool = new ArrayList<>(groupItems(state, poolEntities, mealTypes));
 
         // 目标数量：默认 1 天 3 餐（早餐 3×天数 + 正餐 6×天数），不足 15 按 15（candidate.food 可配置）；
         // 用户明确提出餐次结构时按「各餐顿数 × 天数」计算，尊重需求不再用 15 保底
@@ -930,12 +1066,15 @@ public class CandidateService {
         if (mealActive) {
             int requiredMeals = mealEventCount(planning.getMeal().getLunch(), daysOf(state))
                     + mealEventCount(planning.getMeal().getDinner(), daysOf(state));
+            int requiredComposition = mealEventCount(planning.getMeal().getSnack(), daysOf(state))
+                    + mealEventCount(planning.getMeal().getMainMeal(), daysOf(state));
             int requestedCandidates = Math.max(
                     planning.getMeal().getLunchCandidateCount() == null ? 0
                             : planning.getMeal().getLunchCandidateCount(),
                     planning.getMeal().getDinnerCandidateCount() == null ? 0
                             : planning.getMeal().getDinnerCandidateCount());
-            target = Math.min(Math.max(Math.max(requiredMeals, requestedCandidates), 1), poolEntities.size());
+            target = Math.min(Math.max(Math.max(Math.max(requiredMeals, requiredComposition), requestedCandidates), 1),
+                    poolEntities.size());
         } else {
             target = foodConfig.resolveTarget(daysOf(state), poolEntities.size());
         }
@@ -950,12 +1089,13 @@ public class CandidateService {
                 if (refined.isEmpty()) {
                     // AI 表示池内无匹配（如地点限制）：保留规则池兜底展示，同时自动联网检索补候选
                     evidence.put("aiNoMatch", true);
-                    suppressed = triggerWebSearchOnNoMatch(state);
+                    suppressed = triggerWebSearchOnNoMatch(state, Set.of(), target);
                 } else if (refined.size() < target) {
                     // 确定性触发：AI 精挑数量低于目标即视为覆盖不足（如「园区仅 1 家符合选址，
                     // 其余补位」），直接联网检索扩充——不依赖 advice 文本措辞（措辞多变会漏触发）
                     evidence.put("aiInsufficient", true);
-                    suppressed = triggerWebSearchOnNoMatch(state);
+                    Set<Long> refinedIds = refined.stream().map(Restaurant::getId).collect(Collectors.toSet());
+                    suppressed = triggerWebSearchOnNoMatch(state, refinedIds, target - refined.size());
                 }
                 // AI 精挑通常只有 2~3 家：先并入本会话已通过校验入库的网搜店（与 KB 店同等对待），
                 // 仍不足目标数量时再用规则池补足（补足项同样已经过硬过滤与小吃排除）
@@ -978,6 +1118,11 @@ public class CandidateService {
                 for (Restaurant w : webPool) {
                     if (finalEntities.size() >= target) {
                         break;
+                    }
+                    if (!locationEligible(state, LocationConstraintSupport.FOOD,
+                            w.getName(), w.getAddress(), w.getLng(), w.getLat())) {
+                        locationRejected++;
+                        continue;
                     }
                     if (chosenIds.add(w.getId())) {
                         finalEntities.add(w);
@@ -1029,7 +1174,7 @@ public class CandidateService {
         }
         // 以最终实体重建分组池（AI 精选在前 + 补足项），随后按口味档位优先、档内按 AHP 评分降序
         pool.clear();
-        pool.addAll(groupItems(finalEntities, mealTypes));
+        pool.addAll(groupItems(state, finalEntities, mealTypes));
         // AHP 基础分 + 标签加成（命中加分/冲突减分）= 展示综合分
         Map<String, Double> w = weightsOf(state);
         Map<Long, Double> scores = CandidateScorer.scoreRestaurants(
@@ -1048,7 +1193,8 @@ public class CandidateService {
         for (FoodCandidate g : pool) {
             for (FoodCandidate.FoodItem it : g.getRestaurants()) {
                 double bonus = foodTagEval.bonus().getOrDefault(it.getRestaurantId(), 0.0);
-                it.setScore(round(scores.getOrDefault(it.getRestaurantId(), 0.0) + bonus));
+                it.setScore(round(scores.getOrDefault(it.getRestaurantId(), 0.0) + bonus
+                        + locationBonus(state, LocationConstraintSupport.FOOD, it.getDistanceToAnchor())));
                 String note = foodTagEval.notes().get(it.getRestaurantId());
                 if (note != null && !note.isBlank()) {
                     it.setTagNote(note);
@@ -1084,11 +1230,14 @@ public class CandidateService {
         evidence.put("scannedCount", scanned);
         evidence.put("eligibleCount", poolIds.size());
         evidence.put("unknownCount", unknown);
+        evidence.put("locationRejectedCount", locationRejected);
         evidence.put("acceptedByOrigin", acceptedByOrigin);
+        sanitizeCandidateAdvice(state, "餐厅");
         newSnapshot(state, "FOOD",
                 finalEntities.stream().map(r -> placeKey("FOOD", r.getId())).toList(), evidence);
         obsRecall(null, state, "FOOD", evidence);
         nextFoodBatch(state);
+        state.rememberCandidateAdvice(CandidateChannelCoordinator.CHANNEL_FOOD);
         log.info("[Candidate] 美食备选池 {} 家（会话 {}，AI失败={}）", poolIds.size(), state.getSessionId(), !aiOk);
         return aiOk;
     }
@@ -1099,7 +1248,7 @@ public class CandidateService {
         String raw = null;
         try {
             String poolJson = objectMapper.writeValueAsString(
-                    poolEntities.stream().map(this::restaurantPoolItem).toList());
+                    poolEntities.stream().map(r -> restaurantPoolItem(state, r)).toList());
             String prefJson = prefJson(state, request);
             Traced<String> traced = withTrace(state, "FoodAgent", "美食AI重筛",
                     () -> foodAgent.select(poolJson, prefJson, target));
@@ -1184,6 +1333,7 @@ public class CandidateService {
                     + "\n用户偏好：" + objectMapper.writeValueAsString(state.getPreference());
             DashScopeSearchClient.SearchResult r = dashScopeSearchClient.search(system, user);
             raw = r.content();
+            String actualSearchModel = r.model() == null ? searchModel : r.model();
             int promptTokens = r.promptTokens() == null ? 0 : r.promptTokens();
             int completionTokens = r.completionTokens() == null ? 0 : r.completionTokens();
             TokenUsage searchUsage = new TokenUsage(promptTokens, completionTokens);
@@ -1226,9 +1376,9 @@ public class CandidateService {
                     + (accepted.size() < items.size() ? ",rejected=" + (items.size() - accepted.size()) : "");
             usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
                     "FOODS", "美食联网检索", "SearchAgent", searchUsage, cost, "SUCCESS",
-                    remark, searchModel, UsageChannel.AGENT,
+                    remark, actualSearchModel, UsageChannel.AGENT,
                     UsageService.clip(raw, 2000));
-            state.addTurnUsage(searchModel, promptTokens, completionTokens, UsageChannel.AGENT);
+            state.addTurnUsage(actualSearchModel, promptTokens, completionTokens, UsageChannel.AGENT);
             return accepted.isEmpty() ? null : accepted;
         } catch (Exception e) {
             long cost = System.currentTimeMillis() - start;
@@ -1249,21 +1399,32 @@ public class CandidateService {
 
     /**
      * AI 明确表示池内无匹配或覆盖不足时：自动联网检索补充候选。
-     * 同一需求只搜一次（会话内去重）；存在可复用历史网搜店时跳过本次检索（跨会话复用，
-     * 避免同需求重复付费搜索；未装配晋升组件时无此抑制，保持既有行为）。
+     * 同一需求只搜一次（会话内去重）；只有满足当前硬约束、未被本轮选中且数量足以补齐缺口的
+     * 历史网搜店才能替代本次联网检索。其他片区或数量不足的历史结果不能造成“假复用”。
      * 返回 true 表示本次检索被「历史复用抑制」跳过（未发起检索）。
      */
-    private boolean triggerWebSearchOnNoMatch(TravelState state) {
+    private boolean triggerWebSearchOnNoMatch(TravelState state, Set<Long> selectedIds, int requiredCount) {
         String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_FOOD);
         String key = "confirm:" + (req == null ? "" : req);
         if (key.equals(state.getWebSearchKey())) {
             return false;
         }
-        if (promotion != null
-                && !promotion.reusableWebRestaurants(state.getDestinationId(),
-                        java.time.LocalDateTime.now()).isEmpty()) {
-            log.info("[Food][sessionId={}] 存在可复用历史网搜店，跳过本次联网检索", state.getSessionId());
-            return true;
+        if (promotion != null) {
+            List<Restaurant> reusable = promotion.reusableWebRestaurants(state.getDestinationId(),
+                    java.time.LocalDateTime.now());
+            long eligible = reusable.stream()
+                    .filter(r -> r.getId() != null && (selectedIds == null || !selectedIds.contains(r.getId())))
+                    .filter(r -> reusableFoodEligible(state, r))
+                    .count();
+            if (eligible >= Math.max(1, requiredCount)) {
+                log.info("[Food][sessionId={}] 有 {} 家历史网搜店满足当前约束并足以补齐 {} 家缺口，跳过本次联网检索",
+                        state.getSessionId(), eligible, Math.max(1, requiredCount));
+                return true;
+            }
+            if (!reusable.isEmpty()) {
+                log.info("[Food][sessionId={}] 历史网搜店共 {} 家，但当前约束可复用 {} 家、不足补齐 {} 家缺口，继续联网检索",
+                        state.getSessionId(), reusable.size(), eligible, Math.max(1, requiredCount));
+            }
         }
         List<WebFoodCandidate> web = searchFoodsOnline(state);
         if (web != null && !web.isEmpty()) {
@@ -1274,20 +1435,51 @@ public class CandidateService {
         return false;
     }
 
-    /** 景点通道：AI 表示池内无匹配或覆盖不足时自动联网检索补充（会话内去重，语义与美食通道对称）。
-     *  存在可复用历史网搜景点时跳过本次检索（跨会话复用，避免同需求重复付费搜索；
-     *  未装配晋升组件时无此抑制，保持既有行为）。返回 true 表示本次检索被「历史复用抑制」跳过。 */
-    private boolean triggerWebSearchForAttractions(TravelState state) {
+    /** 历史网搜店是否能在本轮直接复用：沿用当前候选池的地点、餐型、硬条件与价格上限口径。 */
+    private boolean reusableFoodEligible(TravelState state, Restaurant restaurant) {
+        if (restaurant == null || !locationEligible(state, LocationConstraintSupport.FOOD,
+                restaurant.getName(), restaurant.getAddress(), restaurant.getLng(), restaurant.getLat())) {
+            return false;
+        }
+        ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
+        if (!planning.getMeal().isSnacksAllowed() && MealPolicySupport.isSnack(restaurant)) {
+            return false;
+        }
+        if (HardConstraintEvaluator.evaluate(restaurantFact(restaurant, state.getDestinationName()),
+                buildHardPolicy(state)).status() != HardConstraintEvaluator.Status.ELIGIBLE) {
+            return false;
+        }
+        BigDecimal cap = foodPriceCap(state);
+        return cap == null || restaurant.getAvgPrice() == null || restaurant.getAvgPrice().compareTo(cap) <= 0;
+    }
+
+    /**
+     * 景点通道覆盖不足时联网补充。历史结果只有在通过当前位置/硬约束、排除已选后，
+     * 数量足以补齐缺口时才可抑制新搜索，避免“一条无坐标旧记录阻断整轮检索”。
+     */
+    private boolean triggerWebSearchForAttractions(TravelState state, Set<Long> selectedIds, int requiredCount) {
         String req = channelRequest(state, CandidateChannelCoordinator.CHANNEL_ATTRACTION);
         String key = "confirm:" + (req == null ? "" : req);
         if (key.equals(state.getWebAttractionSearchKey())) {
             return false;
         }
-        if (promotion != null
-                && !promotion.reusableWebAttractions(state.getDestinationId(),
-                        java.time.LocalDateTime.now()).isEmpty()) {
-            log.info("[Attraction][sessionId={}] 存在可复用历史网搜景点，跳过本次联网检索", state.getSessionId());
-            return true;
+        if (promotion != null) {
+            List<Attraction> reusable = promotion.reusableWebAttractions(state.getDestinationId(),
+                    java.time.LocalDateTime.now());
+            long eligible = reusable.stream()
+                    .filter(a -> a.getId() != null && (selectedIds == null || !selectedIds.contains(a.getId())))
+                    .filter(a -> reusableAttractionEligible(state, a))
+                    .count();
+            int shortage = Math.max(1, requiredCount);
+            if (eligible >= shortage) {
+                log.info("[Attraction][sessionId={}] 有 {} 个历史网搜景点满足当前约束并足以补齐 {} 个缺口，跳过本次联网检索",
+                        state.getSessionId(), eligible, shortage);
+                return true;
+            }
+            if (!reusable.isEmpty()) {
+                log.info("[Attraction][sessionId={}] 历史网搜景点共 {} 个，但当前约束可复用 {} 个、不足补齐 {} 个缺口，继续联网检索",
+                        state.getSessionId(), reusable.size(), eligible, shortage);
+            }
         }
         List<WebAttractionCandidate> web = searchAttractionsOnline(state);
         if (web != null && !web.isEmpty()) {
@@ -1295,6 +1487,14 @@ public class CandidateService {
             state.setWebAttractionCandidates(web);
         }
         return false;
+    }
+
+    private boolean reusableAttractionEligible(TravelState state, Attraction attraction) {
+        return attraction != null
+                && locationEligible(state, LocationConstraintSupport.ATTRACTION,
+                attraction.getName(), attraction.getAddress(), attraction.getLng(), attraction.getLat())
+                && HardConstraintEvaluator.evaluate(attractionFact(attraction, state.getDestinationName()),
+                buildHardPolicy(state)).status() == HardConstraintEvaluator.Status.ELIGIBLE;
     }
 
     /** 酒店通道：AI 表示池内无匹配或覆盖不足时自动联网检索补充（会话内去重，语义与美食通道对称）。
@@ -1338,11 +1538,14 @@ public class CandidateService {
         try {
             String city = state.getDestinationName();
             String system = loadPrompt("prompts/search_attraction.txt");
+            String locationSummary = LocationConstraintSupport.summary(state.getLocationConstraint());
             String user = "城市：" + city
                     + "\n用户的特殊需求：" + state.getExtraRequest()
+                    + (locationSummary == null ? "" : "\n必须满足的位置范围：" + locationSummary)
                     + "\n用户偏好：" + objectMapper.writeValueAsString(state.getPreference());
             DashScopeSearchClient.SearchResult r = dashScopeSearchClient.search(system, user);
             raw = r.content();
+            String actualSearchModel = r.model() == null ? searchModel : r.model();
             int promptTokens = r.promptTokens() == null ? 0 : r.promptTokens();
             int completionTokens = r.completionTokens() == null ? 0 : r.completionTokens();
             TokenUsage searchUsage = new TokenUsage(promptTokens, completionTokens);
@@ -1370,6 +1573,12 @@ public class CandidateService {
                     // 价格缺失：保留 null，由入库校验拒绝（价格未知的景点不进知识库）
                 }
                 w.setAddress(it.path("address").asText("").trim());
+                if (it.hasNonNull("lng") && it.path("lng").isNumber()) {
+                    w.setLng(it.path("lng").asDouble());
+                }
+                if (it.hasNonNull("lat") && it.path("lat").isNumber()) {
+                    w.setLat(it.path("lat").asDouble());
+                }
                 w.setWhy(it.path("why").asText("").trim());
                 items.add(w);
             }
@@ -1386,9 +1595,9 @@ public class CandidateService {
                     + (accepted.size() < items.size() ? ",rejected=" + (items.size() - accepted.size()) : "");
             usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
                     "ATTRACTIONS", "景点联网检索", "AttractionSearchAgent", searchUsage, cost, "SUCCESS",
-                    remark, searchModel, UsageChannel.AGENT,
+                    remark, actualSearchModel, UsageChannel.AGENT,
                     UsageService.clip(raw, 2000));
-            state.addTurnUsage(searchModel, promptTokens, completionTokens, UsageChannel.AGENT);
+            state.addTurnUsage(actualSearchModel, promptTokens, completionTokens, UsageChannel.AGENT);
             return accepted.isEmpty() ? null : accepted;
         } catch (Exception e) {
             long cost = System.currentTimeMillis() - start;
@@ -1431,6 +1640,7 @@ public class CandidateService {
                     + "\n用户偏好：" + objectMapper.writeValueAsString(state.getPreference());
             DashScopeSearchClient.SearchResult r = dashScopeSearchClient.search(system, user);
             raw = r.content();
+            String actualSearchModel = r.model() == null ? searchModel : r.model();
             int promptTokens = r.promptTokens() == null ? 0 : r.promptTokens();
             int completionTokens = r.completionTokens() == null ? 0 : r.completionTokens();
             TokenUsage searchUsage = new TokenUsage(promptTokens, completionTokens);
@@ -1474,9 +1684,9 @@ public class CandidateService {
                     + (accepted.size() < items.size() ? ",rejected=" + (items.size() - accepted.size()) : "");
             usageService.recordAgent(state.getSessionId(), state.getUserId(), state.getUsername(),
                     "HOTELS", "酒店联网检索", "HotelSearchAgent", searchUsage, cost, "SUCCESS",
-                    remark, searchModel, UsageChannel.AGENT,
+                    remark, actualSearchModel, UsageChannel.AGENT,
                     UsageService.clip(raw, 2000));
-            state.addTurnUsage(searchModel, promptTokens, completionTokens, UsageChannel.AGENT);
+            state.addTurnUsage(actualSearchModel, promptTokens, completionTokens, UsageChannel.AGENT);
             return accepted.isEmpty() ? null : accepted;
         } catch (Exception e) {
             long cost = System.currentTimeMillis() - start;
@@ -1538,7 +1748,12 @@ public class CandidateService {
                 return kn.equals(norm) || (kn.length() >= 4 && norm.length() >= 4
                         && (kn.contains(norm) || norm.contains(kn)));
             });
-            List<String> reasons = WebAttractionValidator.validate(w);
+            List<String> reasons = new ArrayList<>(WebAttractionValidator.validate(w));
+            if (!LocationConstraintSupport.matches(state.getLocationConstraint(),
+                    LocationConstraintSupport.ATTRACTION, w.getName(), w.getAddress(), w.getLng(), w.getLat())) {
+                reasons.add(w.getLng() == null || w.getLat() == null
+                        ? "LOCATION_UNVERIFIABLE" : "LOCATION_OUT_OF_RANGE");
+            }
             if (!dup) {
                 // 与已入库的网搜景点再查重（同目的地同来源同名）
                 Long same = attractionMapper.selectCount(new LambdaQueryWrapper<Attraction>()
@@ -1571,6 +1786,8 @@ public class CandidateService {
             a.setIndoor(0);
             a.setStatus(1);
             a.setAddress(blankToNull(w.getAddress()));
+            a.setLng(w.getLng());
+            a.setLat(w.getLat());
             a.setSource("WEB_SEARCH");
             a.setSourceRef(state.getSessionId());
             a.setSourceNote(UsageService.clip(w.getWhy(), 200));
@@ -1962,7 +2179,7 @@ public class CandidateService {
         return all.stream().sorted(cmp).toList();
     }
 
-    private Map<String, Object> restaurantPoolItem(Restaurant r) {
+    private Map<String, Object> restaurantPoolItem(TravelState state, Restaurant r) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", r.getId());
         m.put("name", r.getName());
@@ -1971,10 +2188,12 @@ public class CandidateService {
         m.put("signatureDish", r.getSignatureDish() == null ? "" : r.getSignatureDish());
         m.put("address", r.getAddress() == null ? "" : r.getAddress());
         m.put("rating", r.getRating());
+        m.put("distanceToAnchorKm",
+                locationDistance(state, LocationConstraintSupport.FOOD, r.getLng(), r.getLat()));
         return m;
     }
 
-    private FoodCandidate.FoodItem foodItemOf(Restaurant r, Map<Long, String> mealTypes) {
+    private FoodCandidate.FoodItem foodItemOf(TravelState state, Restaurant r, Map<Long, String> mealTypes) {
         FoodCandidate.FoodItem item = new FoodCandidate.FoodItem();
         item.setRestaurantId(r.getId());
         item.setName(r.getName());
@@ -1988,6 +2207,8 @@ public class CandidateService {
         if (mealTypes != null) {
             item.setMealType(mealTypes.get(r.getId()));
         }
+        item.setDistanceToAnchor(
+                locationDistance(state, LocationConstraintSupport.FOOD, r.getLng(), r.getLat()));
         return item;
     }
 
@@ -2052,10 +2273,10 @@ public class CandidateService {
     }
 
     /** 店铺列表 → 按风味分组的候选组（保留完整信息：人均/招牌菜/氛围与餐次归类） */
-    private List<FoodCandidate> groupItems(List<Restaurant> rs, Map<Long, String> mealTypes) {
+    private List<FoodCandidate> groupItems(TravelState state, List<Restaurant> rs, Map<Long, String> mealTypes) {
         Map<String, List<FoodCandidate.FoodItem>> m = new LinkedHashMap<>();
         for (Restaurant r : rs) {
-            m.computeIfAbsent(r.getCuisine(), k -> new ArrayList<>()).add(foodItemOf(r, mealTypes));
+            m.computeIfAbsent(r.getCuisine(), k -> new ArrayList<>()).add(foodItemOf(state, r, mealTypes));
         }
         List<FoodCandidate> out = new ArrayList<>();
         for (Map.Entry<String, List<FoodCandidate.FoodItem>> e : m.entrySet()) {
@@ -2088,8 +2309,14 @@ public class CandidateService {
         Map<String, List<String>> acceptedByOrigin = new LinkedHashMap<>();
         int scanned = 0;
         int unknown = 0;
+        int locationRejected = 0;
         for (Hotel h : sorted) {
             scanned++;
+            if (!locationEligible(state, LocationConstraintSupport.HOTEL,
+                    h.getName(), h.getAddress(), h.getLng(), h.getLat())) {
+                locationRejected++;
+                continue;
+            }
             HardConstraintEvaluator.Verdict v = HardConstraintEvaluator.evaluate(hotelFact(h, city), policy);
             if (v.status() == HardConstraintEvaluator.Status.ELIGIBLE) {
                 poolEntities.add(h);
@@ -2103,7 +2330,7 @@ public class CandidateService {
         acceptedByOrigin.put("SQL", poolEntities.stream()
                 .map(h -> placeKey("HOTEL", h.getId())).toList());
         List<HotelCandidate> pool = poolEntities.stream()
-                .map(h -> hotelOf(h, center, "综合推荐")).collect(Collectors.toCollection(ArrayList::new));
+                .map(h -> hotelOf(state, h, center, "综合推荐")).collect(Collectors.toCollection(ArrayList::new));
 
         boolean aiOk = true;
         List<Hotel> finalEntities = poolEntities;
@@ -2144,9 +2371,14 @@ public class CandidateService {
                     if (finalEntities.size() >= HOTEL_POOL_FLOOR) {
                         break;
                     }
+                    if (!locationEligible(state, LocationConstraintSupport.HOTEL,
+                            w.getName(), w.getAddress(), w.getLng(), w.getLat())) {
+                        locationRejected++;
+                        continue;
+                    }
                     if (chosenIds.add(w.getId())) {
                         finalEntities.add(w);
-                        extraPool.add(hotelOf(w, center, "联网检索补充"));
+                        extraPool.add(hotelOf(state, w, center, "联网检索补充"));
                         webAccepted.add(placeKey("HOTEL", w.getId()));
                         if (promotion != null) {
                             // 晋升计数是旁路功能：任何异常都不阻断候选主流程
@@ -2181,7 +2413,7 @@ public class CandidateService {
                     }
                     if (chosenIds.add(h.getId())) {
                         finalEntities.add(h);
-                        extraPool.add(hotelOf(h, center, "综合推荐"));
+                        extraPool.add(hotelOf(state, h, center, "综合推荐"));
                         backfillAccepted.add(placeKey("HOTEL", h.getId()));
                     }
                 }
@@ -2194,7 +2426,7 @@ public class CandidateService {
                 extraPool.forEach(c -> whyById.putIfAbsent(c.getHotelId(), c));
                 pool.clear();
                 for (Hotel h : finalEntities) {
-                    pool.add(whyById.getOrDefault(h.getId(), hotelOf(h, center, "综合推荐")));
+                    pool.add(whyById.getOrDefault(h.getId(), hotelOf(state, h, center, "综合推荐")));
                 }
             } else {
                 aiOk = false;
@@ -2219,7 +2451,8 @@ public class CandidateService {
                 id -> false);
         for (HotelCandidate c : pool) {
             double bonus = hotelTagEval.bonus().getOrDefault(c.getHotelId(), 0.0);
-            c.setScore(round(scores.getOrDefault(c.getHotelId(), 0.0) + bonus));
+            c.setScore(round(scores.getOrDefault(c.getHotelId(), 0.0) + bonus
+                    + locationBonus(state, LocationConstraintSupport.HOTEL, c.getDistanceToAnchor())));
             String note = hotelTagEval.notes().get(c.getHotelId());
             if (note != null && !note.isBlank()) {
                 c.setTagNote(note);
@@ -2232,13 +2465,84 @@ public class CandidateService {
         evidence.put("scannedCount", scanned);
         evidence.put("eligibleCount", finalEntities.size());
         evidence.put("unknownCount", unknown);
+        evidence.put("locationRejectedCount", locationRejected);
         evidence.put("acceptedByOrigin", acceptedByOrigin);
+        sanitizeCandidateAdvice(state, "酒店");
         newSnapshot(state, "HOTEL",
                 finalEntities.stream().map(h -> placeKey("HOTEL", h.getId())).toList(), evidence);
         obsRecall(null, state, "HOTEL", evidence);
         nextHotelBatch(state);
+        state.rememberCandidateAdvice(CandidateChannelCoordinator.CHANNEL_HOTEL);
         log.info("[Candidate] 酒店备选池 {} 个（会话 {}，AI失败={}）", pool.size(), state.getSessionId(), !aiOk);
         return aiOk;
+    }
+
+    /**
+     * 将模型选择结果解释成可验证的推荐方法，不直接展示模型自由生成的地点名。
+     * 具体地点由 acceptedByOrigin.AI 生成结构化可点击引用；联网结果说明只保留 Java 生成的可验证后缀。
+     */
+    private static void sanitizeCandidateAdvice(TravelState state, String label) {
+        String raw = state.getCandidateAdvice();
+        String scope = adviceScope(label);
+        if ((raw == null || raw.isBlank())
+                && !LocationConstraintSupport.appliesTo(state.getLocationConstraint(), scope)) {
+            return;
+        }
+        state.setCandidateAdvice(verifiedCandidateAdvice(state, label, raw == null ? "" : raw));
+    }
+
+    /** 将旧会话中的固定模板文案也可即时升级为新的解释文案。 */
+    public static String verifiedCandidateAdvice(TravelState state, String label, String raw) {
+        List<String> allTags = state.getNeedTags() == null ? List.of() : state.getNeedTags().stream()
+                .filter(t -> t != null && !t.isBlank()).distinct().toList();
+        List<String> channelWords = switch (label) {
+            case "景点" -> List.of("景", "夜", "拍照", "打卡", "游船", "情侣", "浪漫", "文化", "户外");
+            case "餐厅" -> List.of("菜", "餐", "吃", "口味", "辣", "清淡", "小吃", "情侣", "浪漫", "氛围", "新街口");
+            case "酒店" -> List.of("酒店", "住宿", "安静", "地铁", "交通", "位置", "预算", "泳池", "亲子");
+            default -> List.of();
+        };
+        List<String> tags = allTags.stream()
+                .filter(t -> channelWords.stream().anyMatch(t::contains)).limit(5).toList();
+        if (tags.isEmpty()) {
+            tags = allTags.stream().limit(5).toList();
+        }
+        String focus = tags.isEmpty() ? "你的特殊要求" : "「" + String.join("、", tags) + "」等需求";
+        String criteria = switch (label) {
+            case "景点" -> "景点类型、游玩强度、门票成本和行程动线";
+            case "餐厅" -> "口味、人均消费、所在位置和餐次适配";
+            case "酒店" -> "住宿预算、评分、距离和设施特色";
+            default -> "需求匹配、预算和位置";
+        };
+        LocationConstraint location = state.getLocationConstraint();
+        String scope = adviceScope(label);
+        StringBuilder safe = new StringBuilder();
+        if (LocationConstraintSupport.appliesTo(location, scope)) {
+            String locationSummary = LocationConstraintSupport.summary(location);
+            if (LocationConstraint.RESOLVED.equals(location.getStatus())) {
+                safe.append("本轮先按").append(locationSummary).append("确定性过滤，再");
+            } else {
+                safe.append(locationSummary).append("，暂不将距离作为已满足条件；本轮");
+            }
+        } else {
+            safe.append("本轮");
+        }
+        safe.append("优先匹配").append(focus)
+                .append("，并综合考虑").append(criteria)
+                .append("。下方候选由 AI 从当前备选池选出，候选卡片中的推荐理由说明具体匹配点。");
+        Matcher matcher = VERIFIED_ADVICE_SUFFIX.matcher(raw);
+        while (matcher.find()) {
+            safe.append(' ').append(matcher.group(1));
+        }
+        return safe.toString();
+    }
+
+    private static String adviceScope(String label) {
+        return switch (label) {
+            case "景点" -> LocationConstraintSupport.ATTRACTION;
+            case "餐厅" -> LocationConstraintSupport.FOOD;
+            case "酒店" -> LocationConstraintSupport.HOTEL;
+            default -> "";
+        };
     }
 
     private List<Hotel> refineHotelsByAi(TravelState state, List<Hotel> poolEntities,
@@ -2246,7 +2550,7 @@ public class CandidateService {
         String raw = null;
         try {
             String poolJson = objectMapper.writeValueAsString(
-                    poolEntities.stream().map(h -> hotelPoolItem(h, center)).toList());
+                    poolEntities.stream().map(h -> hotelPoolItem(state, h, center)).toList());
             String prefJson = prefJson(state, request);
             Traced<String> traced = withTrace(state, "HotelAgent", "酒店AI重筛",
                     () -> hotelAgent.select(poolJson, prefJson));
@@ -2277,7 +2581,7 @@ public class CandidateService {
                     log.warn("酒店候选 AI 输出项 {} 未通过硬过滤（{}），已剔除", h.getId(), v.reasonCode());
                     continue;
                 }
-                refined.add(hotelOf(h, center,
+                refined.add(hotelOf(state, h, center,
                         c.getWhy() == null || c.getWhy().isBlank() ? "AI 推荐" : c.getWhy()));
                 refinedEntities.add(h);
                 if (refined.size() >= LLM_SELECT_MAX) {
@@ -2369,7 +2673,7 @@ public class CandidateService {
         };
     }
 
-    private Map<String, Object> hotelPoolItem(Hotel h, double[] center) {
+    private Map<String, Object> hotelPoolItem(TravelState state, Hotel h, double[] center) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", h.getId());
         m.put("name", h.getName());
@@ -2378,10 +2682,13 @@ public class CandidateService {
         m.put("level", h.getLevel());
         m.put("distanceKm", round(GeoUtils.distanceKm(center[0], center[1], h.getLng(), h.getLat())));
         m.put("features", h.getFeatures() == null ? "" : h.getFeatures());
+        m.put("address", h.getAddress() == null ? "" : h.getAddress());
+        m.put("distanceToAnchorKm",
+                locationDistance(state, LocationConstraintSupport.HOTEL, h.getLng(), h.getLat()));
         return m;
     }
 
-    private HotelCandidate hotelOf(Hotel h, double[] center, String why) {
+    private HotelCandidate hotelOf(TravelState state, Hotel h, double[] center, String why) {
         HotelCandidate c = new HotelCandidate();
         c.setHotelId(h.getId());
         c.setName(h.getName());
@@ -2391,6 +2698,8 @@ public class CandidateService {
         c.setFeature(h.getFeatures());
         c.setTags(h.getTags());
         c.setWhy(why);
+        c.setDistanceToAnchor(
+                locationDistance(state, LocationConstraintSupport.HOTEL, h.getLng(), h.getLat()));
         return c;
     }
 
@@ -2400,6 +2709,27 @@ public class CandidateService {
             return null;
         }
         return round(GeoUtils.distanceKm(center[0], center[1], lng, lat));
+    }
+
+    private static boolean locationEligible(TravelState state, String scope, String name, String address,
+                                            Double lng, Double lat) {
+        return LocationConstraintSupport.matches(
+                state == null ? null : state.getLocationConstraint(), scope, name, address, lng, lat);
+    }
+
+    private static Double locationDistance(TravelState state, String scope, Double lng, Double lat) {
+        return LocationConstraintSupport.distanceKm(
+                state == null ? null : state.getLocationConstraint(), scope, lng, lat);
+    }
+
+    /** 距离锚点越近，加分越高（最高 +1）；范围过滤仍是独立硬条件。 */
+    private static double locationBonus(TravelState state, String scope, Double distanceKm) {
+        LocationConstraint c = state == null ? null : state.getLocationConstraint();
+        if (distanceKm == null || !LocationConstraintSupport.appliesTo(c, scope)
+                || !LocationConstraint.RESOLVED.equals(c.getStatus()) || c.getRadiusKm() <= 0) {
+            return 0;
+        }
+        return Math.max(0, 1 - distanceKm / c.getRadiusKm());
     }
 
     private double round(double v) {

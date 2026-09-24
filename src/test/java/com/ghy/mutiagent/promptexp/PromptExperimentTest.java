@@ -9,6 +9,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.openai.OpenAiChatRequestParameters;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
@@ -32,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  * O3 Prompt 对比实验（before/after 同输入同模型）。
  *
  * 使用方式（真实模型，需环境变量 QWEN_API_KEY，仅走环境变量）：
- *   mvn -Dtest=PromptExperimentTest test
+ *   mvn -Dtest=PromptExperimentTest -Dprompt.exp.live=true test
  *     -Dprompt.exp.dir=<Prompt目录>      # arm 差异来源：基线=experiments/EXP-O3-PROMPT/prompts-baseline
  *     -Dprompt.exp.case=A1|A2|B         # 单用例运行（每次调用约 1~5 分钟，建议分次跑）
  *     -Dprompt.exp.repeat=0|1|2         # 单次重复
@@ -114,6 +115,9 @@ class PromptExperimentTest {
     @Test
     void promptExperiment() throws Exception {
         boolean stub = Boolean.parseBoolean(System.getProperty("prompt.exp.stub", "false"));
+        boolean live = Boolean.parseBoolean(System.getProperty("prompt.exp.live", "false"));
+        Assumptions.assumeTrue(stub || live,
+                "跳过：Prompt 实验默认关闭；真实实验需显式传 -Dprompt.exp.live=true，管道烟测传 -Dprompt.exp.stub=true");
         String key = System.getenv("QWEN_API_KEY");
         if (!stub) {
             Assumptions.assumeTrue(key != null && !key.isBlank(),
@@ -132,15 +136,20 @@ class PromptExperimentTest {
         String bundleHash = promptBundleHash(dir, List.of("common-format.txt", "itinerary.txt", "food.txt"));
         String arm = System.getProperty("prompt.exp.arm",
                 dir.toAbsolutePath().toString().contains("prompts-baseline") ? "before" : "after");
+        String reasoningEffort = envOr("QWEN_EXP_REASONING_EFFORT", "none");
 
         ChatModel sqlModel = stub ? null : OpenAiChatModel.builder()
                 .baseUrl(envOr("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"))
                 .apiKey(key)
                 // 成本控制：默认用低价模型跑对比实验（两臂同模型，归因不受影响）；
                 // 如需换模型：环境变量 QWEN_EXP_MODEL_SQL / QWEN_EXP_MODEL_DEFAULT 覆盖
-                .modelName(envOr("QWEN_EXP_MODEL_SQL", "qwen3.7-flash"))
+                // 评测直接创建单一物理模型，不经过生产 FailoverChatModel；使用带日期版本防止别名漂移。
+                .modelName(envOr("QWEN_EXP_MODEL_SQL", "qwen3.8-27b"))
+                .defaultRequestParameters(OpenAiChatRequestParameters.builder()
+                        .reasoningEffort(reasoningEffort)
+                        .build())
                 .temperature(0.1)
-                .maxTokens(2048)
+                .maxTokens(1024)
                 .timeout(Duration.ofSeconds(300))
                 .maxRetries(0)
                 .responseFormat("json_object")
@@ -148,7 +157,7 @@ class PromptExperimentTest {
         ChatModel flashModel = stub ? null : OpenAiChatModel.builder()
                 .baseUrl(envOr("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"))
                 .apiKey(key)
-                .modelName(envOr("QWEN_EXP_MODEL_DEFAULT", "qwen3.7-flash"))
+                .modelName(envOr("QWEN_EXP_MODEL_DEFAULT", "qwen3.7-flash-2026-07-15"))
                 .temperature(0.2)
                 .maxTokens(2048)
                 .timeout(Duration.ofSeconds(180))
@@ -158,33 +167,34 @@ class PromptExperimentTest {
 
         Path runs = Path.of(outDir).resolve("runs.jsonl");
         Files.createDirectories(runs.getParent());
-        String mainModel = envOr("QWEN_EXP_MODEL_SQL", "qwen3.7-flash");
-        String candModel = envOr("QWEN_EXP_MODEL_DEFAULT", "qwen3.7-flash");
+        String mainModel = envOr("QWEN_EXP_MODEL_SQL", "qwen3.8-27b");
+        String candModel = envOr("QWEN_EXP_MODEL_DEFAULT", "qwen3.7-flash-2026-07-15");
         for (int r = 0; r < 3; r++) {
             if (onlyRepeat >= 0 && onlyRepeat != r) {
                 continue;
             }
             if (onlyCase.equals("ALL") || onlyCase.equals("A1")) {
                 runCase("A1", arm, bundleHash, r, stub, mainModel, sqlModel,
-                        itinerary, itineraryUser("A1", rules("A1")), runs);
+                        reasoningEffort, itinerary, itineraryUser("A1", rules("A1")), runs);
             }
             if (onlyCase.equals("ALL") || onlyCase.equals("A2")) {
                 runCase("A2", arm, bundleHash, r, stub, mainModel, sqlModel,
-                        itinerary, itineraryUser("A2", rules("A2")), runs);
+                        reasoningEffort, itinerary, itineraryUser("A2", rules("A2")), runs);
             }
             if (onlyCase.equals("ALL") || onlyCase.equals("A3")) {
                 runCase("A3", arm, bundleHash, r, stub, mainModel, sqlModel,
-                        itinerary, itineraryUser("A3", rules("A3")), runs);
+                        reasoningEffort, itinerary, itineraryUser("A3", rules("A3")), runs);
             }
             if (onlyCase.equals("ALL") || onlyCase.equals("B")) {
                 runCase("B", arm, bundleHash, r, stub, candModel, flashModel,
-                        common + "\n\n" + food, foodUser(), runs);
+                        null, common + "\n\n" + food, foodUser(), runs);
             }
         }
     }
 
     private void runCase(String caseId, String arm, String bundleHash, int repeat, boolean stub,
-                         String modelName, ChatModel model, String system, String user, Path runs)
+                         String modelName, ChatModel model, String reasoningEffort,
+                         String system, String user, Path runs)
             throws Exception {
         String content;
         long durationMs;
@@ -216,6 +226,7 @@ class PromptExperimentTest {
         row.put("caseId", caseId);
         row.put("repeatIndex", repeat);
         row.put("model", modelName);
+        row.put("reasoningEffort", reasoningEffort);
         row.put("promptBundleHash", bundleHash);
         row.put("systemChars", system.length());
         row.put("userChars", user.length());
@@ -236,21 +247,16 @@ class PromptExperimentTest {
     // ---------------- 消息组装（镜像生产） ----------------
 
     private String itineraryUser(String caseId, String rules) throws Exception {
-        TravelPreference p = new TravelPreference();
-        p.setDays(1);
-        p.setTotalBudget(new BigDecimal("3000"));
-        p.setPeopleCount(2);
-        p.setFoodTaste("本地特色菜");
-        p.setAttractionType("打卡拍照");
-        p.setEnergyLevel("中等");
-        String pref = JSON.writeValueAsString(p);
+        String pref = JSON.writeValueAsString(Map.of(
+                "days", 1, "energyLevel", "中等", "activityBias", "BALANCED",
+                "nightPlan", "ONE", "returnDeadline", "22:00"));
         String attr = JSON.writeValueAsString("A3".equals(caseId) ? ATTRACTIONS_NIGHT : ATTRACTIONS);
         String food = JSON.writeValueAsString(RESTAURANTS);
         String hotel = JSON.writeValueAsString(List.of());
-        return "用户偏好：" + pref
-                + "\n\n可选景点（只可用其中 id）：" + attr
-                + "\n\n可选美食：" + food
-                + "\n\n酒店：" + hotel
+        return "规划偏好：" + pref
+                + "\n\n已确认景点（必须全部安排，只可用其中 id）：" + attr
+                + "\n\n已确认餐厅（只可用其中 id）：" + food
+                + "\n\n住宿锚点（仅辅助判断片区，不要输出）：" + hotel
                 + "\n\n规则要求：" + rules
                 + "\n\n输出格式：json";
     }
@@ -268,40 +274,28 @@ class PromptExperimentTest {
                 + "\n\n目标数量：6 家左右\n\n输出格式：json";
     }
 
-    /** 镜像 ItineraryService.buildRules（基线 commit 版本；两臂共用，不是实验变量） */
+    /** 镜像 ItineraryService.buildRules：只传影响分天、顺序与餐次的动态规则。 */
     private String rules(String caseId) throws Exception {
         StringBuilder sb = new StringBuilder();
-        sb.append("- 共 1 天；首日以 transport 节点启程（抵达），末日以 transport 节点返程。\n");
-        sb.append("- 用户不需要酒店：不要安排 hotel 节点，住宿费用按 0 计；每天以当日首个景点为起点和终点。\n");
-        sb.append("- 用户已确认的景点必须全部安排进行程（缺一不可）；只有受硬约束（开放时间、劳累度上限）确实无法安排时才能少排，且必须在当天的 theme 或相应 note 中写明原因，不得静默遗漏。\n");
-        sb.append("- 每天 11:30-13:30 之间安排 1 个 restaurant 节点（午餐），17:30-19:30 之间安排 1 个 restaurant 节点（晚餐），各至多 1 个、不得多排；车程中不安排用餐；同一餐厅一天最多出现 1 次（午餐用过的店不能再当晚餐）。\n");
-        sb.append("- 带「夜景」标签的景点安排在 18:30 之后（晚餐后最佳），不得排到白天；确需白天安排时必须在 note 写明理由。\n");
-        sb.append("- 晚餐结束后仍可安排 1-2 个夜景/娱乐节点（酒吧、夜市、夜游等）；返程 transport 必须是当天最后一个节点，时间为最后活动结束后。\n");
-        if ("A3".equals(caseId)) {
-            sb.append("- 每晚 22:00 前回到家：当天最后一个活动必须在 22:00 前结束，返程 transport 时间不得晚于 22:00。\n");
-        }
-        sb.append("- 景点时段分配：上午1个、下午1个、晚上1个\n");
-        sb.append("- 夜景时段只安排 1 个夜景景点：「")
-                .append("A3".equals(caseId) ? "金鸡湖景区" : "金鸡湖月光码头")
-                .append("」（夜景系数最高）；其余夜景标签景点白天安排或在 note 说明原因。\n");
-        sb.append("- 高强度景点与低强度景点错开安排；如某天安排较满，可插入 1 个 rest 节点（候选休息点：）。\n");
-        sb.append("- 全程预算约 3000 元，2 人：餐费按人均价×人数计算，餐饮+门票+交通合计不得超过预算；超预算时优先选择人均价更低的餐厅。");
+        sb.append("- 共 1 天，只决定 attraction/restaurant 的分天与先后顺序。\n");
+        sb.append("- 已确认景点必须全部且各输出一次，不能遗漏。\n");
+        sb.append("- 餐次策略：每天恰好1顿午餐；每天恰好1顿晚餐；restaurant.note 只能写午餐或晚餐，同一餐厅全程最多一次。\n");
+        sb.append("- 分配倾向：上午1个、下午1个、晚上1个；openTime 早结束的景点优先，夜景标签景点排在晚餐之后。\n");
+        sb.append("- 晚餐后只保留 1 个夜景景点，优先 id=")
+                .append("A3".equals(caseId) ? 26 : 43).append("。\n");
         if ("A2".equals(caseId)) {
             String original = JSON.writeValueAsString(Map.of("days", List.of(Map.of(
                     "dayIndex", 1, "theme", "园区浪漫打卡", "nodes", List.of(
-                            Map.of("type", "transport", "time", "09:00", "note", "抵达苏州"),
-                            Map.of("type", "attraction", "placeId", 43, "time", "09:30", "note", "湖畔打卡"),
-                            Map.of("type", "restaurant", "placeId", 17, "time", "11:30", "note", "午餐"),
-                            Map.of("type", "attraction", "placeId", 38, "time", "13:15", "note", "街区拍照"),
-                            Map.of("type", "restaurant", "placeId", 22, "time", "17:30", "note", "晚餐"),
-                            Map.of("type", "transport", "time", "20:00", "note", "返程"))))));
+                            Map.of("type", "attraction", "placeId", 43),
+                            Map.of("type", "restaurant", "placeId", 17, "note", "午餐"),
+                            Map.of("type", "attraction", "placeId", 38),
+                            Map.of("type", "restaurant", "placeId", 22, "note", "晚餐"),
+                            Map.of("type", "attraction", "placeId", 24))))));
             sb.append("\n\n【用户调整诉求与原行程】\n")
-                    .append("用户调整诉求：我要21:30返程\n\n原行程：").append(original)
-                    .append("\n请在原行程基础上做局部调整（其余天数保持不变或仅微调），并同样遵守以上规则。")
-                    .append("如果调整诉求改变的是时间窗口（如返程时间推迟或提前），必须综合重排当天的节点时间与停留时长：")
-                    .append("把多出的时间合理分配给各节点（延长停留、更从容的用餐），并优先补回此前未安排的已选景点；不要只改动一个节点。");
+                    .append("用户调整诉求：把平江路历史街区放在第一站\n\n原行程：").append(original)
+                    .append("\n只调整涉及的地点顺序，仍只输出决策骨架；其他内容保持原顺序。");
         }
-        return sb.toString();
+        return sb.toString().trim();
     }
 
     // ---------------- 判据（确定性，两臂一致） ----------------
@@ -353,47 +347,36 @@ class PromptExperimentTest {
             c.put("adviceNonEmpty", !node.path("advice").asText("").isBlank());
             return c;
         }
-        // A1 / A2 行程判据
+        // A1 / A2 / A3：规划 Agent 只输出决策节点，时间与基础设施由 Java 补齐。
         JsonNode days = node.path("days");
         boolean oneDay = days.isArray() && days.size() == 1;
         List<Long> attractionIds = new ArrayList<>();
-        boolean firstTransport = false;
-        boolean lastTransport = false;
         boolean lunch = false;
         boolean dinner = false;
         int lunchCount = 0;
         int dinnerCount = 0;
-        String nightTime = null;
         long nightSpotId = "A3".equals(caseId) ? 26L : 43L;
-        String lastTime = "";
-        int nightCount = 0;
-        List<String> allTimes = new ArrayList<>();
+        int dinnerIndex = -1;
+        int preferredNightIndex = -1;
+        int infrastructureNodes = 0;
+        int nodesWithTime = 0;
         if (oneDay && days.get(0).path("nodes").isArray()) {
             JsonNode nodes = days.get(0).path("nodes");
             for (int i = 0; i < nodes.size(); i++) {
                 JsonNode n = nodes.get(i);
                 String type = n.path("type").asText("");
-                String time = n.path("time").asText("");
                 String note = n.path("note").asText("");
-                if (!time.isEmpty()) {
-                    allTimes.add(time);
+                if (n.hasNonNull("time")) {
+                    nodesWithTime++;
                 }
-                if (i == 0 && "transport".equals(type)) {
-                    firstTransport = true;
-                }
-                if ("transport".equals(type)) {
-                    lastTransport = i == nodes.size() - 1;
-                    lastTime = time;
+                if ("transport".equals(type) || "hotel".equals(type) || "rest".equals(type)) {
+                    infrastructureNodes++;
                 }
                 if ("attraction".equals(type) && n.path("placeId").isNumber()) {
                     long pid = n.path("placeId").asLong();
                     attractionIds.add(pid);
                     if (pid == nightSpotId) {
-                        nightTime = time;
-                    }
-                    // A3：43/26 都带夜景标签，统计排到 18:30 后的数量（只看 1 个 → ≤1）
-                    if ((pid == 43L || pid == 26L) && time.compareTo("18:30") >= 0) {
-                        nightCount++;
+                        preferredNightIndex = i;
                     }
                 }
                 if ("restaurant".equals(type)) {
@@ -404,35 +387,24 @@ class PromptExperimentTest {
                     if (note.contains("晚餐")) {
                         dinner = true;
                         dinnerCount++;
+                        dinnerIndex = i;
                     }
                 }
             }
         }
         c.put("oneDay", oneDay);
-        c.put("firstTransport", firstTransport);
-        c.put("lastTransport", lastTransport);
+        c.put("decisionOnly", infrastructureNodes == 0 && nodesWithTime == 0);
+        c.put("infrastructureNodes", infrastructureNodes);
+        c.put("nodesWithTime", nodesWithTime);
         c.put("allThreeAttractions", attractionIds.containsAll("A3".equals(caseId)
                 ? List.of(43L, 26L, 38L) : List.of(43L, 38L, 24L)));
         c.put("lunchPresent", lunch);
         c.put("dinnerPresent", dinner);
         c.put("lunchCount", lunchCount);
         c.put("dinnerCount", dinnerCount);
-        if ("A3".equals(caseId)) {
-            // 只看 1 个夜景：夜晚（18:30 后）恰有 1 个夜景标签景点
-            c.put("nightTimingOk", nightCount == 1);
-            c.put("nightInEvening", nightCount >= 1);
-        } else {
-            // 指定夜景主角（43 月光码头）若被安排，必须在 18:30 之后；未安排时为 null（不作判定）
-            c.put("nightTimingOk", nightTime == null ? null : nightTime.compareTo("18:30") >= 0);
-        }
-        // 时间越界（26:30 类事故）：所有节点 time 必须小于 24:00
-        c.put("noTimePast2400", allTimes.stream().allMatch(t -> t.compareTo("24:00") < 0));
-        if ("A3".equals(caseId)) {
-            c.put("returnAtMost2200", lastTime.compareTo("22:00") <= 0);
-            c.put("nightCountOk", nightCount <= 1);
-        }
+        c.put("preferredNightAfterDinner", preferredNightIndex > dinnerIndex && dinnerIndex >= 0);
         if ("A2".equals(caseId)) {
-            c.put("returnAtLeast2130", lastTime.compareTo("21:30") >= 0);
+            c.put("requestedFirstAttraction", !attractionIds.isEmpty() && attractionIds.get(0) == 24L);
         }
         return c;
     }
@@ -441,15 +413,14 @@ class PromptExperimentTest {
         if ("B".equals(caseId)) {
             return "{\"items\":[{\"restaurantId\":1},{\"restaurantId\":2}],\"advice\":\"园区店有限，建议扩大范围\"}";
         }
-        String lastTime = "A2".equals(caseId) ? "21:30" : "A3".equals(caseId) ? "22:00" : "20:00";
+        long first = "A3".equals(caseId) ? 43L : 24L;
+        long last = "A3".equals(caseId) ? 26L : 43L;
         return "{\"days\":[{\"dayIndex\":1,\"theme\":\"园区浪漫打卡\",\"nodes\":["
-                + "{\"type\":\"transport\",\"time\":\"09:00\",\"note\":\"抵达苏州\"},"
-                + "{\"type\":\"attraction\",\"placeId\":43,\"time\":\"09:30\",\"note\":\"湖畔打卡\"},"
-                + "{\"type\":\"restaurant\",\"placeId\":17,\"time\":\"11:30\",\"note\":\"午餐\"},"
-                + "{\"type\":\"attraction\",\"placeId\":38,\"time\":\"13:15\",\"note\":\"街区拍照\"},"
-                + "{\"type\":\"attraction\",\"placeId\":24,\"time\":\"15:30\",\"note\":\"古城漫步\"},"
-                + "{\"type\":\"restaurant\",\"placeId\":22,\"time\":\"17:30\",\"note\":\"晚餐\"},"
-                + "{\"type\":\"transport\",\"time\":\"" + lastTime + "\",\"note\":\"返程\"}]}]}";
+                + "{\"type\":\"attraction\",\"placeId\":" + first + "},"
+                + "{\"type\":\"restaurant\",\"placeId\":17,\"note\":\"午餐\"},"
+                + "{\"type\":\"attraction\",\"placeId\":38},"
+                + "{\"type\":\"restaurant\",\"placeId\":22,\"note\":\"晚餐\"},"
+                + "{\"type\":\"attraction\",\"placeId\":" + last + "}]}]}";
     }
 
     // ---------------- 工具 ----------------

@@ -38,6 +38,10 @@ public class ChatStepResult {
     private RequirementFulfillmentReport requirementFulfillmentReport;
     /** Agent 针对用户特殊要求给出的「推荐方法」建议文本 */
     private String candidateAdvice;
+    /** 当前页面中由 AI 选出的真实候选；前端可点击后直接勾选对应候选项。 */
+    private List<CandidateAdviceRef> candidateAdviceRefs;
+    /** 当前候选池是否还有未展示条目；false 时前端隐藏“换一批”。 */
+    private Boolean candidateHasMore;
     /**
      * S07：本轮结果状态。NEEDS_CONFIRMATION = 锁定项与新约束冲突（或存在其他需用户裁决的阻断），
      * 未提交任何结果；其余流程为 null。
@@ -53,6 +57,8 @@ public class ChatStepResult {
     private Boolean pendingBudgetConfirm;
     /** 预算超支待确认的超支金额（展示文案用） */
     private java.math.BigDecimal pendingBudgetOver;
+    /** 预算待确认草稿中除预算外的发布阻断；非空时不得直接发布。 */
+    private List<String> pendingPlanIssues;
     /** 行程偏好问卷（PLAN_QUIZ 阶段；为 null 表示本步不涉及问卷） */
     private PlanQuiz planQuiz;
     /** 候选通道就绪状态（并行预热）：channel → READY/RUNNING（未开启并行时为 null，前端忽略） */

@@ -30,6 +30,9 @@ public class CandidateChannelCoordinator {
     public static final String STATUS_READY = "READY";
     /** 用户明确不需要该通道；它与 READY 一样是终态，但没有候选结果。 */
     public static final String STATUS_SKIPPED = "SKIPPED";
+    /** 后台预生成或缓存落盘失败；进入该阶段时走同步懒加载。 */
+    public static final String STATUS_FALLBACK = "FALLBACK";
+    public static final String STATUS_RUNNING = "RUNNING";
 
     private static final Logger log = LoggerFactory.getLogger(CandidateChannelCoordinator.class);
     private static final Duration TTL = Duration.ofMinutes(30);
@@ -87,15 +90,17 @@ public class CandidateChannelCoordinator {
     }
 
     /** 写入通道结果（幂等覆盖；TTL 与就绪标记一致） */
-    public void putResult(String sessionId, String channel, Object payload) {
+    public boolean putResult(String sessionId, String channel, Object payload) {
         if (redis == null || sessionId == null || channel == null || payload == null) {
-            return;
+            return false;
         }
         try {
             redis.opsForValue().set(String.format(RESULT_KEY, sessionId, channel),
                     objectMapper.writeValueAsString(payload), TTL);
+            return true;
         } catch (Exception e) {
             log.warn("通道结果缓存写入失败（{}），降级为懒加载", e.getClass().getSimpleName());
+            return false;
         }
     }
 

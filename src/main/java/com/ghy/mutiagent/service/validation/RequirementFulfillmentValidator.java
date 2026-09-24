@@ -42,8 +42,11 @@ public final class RequirementFulfillmentValidator {
             return report;
         }
         if (!policy.getMeal().isNoFood()) {
-            addMealResult(report, plan, policy.getMeal().getLunch(), restaurants);
-            addMealResult(report, plan, policy.getMeal().getDinner(), restaurants);
+            boolean snackCanFillWindow = policy.getMeal().isExplicitMealComposition();
+            addMealResult(report, plan, policy.getMeal().getLunch(), restaurants, snackCanFillWindow);
+            addMealResult(report, plan, policy.getMeal().getDinner(), restaurants, snackCanFillWindow);
+            addMealKindResult(report, plan, policy.getMeal().getSnack(), restaurants, true);
+            addMealKindResult(report, plan, policy.getMeal().getMainMeal(), restaurants, false);
         } else {
             RequirementFulfillmentResult noFood = base("POLICY-NO-FOOD", 1, "HARD",
                     RequirementSubject.NO_FOOD, RequirementOperator.FORBID, 0,
@@ -107,7 +110,8 @@ public final class RequirementFulfillmentValidator {
 
     private static void addMealResult(RequirementFulfillmentReport report, ItineraryPlan plan,
                                       ResolvedPlanningPolicy.MealRule rule,
-                                      Map<Long, Restaurant> restaurants) {
+                                      Map<Long, Restaurant> restaurants,
+                                      boolean snackCanFillWindow) {
         if (rule == null) {
             return;
         }
@@ -130,7 +134,7 @@ public final class RequirementFulfillmentValidator {
                         unknownFact = true;
                         continue;
                     }
-                    if (MealPolicySupport.isSnack(restaurant)) {
+                    if (!snackCanFillWindow && MealPolicySupport.isSnack(restaurant)) {
                         continue;
                     }
                     count++;
@@ -156,6 +160,61 @@ public final class RequirementFulfillmentValidator {
         } else {
             result.setStatus(FulfillmentStatus.VIOLATED);
             result.setReasonCode("MEAL_COUNT_MISMATCH");
+        }
+        report.getResults().add(result);
+    }
+
+    /** 验收餐食组成；它与午餐/晚餐时间窗分开计数。 */
+    private static void addMealKindResult(RequirementFulfillmentReport report, ItineraryPlan plan,
+                                          ResolvedPlanningPolicy.MealRule rule,
+                                          Map<Long, Restaurant> restaurants,
+                                          boolean expectSnack) {
+        if (rule == null) {
+            return;
+        }
+        RequirementFulfillmentResult result = base(rule.getRequirementId(), rule.getRequirementRevision(),
+                rule.getHardness(), rule.getSubject(), rule.getOperator(), rule.getCount(),
+                RequirementUnit.MEAL_OCCASION, rule.getScope());
+        List<Integer> counts = new ArrayList<>();
+        boolean unknownFact = false;
+        for (DailyPlan day : plan.getDays()) {
+            int count = 0;
+            if (day.getNodes() != null) {
+                for (int i = 0; i < day.getNodes().size(); i++) {
+                    PlanNode node = day.getNodes().get(i);
+                    if (!"restaurant".equals(node.getType())) {
+                        continue;
+                    }
+                    Restaurant restaurant = node.getPlaceId() == null || restaurants == null
+                            ? null : restaurants.get(node.getPlaceId());
+                    if (restaurant == null) {
+                        unknownFact = true;
+                        continue;
+                    }
+                    if (MealPolicySupport.isSnack(restaurant) != expectSnack) {
+                        continue;
+                    }
+                    count++;
+                    result.getNodeIds().add(MealPolicySupport.evidenceNodeId(day, node, i));
+                    result.getFactIds().add("restaurant:" + restaurant.getId());
+                }
+            }
+            counts.add(count);
+            result.getActual().put("day-" + day.getDayIndex(), count);
+        }
+        int total = counts.stream().mapToInt(Integer::intValue).sum();
+        result.getActual().put("trip", total);
+        boolean satisfied = rule.getScope() == RequirementScope.PER_DAY
+                ? counts.stream().allMatch(v -> compare(v, rule.getCount(), rule.getOperator()))
+                : compare(total, rule.getCount(), rule.getOperator());
+        if (satisfied) {
+            result.setStatus(FulfillmentStatus.SATISFIED);
+        } else if (unknownFact) {
+            result.setStatus(FulfillmentStatus.UNVERIFIABLE);
+            result.setReasonCode("RESTAURANT_FACT_MISSING");
+        } else {
+            result.setStatus(FulfillmentStatus.VIOLATED);
+            result.setReasonCode(expectSnack ? "SNACK_COUNT_MISMATCH" : "MAIN_MEAL_COUNT_MISMATCH");
         }
         report.getResults().add(result);
     }

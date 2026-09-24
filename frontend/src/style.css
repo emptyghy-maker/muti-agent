@@ -132,6 +132,13 @@ h3 { font-size: 15px; margin: 0 0 8px; }
   border-radius: 8px; padding: 10px 12px; margin: 10px 0;
   font-size: 13px; line-height: 1.7; white-space: pre-wrap;
 }
+.advice-links { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 7px; }
+.advice-link {
+  border: 1px solid #d6b656; background: #fff; color: #6b5200; border-radius: 14px;
+  padding: 3px 9px; cursor: pointer; font-size: 12px;
+}
+.advice-link:hover { background: #fff4bf; }
+.issue-list { margin: 8px 0 0 18px; color: #b42318; font-size: 13px; }
 
 .tb { width: 100%; border-collapse: collapse; font-size: 12px; }.tb th, .tb td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; }
 .tb th { color: #888; font-weight: 500; }

@@ -109,6 +109,49 @@ class O2RequirementFulfillmentValidatorTest {
     }
 
     @Test
+    void 明确一顿小吃一顿正餐时小吃可以占午餐时间窗并分别验收() {
+        TravelState state = policyState("饭店要一顿小吃一顿正餐", 1);
+        ItineraryPlan plan = plan(day(1,
+                meal(9L, "12:00", "午餐"),
+                meal(2L, "18:00", "晚餐")));
+
+        RequirementFulfillmentReport report = RequirementFulfillmentValidator.validate(plan,
+                PlanningPolicyResolver.resolve(state), state.getRequirementSnapshot(), 1,
+                Map.of(9L, restaurant(9L, "特色小吃"), 2L, restaurant(2L, "火锅")));
+
+        assertThat(report.hardRequirementsSatisfied()).isTrue();
+        assertThat(report.getResults())
+                .filteredOn(r -> r.getSubject() == com.ghy.mutiagent.model.requirement.RequirementSubject.SNACK)
+                .singleElement().satisfies(r -> assertThat(r.getActual()).containsEntry("trip", 1));
+        assertThat(report.getResults())
+                .filteredOn(r -> r.getSubject() == com.ghy.mutiagent.model.requirement.RequirementSubject.MAIN_MEAL)
+                .singleElement().satisfies(r -> assertThat(r.getActual()).containsEntry("trip", 1));
+    }
+
+    @Test
+    void 餐食组成不满足时分别指出小吃和正餐数量问题() {
+        TravelState state = policyState("饭店要一顿小吃一顿正餐", 1);
+        ItineraryPlan plan = plan(day(1,
+                meal(1L, "12:00", "午餐"),
+                meal(2L, "18:00", "晚餐")));
+
+        RequirementFulfillmentReport report = RequirementFulfillmentValidator.validate(plan,
+                PlanningPolicyResolver.resolve(state), state.getRequirementSnapshot(), 1,
+                Map.of(1L, restaurant(1L, "本地菜"), 2L, restaurant(2L, "火锅")));
+
+        assertThat(report.hardRequirementsSatisfied()).isFalse();
+        assertThat(report.getResults()).anySatisfy(r -> {
+            assertThat(r.getSubject()).isEqualTo(
+                    com.ghy.mutiagent.model.requirement.RequirementSubject.SNACK);
+            assertThat(r.getReasonCode()).isEqualTo("SNACK_COUNT_MISMATCH");
+        }).anySatisfy(r -> {
+            assertThat(r.getSubject()).isEqualTo(
+                    com.ghy.mutiagent.model.requirement.RequirementSubject.MAIN_MEAL);
+            assertThat(r.getReasonCode()).isEqualTo("MAIN_MEAL_COUNT_MISMATCH");
+        });
+    }
+
+    @Test
     void O2_T09_餐饮自理不会被默认餐次补回() {
         TravelState state = new TravelState();
         state.setSessionId("o2-no-food");

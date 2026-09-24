@@ -5,6 +5,7 @@ import com.ghy.mutiagent.agent.AttractionAgent;
 import com.ghy.mutiagent.agent.FoodAgent;
 import com.ghy.mutiagent.agent.HotelAgent;
 import com.ghy.mutiagent.config.CandidateFoodConfig;
+import com.ghy.mutiagent.model.LocationConstraint;
 import com.ghy.mutiagent.model.TravelPreference;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.enums.TravelStage;
@@ -307,5 +308,51 @@ class WebAttractionHotelExpansionTest {
         verify(searchClient, times(2)).search(anyString(), anyString());
         // 失败时 advice 如实提示，不假装列表已扩充
         assertThat(st.getCandidateAdvice()).contains("联网检索暂不可用");
+    }
+
+    @Test
+    void 无坐标历史景点不能阻断当前位置不足时的新搜索() throws Exception {
+        FoodPromotionService promotion = mock(FoodPromotionService.class);
+        Attraction history = new Attraction();
+        history.setId(900L);
+        history.setDestinationId(1L);
+        history.setName("新街口德基广场");
+        history.setCategory("商场/打卡点");
+        history.setFeatures("网红,打卡");
+        history.setTags("网红,打卡");
+        history.setTicketPrice(BigDecimal.ZERO);
+        history.setAddress("秦淮区新街口商圈");
+        history.setSource("WEB_SEARCH");
+        history.setStatus(1);
+        when(promotion.reusableWebAttractions(any(), any())).thenReturn(List.of(history));
+        ReflectionTestUtils.setField(svc, "promotion", promotion);
+
+        when(attractionAgent.select(anyString(), anyString(), anyInt())).thenReturn(
+                Result.<String>builder().content("{\"items\":[],\"advice\":\"当前范围候选不足\"}")
+                        .tokenUsage(new TokenUsage(1, 1)).build());
+        when(searchClient.search(anyString(), anyString())).thenReturn(
+                new DashScopeSearchClient.SearchResult(
+                        "{\"items\":[{\"name\":\"三牌楼文化街区\",\"category\":\"打卡拍照\"," +
+                                "\"tags\":\"街区,情侣,打卡\",\"ticketPrice\":0," +
+                                "\"address\":\"鼓楼区三牌楼大街\",\"lng\":118.771," +
+                                "\"lat\":32.082,\"why\":\"靠近三牌楼校区，适合散步拍照\"}]}",
+                        100, 50));
+
+        TravelState st = state();
+        st.setDestinationName("南京");
+        LocationConstraint location = new LocationConstraint();
+        location.setAnchorName("南京邮电大学三牌楼校区");
+        location.setLng(118.770844);
+        location.setLat(32.081113);
+        location.setRadiusKm(3);
+        location.setStatus(LocationConstraint.RESOLVED);
+        location.setScopes(List.of("ATTRACTION"));
+        st.setLocationConstraint(location);
+
+        svc.generateAttractions(st);
+
+        verify(searchClient, times(1)).search(anyString(), anyString());
+        assertThat(st.getAttractionPool()).extracting("name").contains("三牌楼文化街区");
+        assertThat(st.getAttractionPool()).extracting("name").doesNotContain("新街口德基广场");
     }
 }

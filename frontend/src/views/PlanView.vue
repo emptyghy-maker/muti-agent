@@ -5,7 +5,7 @@ import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { api } from '../api'
 import ItineraryTimeline from '../components/ItineraryTimeline.vue'
 import RouteDialog from '../components/RouteDialog.vue'
-import { channelStatusFromSnapshot, isChannelTerminal } from '../utils/channelStatus'
+import { channelStatusFromSnapshot, isChannelReady, isChannelTerminal } from '../utils/channelStatus'
 
 const params = new URLSearchParams((location.hash.split('?')[1] || ''))
 const destinationId = Number(params.get('destinationId'))
@@ -32,6 +32,7 @@ const chatHistory = ref([])
 const attractionCandidates = ref([])
 const foodCandidates = ref([])
 const hotelCandidates = ref([])
+const candidateHasMore = ref(false)
 const selectedIds = ref([])
 const itineraryId = ref(null)
 const itineraryText = ref('')
@@ -47,6 +48,7 @@ const routeDialog = ref(null)
 const chatBox = ref(null)
 const agentWorking = ref('')
 const aiAdvice = ref('')
+const aiAdviceRefs = ref([])
 // 断点恢复失败（会话已过期/不存在）时展示「重新开始 / 返回首页」
 const resumeExpired = ref(false)
 // B 方案：疲劳超载草稿待确认（快照 pendingFatigueConfirm 驱动确认卡片）
@@ -55,6 +57,7 @@ const fatigueScore = ref(null)
 // 预算超支知情放行（快照 pendingBudgetConfirm 驱动放行卡片）
 const pendingBudget = ref(false)
 const budgetOver = ref(null)
+const pendingPlanIssues = ref([])
 // 行程偏好问卷（PLAN_QUIZ 阶段，服务端判定问题集合）
 const planQuiz = ref(null)
 const quizWake = ref('09:00')
@@ -197,6 +200,8 @@ const channelReadyChips = computed(() => {
       chips.push({ text: CHANNEL_LABELS[ch] + '已好', ready: true })
     } else if (st[ch] === 'SKIPPED') {
       continue
+    } else if (st[ch] === 'FALLBACK') {
+      chips.push({ text: CHANNEL_LABELS[ch] + '将在进入时生成', ready: false })
     } else if (stage.value === 'ATTRACTIONS') {
       chips.push({ text: CHANNEL_LABELS[ch] + '生成中…', ready: false })
     }
@@ -248,6 +253,7 @@ function applyStep(s) {
   attractionCandidates.value = s.attractionCandidates || []
   foodCandidates.value = s.foodCandidates || []
   hotelCandidates.value = s.hotelCandidates || []
+  candidateHasMore.value = !!s.candidateHasMore
   // 按当前阶段恢复服务端已勾选（同时覆盖 409 重载丢选中的场景）
   if (s.stage === 'ATTRACTIONS') selectedIds.value = [...(s.selectedAttractionIds || [])]
   else if (s.stage === 'FOODS') selectedIds.value = [...(s.selectedFoodIds || [])]
@@ -259,6 +265,7 @@ function applyStep(s) {
   itineraryText.value = s.itineraryText || ''
   plan.value = s.plan || null
   aiAdvice.value = s.candidateAdvice || ''
+  aiAdviceRefs.value = s.candidateAdviceRefs || []
   // B 方案：待确认标记（后端快照与步进结果均携带该字段，null 即未进入待确认）
   if (s.pendingFatigueConfirm !== undefined) {
     pendingFatigue.value = !!s.pendingFatigueConfirm
@@ -267,6 +274,7 @@ function applyStep(s) {
   if (s.pendingBudgetConfirm !== undefined) {
     pendingBudget.value = !!s.pendingBudgetConfirm
     budgetOver.value = s.pendingBudgetOver ?? null
+    pendingPlanIssues.value = s.pendingPlanIssues || []
   }
   // 行程偏好问卷：PLAN_QUIZ 阶段携带，其余阶段清空；夜景默认只看 1 个
   planQuiz.value = s.planQuiz || null
@@ -594,6 +602,14 @@ function toggle(id) {
   else selectedIds.value.push(id)
 }
 
+async function selectAdviceRef(item) {
+  if (!item || item.id == null) return
+  if (!selectedIds.value.includes(item.id)) selectedIds.value.push(item.id)
+  await nextTick()
+  document.querySelector('[data-candidate-id="' + item.id + '"]')
+    ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 async function confirmSelection(regenerate) {
   loading.value = true
   error.value = ''
@@ -601,6 +617,8 @@ async function confirmSelection(regenerate) {
     agentWorking.value = '正在从备选池为你翻页…'
   } else if (candidateType.value === 'HOTEL') {
     agentWorking.value = 'ItineraryAgent 正在结合偏好、劳累度和饭点编排行程…'
+  } else if (candidateType.value === 'ATTRACTION' && isChannelReady(channelStatus.value?.FOOD)) {
+    agentWorking.value = '正在打开已准备好的美食待选框…'
   } else {
     agentWorking.value = '正在生成下一级备选池…'
   }
@@ -803,8 +821,8 @@ function openRoute(payload) {
         <template v-else-if="candidateType === 'FOOD'">选择感兴趣的餐厅</template>
         <template v-else>选择住宿酒店</template>
       </h3>
-      <p class="tip">{{ agentLabel }} 已从 {{ destinationName }} 知识库中筛出{{ agentTopic }}备选池（每批展示一部分）；
-        勾选心仪的选项（可多选），「换一批」只翻页不重新分析、秒出且不重复，已勾选的会保留置顶；
+      <p class="tip">{{ agentLabel }} 已从 {{ destinationName }} 知识库中筛出{{ agentTopic }}备选池；
+        勾选心仪的选项（可多选）<template v-if="candidateHasMore">，「换一批」只翻页不重新分析、秒出且不重复，已勾选的会保留置顶</template>；
         直接打字提要求时才会让 AI 重新分析。</p>
       <!-- 三通道并行预热：其余通道就绪提示（谁先好先展示；后端未开启并行时不展示） -->
       <div class="channel-ready" v-if="channelReadyChips.length">
@@ -812,15 +830,26 @@ function openRoute(payload) {
           {{ c.ready ? '✅' : '⏳' }} {{ c.text }}
         </span>
       </div>
-      <div class="ai-advice" v-if="aiAdvice">💡 AI 推荐方法：{{ aiAdvice }}</div>
+      <div class="ai-advice" v-if="aiAdvice || aiAdviceRefs.length">
+        <div v-if="aiAdvice">💡 AI 推荐方法：{{ aiAdvice }}</div>
+        <div class="advice-links" v-if="aiAdviceRefs.length">
+          <span>AI 推荐候选：</span>
+          <button v-for="item in aiAdviceRefs" :key="item.type + ':' + item.id"
+                  type="button" class="advice-link" @click.stop="selectAdviceRef(item)">
+            {{ selectedIds.includes(item.id) ? '✓ ' : '+ ' }}{{ item.name }}
+          </button>
+        </div>
+      </div>
 
       <!-- 景点 / 酒店：卡片 -->
       <div class="cand-grid" v-if="candidateType !== 'FOOD'">
         <div v-for="c in candidates" :key="c.attractionId || c.hotelId" class="cand"
+             :data-candidate-id="c.attractionId || c.hotelId"
              :class="{ checked: selectedIds.includes(c.attractionId || c.hotelId) }"
              @click="toggle(c.attractionId || c.hotelId)">
           <div class="name">{{ c.name }}<span class="score" v-if="c.score != null" :title="scoreTitle(c)">{{ c.score.toFixed(1) }}</span></div>
           <div class="sub" v-if="c.feature">{{ c.feature }}</div>
+          <div class="sub" v-if="c.distanceToAnchor != null">距指定地点约 {{ c.distanceToAnchor }}km</div>
           <div class="sub" v-if="c.pricePerNight != null">¥{{ c.pricePerNight }}/晚 · 评分 {{ c.rating }} · 距景点美食中心 {{ c.distanceToCenter }}km</div>
           <div class="tags" v-if="c.tags"><span v-for="t in splitTags(c.tags)" :key="t" class="tag-chip">{{ t }}</span></div>
           <div class="why">{{ c.why }}</div>
@@ -834,11 +863,13 @@ function openRoute(payload) {
         <div v-for="g in foodGroups" :key="g.label" class="cand-group">
           <div class="cuisine">{{ g.isMeal ? '餐次 · ' + g.label : g.label }}</div>
           <div v-for="r in g.items" :key="r.restaurantId" class="cand-row"
+               :data-candidate-id="r.restaurantId"
                :class="{ checked: selectedIds.includes(r.restaurantId) }"
                @click="toggle(r.restaurantId)">
             <div class="info">
               <div class="name">{{ r.name }}<span class="badge" v-if="r.source === 'WEB_SEARCH'">网络检索</span><span class="score" v-if="r.score != null" :title="scoreTitle(r)">{{ r.score.toFixed(1) }}</span></div>
               <div class="sub">人均 ¥{{ r.avgPrice }} · 招牌：{{ r.signatureDish || '-' }}</div>
+              <div class="sub" v-if="r.distanceToAnchor != null">距指定地点约 {{ r.distanceToAnchor }}km</div>
               <div class="tags" v-if="r.tags"><span v-for="t in splitTags(r.tags)" :key="t" class="tag-chip">{{ t }}</span></div>
               <div class="why" v-if="r.reason">推荐理由：{{ r.reason }}</div>
             </div>
@@ -850,7 +881,7 @@ function openRoute(payload) {
         <button class="btn" :disabled="!selectedIds.length || loading" @click="confirmSelection(false)">
           确认选择（{{ selectedIds.length }}）
         </button>
-        <button class="btn ghost" :disabled="loading" @click="confirmSelection(true)">换一批（秒出）</button>
+        <button v-if="candidateHasMore" class="btn ghost" :disabled="loading" @click="confirmSelection(true)">换一批（秒出）</button>
         <button class="btn ghost" :disabled="!selectedIds.length || loading" @click="selectedIds = []">清空本页勾选</button>
         <button v-if="stage !== 'ATTRACTIONS'" class="btn ghost" :disabled="loading"
                 @click="rewindTo(previousSelectionTarget)">{{ previousSelectionLabel }}</button>
@@ -930,14 +961,18 @@ function openRoute(payload) {
 
     <!-- 预算超支知情放行 -->
     <div class="card" v-if="stage === 'ITINERARY' && !plan && pendingBudget">
-      <h3>行程已生成，餐饮超出预算待确认</h3>
+      <h3>行程草稿超出预算，等待你的选择</h3>
       <p class="tip">
-        当前行程餐饮费用超出预算<span v-if="budgetOver != null"> {{ Number(budgetOver).toFixed(0) }} 元</span>。
-        你可以确认发布（超支部分自付），或返回调整换更实惠的餐厅。
+        当前行程预计总费用超出预算<span v-if="budgetOver != null"> {{ Number(budgetOver).toFixed(0) }} 元</span>。
+        <template v-if="!pendingPlanIssues.length">你可以确认发布（接受超支），或返回修改行程。</template>
+        <template v-else>草稿还有以下发布阻断，请先返回修改：</template>
       </p>
+      <ul class="issue-list" v-if="pendingPlanIssues.length">
+        <li v-for="(issue, i) in pendingPlanIssues" :key="i">{{ issue }}</li>
+      </ul>
       <div class="toolbar">
-        <button class="btn" :disabled="loading" @click="confirmBudget(true)">确认发布</button>
-        <button class="btn ghost" :disabled="loading" @click="confirmBudget(false)">返回调整</button>
+        <button v-if="!pendingPlanIssues.length" class="btn" :disabled="loading" @click="confirmBudget(true)">确认发布</button>
+        <button class="btn ghost" :disabled="loading" @click="confirmBudget(false)">返回修改</button>
       </div>
     </div>
 

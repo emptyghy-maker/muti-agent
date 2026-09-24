@@ -16,6 +16,10 @@ public class WebAttractionCandidate {
     private BigDecimal ticketPrice;
     /** 街道/商圈级位置 */
     private String address;
+    /** GCJ-02 经度；存在“附近”硬约束时用于确定性距离验收。 */
+    private Double lng;
+    /** GCJ-02 纬度；存在“附近”硬约束时用于确定性距离验收。 */
+    private Double lat;
     /** 一句话理由（入库后写入 source_note） */
     private String why;
 }

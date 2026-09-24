@@ -195,6 +195,9 @@ class WebFoodExpansionTest {
         verify(searchClient, times(1)).search(anyString(), anyString());
         // 扩充说明追加到 advice，避免列表与说明错位
         assertThat(st.getCandidateAdvice()).contains("已联网检索扩充 1 家");
+        assertThat(st.getCandidateAdvice()).contains("本轮优先匹配", "口味、人均消费、所在位置和餐次适配");
+        assertThat(st.getCandidateAdvice()).doesNotContain("已按你的特殊要求完成 AI 重筛");
+        assertThat(st.getCandidateAdvice()).doesNotContain("新梅华", "金鸡湖店");
         // 网搜店并入候选池
         List<String> poolNames = st.getFoodPool().stream()
                 .flatMap(g -> g.getRestaurants().stream())

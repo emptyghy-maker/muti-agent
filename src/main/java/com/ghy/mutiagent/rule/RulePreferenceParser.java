@@ -166,7 +166,7 @@ public class RulePreferenceParser {
         extractConstraints(m, r, spans);
 
         // 8. 餐次结构（顿数/早饭午饭晚饭/小吃取舍；明确表达才生效，未命中照旧进残余）
-        extractMealPlan(m, r, spans);
+        extractMealPlan(m, context, r, spans);
 
         // 8.5 行程偏好问卷字段（起床/回家回酒店时间/活动倾向/夜景数量；命中即消费原文区间）
         extractQuizAnswers(m, r, spans);
@@ -360,7 +360,7 @@ public class RulePreferenceParser {
      * O2 餐次需求：数量必须同时携带 unit 与 scope。
      * 无范围的「2顿午餐」进入 NEEDS_CLARIFICATION，不能再猜成 lunchPerDay。
      */
-    private void extractMealPlan(String m, RuleParseResult r, List<int[]> spans) {
+    private void extractMealPlan(String m, TravelPreference context, RuleParseResult r, List<int[]> spans) {
         RequirementScope scope = mealScope(m);
         List<int[]> local = new ArrayList<>();
         boolean matched = false;
@@ -436,6 +436,33 @@ public class RulePreferenceParser {
                 }
             }
             addSpan(spans, meal);
+            matched = true;
+        }
+
+        // “午餐/晚餐”是时间窗，“小吃/正餐”是餐食类型，两组约束必须分别保存和验收。
+        // 单日行程中 TRIP 与 PER_DAY 等价，可以直接确认；多日且未给范围时仍要求用户澄清。
+        RequirementScope compositionScope = scope == RequirementScope.UNRESOLVED
+                && context != null && Integer.valueOf(1).equals(context.getDays())
+                ? RequirementScope.TRIP : scope;
+        Matcher composition = Pattern.compile("(?:(?:饭店|餐厅|餐饮)\\s*)?(?:(?:要|安排|吃)\\s*)?"
+                        + "((?:至少|最少|最多|不超过|至多)?)([一二两三四五六七八九十\\d]+)\\s*顿?\\s*(小吃|夜宵|正餐)")
+                .matcher(m);
+        while (composition.find()) {
+            int count = chineseNumber(composition.group(2));
+            RequirementSubject subject = "正餐".equals(composition.group(3))
+                    ? RequirementSubject.MAIN_MEAL : RequirementSubject.SNACK;
+            InterpretationStatus interpretation = compositionScope == RequirementScope.UNRESOLVED
+                    ? InterpretationStatus.NEEDS_CLARIFICATION : InterpretationStatus.CONFIRMED;
+            r.getConstraints().add(structuredRequirement(
+                    "meal." + subject.name(), subject, count, operatorOf(composition.group(1)),
+                    RequirementUnit.MEAL_OCCASION, compositionScope, interpretation, "HARD",
+                    composition.group(), interpretation == InterpretationStatus.NEEDS_CLARIFICATION
+                            ? "MEAL_SCOPE_REQUIRED" : null));
+            if (subject == RequirementSubject.SNACK && count > 0) {
+                r.getUpdates().put("snacksAllowed", "true");
+            }
+            addSpan(local, composition);
+            addSpan(spans, composition);
             matched = true;
         }
         Matcher snNeg = Pattern.compile("(不要|不吃|不需要|不用|免|取消|省了)\\s*(小吃|夜宵)").matcher(m);

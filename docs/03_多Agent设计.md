@@ -92,7 +92,7 @@ INIT ──选目的地/首轮输入──▶ PREFERENCE ──缺失字段逐�
 
 ### 5.1 规划模式
 - 输入：确认全集 + 规则引擎骨架（每天劳累分、饭点缺口、待插入休息点、交通与消费估算）。
-- 输出：按天行程文本 + 严格 JSON 节点数组（type=transport/hotel/attraction/restaurant/rest、placeId、名称、时段、说明）。
+- 输出：严格 JSON 决策骨架，只包含 attraction/restaurant 的分天、顺序和正餐 note；Java 再补交通、酒店、休息点、时间、名称、费用与展示文本。
 - 硬约束在提示词中列为「必须遵守」，Java 解析后二次校验（餐点存在性、休息点位置）。
 
 ### 5.2 修改模式（ADJUST）

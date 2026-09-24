@@ -58,6 +58,13 @@ public final class WebAttractionValidator {
         if (price == null || price.signum() < 0 || price.compareTo(MAX_PRICE) > 0) {
             reasons.add("PRICE_INVALID");
         }
+        if ((w.getLng() == null) != (w.getLat() == null)) {
+            reasons.add("COORDINATE_INCOMPLETE");
+        } else if (w.getLng() != null
+                && (!Double.isFinite(w.getLng()) || !Double.isFinite(w.getLat())
+                || Math.abs(w.getLng()) > 180 || Math.abs(w.getLat()) > 90)) {
+            reasons.add("COORDINATE_INVALID");
+        }
         String why = trim(w.getWhy());
         if (!why.isEmpty() && (why.length() > MAX_WHY || !WebFoodValidator.cleanText(why))) {
             reasons.add("WHY_INVALID");

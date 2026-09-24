@@ -9,6 +9,7 @@ import com.ghy.mutiagent.common.JsonUtils;
 import com.ghy.mutiagent.common.OpAbortException;
 import com.ghy.mutiagent.common.PatchRejectException;
 import com.ghy.mutiagent.common.ResultCode;
+import com.ghy.mutiagent.config.LlmRouteContext;
 import com.ghy.mutiagent.model.AdjustPatchIntent;
 import com.ghy.mutiagent.model.DailyPlan;
 import com.ghy.mutiagent.model.BudgetBreakdown;
@@ -46,6 +47,7 @@ import com.ghy.mutiagent.repository.mapper.RestaurantMapper;
 import com.ghy.mutiagent.rule.BudgetCalculator;
 import com.ghy.mutiagent.rule.FatigueScorer;
 import com.ghy.mutiagent.rule.ItineraryTextRenderer;
+import com.ghy.mutiagent.rule.ItineraryDecisionSkeleton;
 import com.ghy.mutiagent.rule.MealPolicySupport;
 import com.ghy.mutiagent.rule.MealTimeChecker;
 import com.ghy.mutiagent.rule.NightScorer;
@@ -58,6 +60,7 @@ import com.ghy.mutiagent.rule.PlanningPolicyResolver;
 import com.ghy.mutiagent.rule.ScheduleBuilder;
 import com.ghy.mutiagent.rule.TripBilling;
 import com.ghy.mutiagent.service.validation.ItineraryValidator;
+import com.ghy.mutiagent.service.validation.LocationConstraintPlanValidator;
 import com.ghy.mutiagent.service.validation.PlanStructureValidator;
 import com.ghy.mutiagent.service.validation.RequirementFulfillmentValidator;
 import com.ghy.mutiagent.security.AuthenticatedUser;
@@ -128,6 +131,10 @@ public class ItineraryService {
     /** 补丁 Agent 使用的模型（小 JSON 任务，快模型） */
     @Value("${llm.models.default}")
     private String patchModel;
+
+    /** 快速修复模型池主模型；强修复仍使用 sql 模型池。 */
+    @Value("${llm.models.repair:${llm.models.default}}")
+    private String repairModel;
 
     /** ItineraryAgent 绑定 sqlChatModel，记录用量时注明模型 */
     @Value("${llm.models.sql}")
@@ -203,19 +210,14 @@ public class ItineraryService {
                 state.getAttractionPool(), state.getFoodPool(), state.getHotelPool());
         String usageStage = state.getAdjustContext() == null ? "ITINERARY" : "ADJUST";
         try {
-            String prefJson = objectMapper.writeValueAsString(state.getPreference());
+            String prefJson = objectMapper.writeValueAsString(planningPreference(state));
             String attrJson = objectMapper.writeValueAsString(attractions.stream()
-                    .map(a -> Map.of("id", a.getId(), "name", a.getName(), "category", a.getCategory(),
-                            "tags", a.getTags() == null ? "" : a.getTags(),
-                            "intensity", a.getIntensity(), "hours", a.getSuggestHours(), "price", a.getTicketPrice(),
-                            "score", scoreById.getOrDefault(PlaceKey.of(PlaceType.ATTRACTION, a.getId()), 0.0)))
+                    .map(ItineraryService::planningAttraction)
                     .toList());            String foodJson = objectMapper.writeValueAsString(restaurants.stream()
-                    .map(r -> Map.of("id", r.getId(), "name", r.getName(), "cuisine", r.getCuisine(),
-                            "score", scoreById.getOrDefault(PlaceKey.of(PlaceType.RESTAURANT, r.getId()), 0.0)))
+                    .map(ItineraryService::planningRestaurant)
                     .toList());
             String hotelJson = objectMapper.writeValueAsString(hotels.stream()
-                    .map(h -> Map.of("id", h.getId(), "name", h.getName(), "price", h.getPricePerNight(),
-                            "score", scoreById.getOrDefault(PlaceKey.of(PlaceType.HOTEL, h.getId()), 0.0)))
+                    .map(ItineraryService::planningHotel)
                     .toList());
             String rules = buildRules(state, restSpots, attractions);
 
@@ -224,8 +226,10 @@ public class ItineraryService {
                 // ==================== P0 语义（未装配修复引擎时完全不变） ====================
                 TraceContext ctx = traceService.newTrace(state.getSessionId(), "行程规划");
                 long startNs = System.nanoTime();
+                String actualModel = sqlModel;
                 try {
                     Result<String> r = itineraryAgent.plan(prefJson, attrJson, foodJson, hotelJson, rules);
+                    actualModel = LlmRouteContext.consume("plan", sqlModel);
                     long cost = (System.nanoTime() - startNs) / 1_000_000;
                     // S03：提供方调用成功——此后输出不合格一律拒绝发布，不静默替换为规则方案
                     providerOk = true;
@@ -238,9 +242,10 @@ public class ItineraryService {
                     int[] tk = tokenCounts(r.tokenUsage());
                     usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                             usageStage, "行程规划", "ItineraryAgent", r.tokenUsage(), cost, "SUCCESS", null,
-                            sqlModel, UsageChannel.AGENT, UsageService.clip(raw, 2000));
-                    state.addTurnUsage(sqlModel, tk[0], tk[1], UsageChannel.AGENT);
+                            actualModel, UsageChannel.AGENT, UsageService.clip(raw, 2000));
+                    state.addTurnUsage(actualModel, tk[0], tk[1], UsageChannel.AGENT);
                 } catch (Exception e) {
+                    actualModel = LlmRouteContext.consume("plan", actualModel);
                     long cost = (System.nanoTime() - startNs) / 1_000_000;
                     ctx.add(AgentTrace.failure("ItineraryAgent", cost,
                             e.getClass().getName() + ": " + e.getMessage()));
@@ -248,7 +253,7 @@ public class ItineraryService {
                     usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                             usageStage, "行程规划", "ItineraryAgent", null, cost, "FAILED",
                             e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()),
-                            sqlModel, UsageChannel.RULE_FALLBACK, null);
+                            actualModel, UsageChannel.RULE_FALLBACK, null);
                     state.addTurnUsage(null, 0, 0, UsageChannel.RULE_FALLBACK);
                     log.warn("行程规划 LLM 调用或输出处理失败（{}）", e.getClass().getName(), e);
                 } finally {
@@ -348,6 +353,12 @@ public class ItineraryService {
                         "发布检查未通过：" + String.join("；", check.violations())
                                 + (check.needsConfirmation() ? "；存在无法自动核实的硬条件，需用户确认" : ""));
             }
+            LocationConstraintPlanValidator.Result locationCheck = validateLocationConstraint(
+                    state, plan, attractions, restaurants, hotels);
+            if (!locationCheck.passed()) {
+                throw new BizException(ResultCode.PLAN_INVALID.getCode(),
+                        locationFailureMessage(locationCheck));
+            }
 
             RequirementFulfillmentReport fulfillment = validateRequirementFulfillment(state, plan, restaurants);
             if (!fulfillment.hardRequirementsSatisfied()) {
@@ -395,6 +406,27 @@ public class ItineraryService {
             if (firstCodes == null) {
                 firstCodes = codes;
             }
+            // 预算是用户裁决项：一旦发现超支，立即返回“确认发布/返回修改”，不调用 RepairAgent。
+            // 其余并存违规一并反馈；前端在这些问题解决前禁止直接发布，避免预算确认绕过硬校验。
+            if (codes.contains(ItineraryValidator.BUDGET_EXCEEDED)) {
+                List<ItineraryRepairEngine.RepairViolation> otherViolations = violations.stream()
+                        .filter(v -> !ItineraryValidator.BUDGET_EXCEEDED.equals(v.code())).toList();
+                BigDecimal over = budgetOverAmount(draft);
+                state.setPendingPlan(draft);
+                state.setPendingBudgetConfirm(true);
+                state.setPendingBudgetOver(over);
+                state.setPendingPlanIssues(otherViolations.isEmpty()
+                        ? new ArrayList<>()
+                        : new ArrayList<>(List.of(describeViolations(draft, otherViolations))));
+                evidence.put("validationCodes", firstCodes);
+                evidence.put("finalValidationCodes", codes);
+                evidence.put("repairAttempts", attempt);
+                evidence.put("reasonCodes", List.of());
+                evidence.put("awaitingBudgetConfirm", true);
+                log.info("[Itinerary][sessionId={}] 预算超支（超 {} 元）：跳过模型修复，直接进入用户裁决；其他阻断={}",
+                        state.getSessionId(), over, state.getPendingPlanIssues());
+                return evidence;
+            }
             // B 方案：疲劳超载单独分流——确定性判定且模型修复无杠杆（休息不计分、景点已锁定），
             // 与可修复违规分离：可修复的照常走修复循环，疲劳仅剩自己时进入待用户确认
             List<ItineraryRepairEngine.RepairViolation> fatigueViolations = violations.stream()
@@ -436,55 +468,8 @@ public class ItineraryService {
                         state.getSessionId(), fatigueScore);
                 return evidence;
             }
-            // 预算超限走确定性换店修复（修复约束禁止引入新地点，模型对预算违规无杠杆）。
-            // 触发条件：预算超支是当前**唯一**剩余违规——若同时存在时间越界等其他违规（如排过 24:00），
-            // 不能带病停车（用户确认后直接发布，会绕过修复），必须继续走下面的修复/终止逻辑。
-            // 注意：BUDGET_EXCEEDED 在统一层标记为 repairable=true，因此不能用 repairableViolations.isEmpty()
-            // 判断「唯一违规」——那会把预算知情放行流程彻底堵死（每次都走模型修复到耗尽后 422）。
-            boolean budgetOnly = codes.stream().allMatch(ItineraryValidator.BUDGET_EXCEEDED::equals);
-            if (budgetOnly) {
-                if (budgetSwap(draft, restaurants, state.getPreference())) {
-                    log.info("[Itinerary][sessionId={}] 预算超限：已用更便宜的已选餐厅确定性替换，进入下一轮重验",
-                            state.getSessionId());
-                    continue;
-                }
-                // 已选餐厅内无法压到预算内：留存草稿进入待确认（知情放行/返回调整），不进模型修复
-                BigDecimal over = budgetOverAmount(draft);
-                state.setPendingPlan(draft);
-                state.setPendingBudgetConfirm(true);
-                state.setPendingBudgetOver(over);
-                evidence.put("validationCodes", firstCodes);
-                evidence.put("finalValidationCodes", codes);
-                evidence.put("repairAttempts", attempt);
-                evidence.put("reasonCodes", List.of());
-                evidence.put("awaitingBudgetConfirm", true);
-                log.info("[Itinerary][sessionId={}] 预算超支（超 {} 元）：行程草稿进入待用户确认",
-                        state.getSessionId(), over);
-                return evidence;
-            }
             boolean repairable = repairableViolations.stream().allMatch(ItineraryRepairEngine.RepairViolation::repairable);
             if (attempt == maxRepairs || !repairable) {
-                if (codes.contains(ItineraryValidator.BUDGET_EXCEEDED)) {
-                    // 预算超支绝不硬拦（用户口径）：终止前先做最后一次确定性换店，仍超则知情放行待确认。
-                    // 共存的其他违规不在此停车：用户「确认发布」时 publishPending 会复验拦截（26:30 事故根修）。
-                    if (budgetSwap(draft, restaurants, state.getPreference())) {
-                        log.info("[Itinerary][sessionId={}] 终止前换店成功：预算已压回，进入下一轮重验",
-                                state.getSessionId());
-                        continue;
-                    }
-                    BigDecimal over = budgetOverAmount(draft);
-                    state.setPendingPlan(draft);
-                    state.setPendingBudgetConfirm(true);
-                    state.setPendingBudgetOver(over);
-                    evidence.put("validationCodes", firstCodes);
-                    evidence.put("finalValidationCodes", codes);
-                    evidence.put("repairAttempts", attempt);
-                    evidence.put("reasonCodes", List.of());
-                    evidence.put("awaitingBudgetConfirm", true);
-                    log.info("[Itinerary][sessionId={}] 预算超支（超 {} 元）：行程草稿进入待用户确认",
-                            state.getSessionId(), over);
-                    return evidence;
-                }
                 // 不可修复或修复上限耗尽：保留草稿与冲突说明，不保存为可用行程，交由用户确认
                 List<String> reasons = new ArrayList<>(budget.reasonCodes());
                 if (attempt == maxRepairs) {
@@ -535,10 +520,15 @@ public class ItineraryService {
             AgentTrace repairSpan = null;
             // 首轮修复用快模型（秒级出稿），仍不过再升级强模型兜底一轮
             boolean heavyRepair = attempt > 0;
-            String repairModel = heavyRepair ? sqlModel : patchModel;
+            String configuredRepairModel = heavyRepair ? sqlModel : repairModel;
+            String actualRepairModel = configuredRepairModel;
             try {
                 repaired = repairEngine.repair(budget, repairContext, heavyRepair);
+                actualRepairModel = LlmRouteContext.consume(heavyRepair ? "plan" : "repair",
+                        configuredRepairModel);
             } catch (Exception e) {
+                actualRepairModel = LlmRouteContext.consume(heavyRepair ? "plan" : "repair",
+                        configuredRepairModel);
                 repairError = e;
                 // 修复提供方失败且已越过截止 → 按截止终止（不再重试制造重复计费）
                 if (budget.deadlineExceeded()) {
@@ -559,7 +549,7 @@ public class ItineraryService {
                     usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                             usageStage, "行程修复", "ItineraryRepairAgent",
                             repaired == null ? null : repaired.tokenUsage(), cost, "SUCCESS", null,
-                            repairModel, UsageChannel.AGENT, UsageService.clip(repairContext, 2000));
+                            actualRepairModel, UsageChannel.AGENT, UsageService.clip(repairContext, 2000));
                 } else {
                     repairSpan = AgentTrace.failure("ItineraryRepairAgent", cost,
                             repairError.getClass().getName() + ": " + repairError.getMessage());
@@ -570,7 +560,7 @@ public class ItineraryService {
                             usageStage, "行程修复", "ItineraryRepairAgent", null, cost, "FAILED",
                             repairError.getClass().getSimpleName()
                                     + (repairError.getMessage() == null ? "" : ": " + repairError.getMessage()),
-                            repairModel, UsageChannel.RULE_FALLBACK, null);
+                            actualRepairModel, UsageChannel.RULE_FALLBACK, null);
                 }
                 traceService.finish(rctx);
             }
@@ -588,6 +578,22 @@ public class ItineraryService {
             if (next == null) {
                 log.warn("[Itinerary] 修复输出无法解析为合法行程 JSON，进入下一轮");
                 continue;
+            }
+            if (decisionSignature(draft).equals(decisionSignature(next))) {
+                int repairAttempts = attempt + 1;
+                List<String> reasons = new ArrayList<>(budget.reasonCodes());
+                reasons.add("REPAIR_NO_PROGRESS");
+                Map<String, Object> abortEvidence = new LinkedHashMap<>();
+                abortEvidence.put("validationCodes", firstCodes);
+                abortEvidence.put("finalValidationCodes", codes);
+                abortEvidence.put("repairAttempts", repairAttempts);
+                abortEvidence.put("repairNoProgress", true);
+                log.warn("[Itinerary][sessionId={}] 修复结果未改变地点顺序或餐次，终止后续重复修复",
+                        state.getSessionId());
+                throw new OpAbortException(ResultCode.PLAN_INVALID,
+                        "行程生成未通过发布检查：" + describeViolations(draft, violations)
+                                + "（自动修复未改变方案，已停止重复调用）。请调整选择后重试。",
+                        "NEEDS_CONFIRMATION", reasons, codes, abortEvidence);
             }
             draft = next;
             draftSpan = repairSpan;
@@ -627,11 +633,13 @@ public class ItineraryService {
             traceService.register(ctx);
         }
         long startNs = System.nanoTime();
+        String actualModel = sqlModel;
         try {
             // S08：规划调用进共享预算——调用前原子预留（输入估计+最大输出），不足不发请求
             Result<String> r = repairEngine.plannerCall(budget, ItineraryRepairEngine.estimateTokens(
                             prefJson + attrJson + foodJson + hotelJson + rules),
                     () -> itineraryAgent.plan(prefJson, attrJson, foodJson, hotelJson, rules));
+            actualModel = LlmRouteContext.consume("plan", sqlModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
             AgentTrace span = AgentTrace.success("ItineraryAgent", cost, r.tokenUsage());
             span.setAnswer(UsageService.clip(r.content(), 2000));
@@ -640,8 +648,8 @@ public class ItineraryService {
             int[] tk = tokenCounts(r.tokenUsage());
             usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                     usageStage, "行程规划", "ItineraryAgent", r.tokenUsage(), cost, "SUCCESS", null,
-                    sqlModel, UsageChannel.AGENT, UsageService.clip(r.content(), 2000));
-            state.addTurnUsage(sqlModel, tk[0], tk[1], UsageChannel.AGENT);
+                    actualModel, UsageChannel.AGENT, UsageService.clip(r.content(), 2000));
+            state.addTurnUsage(actualModel, tk[0], tk[1], UsageChannel.AGENT);
             return new PlannerInvocation(r, ctx, span);
         } catch (OpAbortException abort) {
             // 预算预留失败（截止/配额/token）：终止语义直达上层，不兜底、不重试
@@ -652,6 +660,7 @@ public class ItineraryService {
             ctx.finish("FAILED");
             throw abort;
         } catch (Exception e) {
+            actualModel = LlmRouteContext.consume("plan", actualModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
             AgentTrace span = AgentTrace.failure("ItineraryAgent", cost,
                     e.getClass().getName() + ": " + e.getMessage());
@@ -660,7 +669,7 @@ public class ItineraryService {
             usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                     usageStage, "行程规划", "ItineraryAgent", null, cost, "FAILED",
                     e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()),
-                    sqlModel, UsageChannel.RULE_FALLBACK, null);
+                    actualModel, UsageChannel.RULE_FALLBACK, null);
             state.addTurnUsage(null, 0, 0, UsageChannel.RULE_FALLBACK);
             log.warn("行程规划 LLM 调用或输出处理失败（{}）", e.getClass().getName(), e);
             // S08：提供方返回后已越过截止 → 不再兜底、不再修复，按截止终止
@@ -801,17 +810,26 @@ public class ItineraryService {
         }
     }
 
-    private ItineraryPlan parsePlanJson(String raw) {
+    /**
+     * 解析规划/修复输出。模型达到输出上限时可能在字段名或字符串中间截断；这是一次
+     * provider attempt 的解析失败，应由规划状态机重试或返回可诊断结果，不能冒泡成 500。
+     */
+    static ItineraryPlan parsePlanJson(String raw) {
         if (raw == null) {
             return null;
         }
-        JsonUtils.ParseTracked<ItineraryPlan> tracked = JsonUtils.parseTracked(raw, ItineraryPlan.class);
-        ItineraryPlan plan = tracked == null ? null : tracked.value();
-        if (plan == null || plan.getDays() == null || plan.getDays().isEmpty()) {
-            // 模型偶发把 days 包在别的键里：统一解析层泛化查找再解析
-            plan = AgentOutputParser.nestedItinerary(JsonUtils.readTree(raw));
+        try {
+            JsonUtils.ParseTracked<ItineraryPlan> tracked = JsonUtils.parseTracked(raw, ItineraryPlan.class);
+            ItineraryPlan plan = tracked == null ? null : tracked.value();
+            if (plan == null || plan.getDays() == null || plan.getDays().isEmpty()) {
+                // 模型偶发把 days 包在别的键里：统一解析层泛化查找再解析
+                plan = AgentOutputParser.nestedItinerary(JsonUtils.readTree(raw));
+            }
+            return plan;
+        } catch (IllegalArgumentException parseError) {
+            log.warn("[Itinerary] 模型输出不是完整合法 JSON，本轮解析失败：{}", parseError.getMessage());
+            return null;
         }
-        return plan;
     }
 
     /**
@@ -853,12 +871,24 @@ public class ItineraryService {
         ItineraryValidator.ValidationResult check = ItineraryValidator.validate(draft, state.getPreference(),
                 state.getRequirementSnapshot(), state.getPreference().getTotalBudget(), bill.getKnownSubtotal(),
                 openTimes, attById, hardFatigueOverload);
+        LocationConstraintPlanValidator.Result locationCheck = validateLocationConstraint(
+                state, draft, attractions, restaurants, hotels);
         RequirementFulfillmentReport fulfillment = validateRequirementFulfillment(state, draft, restaurants);
         if (check.needsConfirmation()) {
             return List.of(new ItineraryRepairEngine.RepairViolation(
                     "NEEDS_CONFIRMATION", 0, List.of(), false, null));
         }
         List<ItineraryRepairEngine.RepairViolation> violations = new ArrayList<>(ItineraryRepairEngine.unify(check));
+        if (!locationCheck.violations().isEmpty()) {
+            violations.add(new ItineraryRepairEngine.RepairViolation(
+                    LocationConstraintPlanValidator.VIOLATED, 0, locationCheck.violations(), false,
+                    "计划节点超出用户指定地点范围"));
+        }
+        if (!locationCheck.unverifiable().isEmpty()) {
+            violations.add(new ItineraryRepairEngine.RepairViolation(
+                    LocationConstraintPlanValidator.UNVERIFIABLE, 0, locationCheck.unverifiable(), false,
+                    "位置事实缺失，无法证明满足用户指定地点范围"));
+        }
         for (RequirementFulfillmentResult result : fulfillment.getResults()) {
             if (!"HARD".equals(result.getHardness()) || result.getStatus() == FulfillmentStatus.SATISFIED) {
                 continue;
@@ -882,6 +912,31 @@ public class ItineraryService {
                 PlanningPolicyResolver.resolve(state), state.getRequirementSnapshot(), state.getPlanRevision(), byId);
         state.setRequirementFulfillmentReport(report);
         return report;
+    }
+
+    private static LocationConstraintPlanValidator.Result validateLocationConstraint(
+            TravelState state, ItineraryPlan plan, List<Attraction> attractions,
+            List<Restaurant> restaurants, List<Hotel> hotels) {
+        Map<Long, Attraction> attractionFacts = attractions.stream()
+                .collect(Collectors.toMap(Attraction::getId, a -> a, (a, b) -> a));
+        Map<Long, Restaurant> restaurantFacts = restaurants.stream()
+                .collect(Collectors.toMap(Restaurant::getId, r -> r, (a, b) -> a));
+        Map<Long, Hotel> hotelFacts = hotels.stream()
+                .collect(Collectors.toMap(Hotel::getId, h -> h, (a, b) -> a));
+        return LocationConstraintPlanValidator.validate(plan,
+                state == null ? null : state.getLocationConstraint(),
+                attractionFacts, restaurantFacts, hotelFacts);
+    }
+
+    private static String locationFailureMessage(LocationConstraintPlanValidator.Result result) {
+        List<String> parts = new ArrayList<>();
+        if (!result.violations().isEmpty()) {
+            parts.add("位置约束未通过，超出范围节点=" + result.violations());
+        }
+        if (!result.unverifiable().isEmpty()) {
+            parts.add("位置约束无法核实，缺少位置事实节点=" + result.unverifiable());
+        }
+        return String.join("；", parts);
     }
 
     private static String fulfillmentFailures(RequirementFulfillmentReport report) {
@@ -1065,17 +1120,20 @@ public class ItineraryService {
     private AdjustPatchIntent proposePatch(TravelState state, String patchContext) {
         TraceContext ctx = traceService.newTrace(state.getSessionId(), "行程补丁");
         long startNs = System.nanoTime();
+        String actualModel = patchModel;
         try {
             dev.langchain4j.service.Result<String> r = patchAgent.propose(patchContext);
+            actualModel = LlmRouteContext.consume("fast", patchModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
             ctx.add(AgentTrace.success("ItineraryPatchAgent", cost, r.tokenUsage()));
             ctx.finish("SUCCESS");
             obsPatchEvent(null, state, true, "PROPOSED", Map.of());
             usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                     "ADJUST", "行程补丁", "ItineraryPatchAgent", r.tokenUsage(), cost, "SUCCESS", null,
-                    patchModel, UsageChannel.AGENT, UsageService.clip(patchContext, 2000));
+                    actualModel, UsageChannel.AGENT, UsageService.clip(patchContext, 2000));
             return JsonUtils.parse(r.content(), AdjustPatchIntent.class);
         } catch (Exception e) {
+            actualModel = LlmRouteContext.consume("fast", actualModel);
             long cost = (System.nanoTime() - startNs) / 1_000_000;
             ctx.add(AgentTrace.failure("ItineraryPatchAgent", cost,
                     e.getClass().getName() + ": " + e.getMessage()));
@@ -1083,7 +1141,7 @@ public class ItineraryService {
             usageService.recordAgent(auditSessionId(state), state.getUserId(), state.getUsername(),
                     "ADJUST", "行程补丁", "ItineraryPatchAgent", null, cost, "FAILED",
                     e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()),
-                    patchModel, UsageChannel.RULE_FALLBACK, null);
+                    actualModel, UsageChannel.RULE_FALLBACK, null);
             throw new PatchRejectException("PATCH_EXECUTION_FAILED",
                     e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
         } finally {
@@ -1216,6 +1274,13 @@ public class ItineraryService {
                     "调整后发布检查未通过：" + String.join("；", check.violations())
                             + (check.needsConfirmation() ? "；存在无法自动核实的硬条件" : ""));
         }
+        TravelState locationState = sessionState == null ? adjState : sessionState;
+        LocationConstraintPlanValidator.Result locationCheck = validateLocationConstraint(
+                locationState, patched, attractions, restaurants, hotels);
+        if (!locationCheck.passed()) {
+            throw new PatchRejectException(ItineraryPatchEngine.ERR_PATCH_VALIDATION_FAILED,
+                    "调整后" + locationFailureMessage(locationCheck));
+        }
         // Patch 只能改局部，但发布必须复验整份计划的逐条需求；防止用小吃替代正餐等
         // “结构看似合法、需求实际被破坏”的补丁绕过生成阶段验收。
         com.ghy.mutiagent.model.RequirementSnapshot requirementSnapshot =
@@ -1260,51 +1325,89 @@ public class ItineraryService {
                 .toList();
     }
 
+    /** 规划模型只接收会改变“分天/顺序”的字段，预算、人数、展示状态等由 Java 使用。 */
+    static Map<String, Object> planningPreference(TravelState state) {
+        TravelPreference pref = state == null ? null : state.getPreference();
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (pref == null) {
+            return out;
+        }
+        putIfPresent(out, "days", pref.getDays());
+        putIfPresent(out, "energyLevel", pref.getEnergyLevel());
+        putIfPresent(out, "wakeTime", pref.getWakeTime());
+        putIfPresent(out, "returnDeadline", pref.getReturnDeadline());
+        putIfPresent(out, "activityBias", pref.getActivityBias());
+        putIfPresent(out, "nightPlan", pref.getNightPlan());
+        putIfPresent(out, "specialRequests", pref.getSpecialRequests());
+        return out;
+    }
+
+    private static Map<String, Object> planningAttraction(Attraction attraction) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        putIfPresent(out, "id", attraction.getId());
+        putIfPresent(out, "name", attraction.getName());
+        putIfPresent(out, "tags", attraction.getTags());
+        putIfPresent(out, "intensity", attraction.getIntensity());
+        putIfPresent(out, "hours", attraction.getSuggestHours());
+        putIfPresent(out, "openTime", attraction.getOpenTime());
+        return out;
+    }
+
+    private static Map<String, Object> planningRestaurant(Restaurant restaurant) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        putIfPresent(out, "id", restaurant.getId());
+        putIfPresent(out, "name", restaurant.getName());
+        putIfPresent(out, "cuisine", restaurant.getCuisine());
+        return out;
+    }
+
+    private static Map<String, Object> planningHotel(Hotel hotel) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        putIfPresent(out, "id", hotel.getId());
+        putIfPresent(out, "name", hotel.getName());
+        return out;
+    }
+
+    private static void putIfPresent(Map<String, Object> target, String key, Object value) {
+        if (value != null && (!(value instanceof String text) || !text.isBlank())) {
+            target.put(key, value);
+        }
+    }
+
     private String buildRules(TravelState state, List<Attraction> restSpots, List<Attraction> attractions) {
         int days = state.getPreference().getDays() == null ? 3 : state.getPreference().getDays();
-        String restNames = restSpots.stream().map(Attraction::getName).collect(Collectors.joining("、"));
         StringBuilder sb = new StringBuilder();
-        sb.append("- 共 ").append(days).append(" 天；首日以 transport 节点启程（抵达），末日以 transport 节点返程。\n");
-        if (Boolean.TRUE.equals(state.getNoHotelNeeded())) {
-            sb.append("- 用户不需要酒店：不要安排 hotel 节点，住宿费用按 0 计；每天以当日首个景点为起点和终点。\n");
-        } else {
-            sb.append("- 每天以酒店为起点和终点。\n");
-        }
+        sb.append("- 共 ").append(days).append(" 天，只决定 attraction/restaurant 的分天与先后顺序。\n");
         if (Boolean.TRUE.equals(state.getNoAttractionNeeded())) {
-            sb.append("- 用户不需要景点：不要安排 attraction 节点；行程以餐饮（和酒店）为主。\n");
+            sb.append("- 用户不需要景点：不要输出 attraction。\n");
         } else if (state.getSelectedAttractionIds() != null && !state.getSelectedAttractionIds().isEmpty()) {
-            sb.append("- 用户已确认的景点必须全部安排进行程（缺一不可）；只有受硬约束（开放时间、劳累度上限）确实无法安排时才能少排，且必须在当天的 theme 或相应 note 中写明原因，不得静默遗漏。\n");
+            sb.append("- 已确认景点必须全部且各输出一次，不能因时间紧张或体力原因遗漏。\n");
         }
         if (Boolean.TRUE.equals(state.getNoFoodNeeded())) {
-            sb.append("- 用户不需要美食推荐：不要安排 restaurant 节点，用餐由用户自行解决、不产生餐费。\n");
+            sb.append("- 用户不需要餐厅：不要输出 restaurant。\n");
         } else {
             ResolvedPlanningPolicy planning = PlanningPolicyResolver.resolve(state);
-            sb.append("- 餐次执行策略（").append(planning.getPolicyVersion()).append("，需求快照 r")
-                    .append(planning.getRequirementSnapshotRevision()).append("）：")
+            sb.append("- 餐次策略：")
                     .append(renderMealRule(planning.getMeal().getLunch(), "午餐", "11:30-13:30"))
                     .append("；")
                     .append(renderMealRule(planning.getMeal().getDinner(), "晚餐", "17:30-19:30"))
-                    .append("；小吃/夜宵")
-                    .append(planning.getMeal().isSnacksAllowed() ? "允许作为额外节点，但不得充当正餐" : "不得安排")
-                    .append("。restaurant 的 note 必须标注午餐或晚餐；同一餐厅全程最多出现 1 次。\n");
+                    .append("；restaurant.note 只能写午餐或晚餐，同一餐厅全程最多一次。\n");
+            if (planning.getMeal().isExplicitMealComposition()) {
+                sb.append("- 餐食组成与用餐时间窗是两个维度：")
+                        .append(renderMealRule(planning.getMeal().getSnack(), "小吃", "午餐或晚餐时间窗"))
+                        .append("；")
+                        .append(renderMealRule(planning.getMeal().getMainMeal(), "正餐", "午餐或晚餐时间窗"))
+                        .append("。小吃可以占用一个用餐时间窗，但必须同时满足小吃/正餐各自数量；不要把小吃改写成正餐。\n");
+            }
         }
-        sb.append("- 带「夜景」标签的景点安排在 18:30 之后（晚餐后最佳），不得排到白天；确需白天安排时必须在 note 写明理由。\n");
-        sb.append("- 晚餐结束后仍可安排 1-2 个夜景/娱乐节点（酒吧、夜市、夜游等）；返程 transport 必须是当天最后一个节点，时间为最后活动结束后。\n");
         TravelPreference pref = state.getPreference();
-        String wake = pref == null ? null : pref.getWakeTime();
-        if (wake != null && !wake.isBlank()) {
-            sb.append("- 每天 ").append(wake).append(" 起床出发：首节点（抵达/首个景点）时间不早于 ")
-                    .append(wake).append("。\n");
-        }
         String deadline = pref == null ? null : pref.getReturnDeadline();
         if (deadline != null && !"UNLIMITED".equals(deadline)) {
-            sb.append("- 每晚 ").append(deadline).append(" 前回到")
-                    .append(state.getSelectedHotelIds().isEmpty() ? "家" : "酒店")
-                    .append("：当天最后一个活动必须在 ").append(deadline)
-                    .append(" 前结束，返程 transport 时间不得晚于 ").append(deadline).append("。\n");
+            sb.append("- 排序时为每晚 ").append(deadline).append(" 前结束活动留出余量。\n");
         }
         if (!attractions.isEmpty()) {
-            sb.append("- 景点时段分配：").append(allocationTemplate(pref, attractions.size())).append("\n");
+            sb.append("- 分配倾向：").append(allocationTemplate(pref, attractions.size())).append("；")
+                    .append("openTime 早结束的景点优先，夜景标签景点排在晚餐之后。\n");
             List<Attraction> nights = attractions.stream()
                     .filter(a -> NightScorer.isNight(a.getTags())).toList();
             if (!nights.isEmpty()) {
@@ -1312,42 +1415,24 @@ public class ItineraryService {
                         .max(Comparator.comparingInt(a -> NightScorer.score(a.getTags())))
                         .orElse(nights.get(0));
                 if ("ALL".equals(pref == null ? null : pref.getNightPlan())) {
-                    sb.append("- 夜景标签景点可都安排在晚上，但必须在返程截止时间前结束。\n");
+                    sb.append("- 所有夜景标签景点都可排在晚餐后。\n");
                 } else {
-                    sb.append("- 夜景时段只安排 1 个夜景景点：「").append(top.getName())
-                            .append("」（夜景系数最高）；其余夜景标签景点白天安排或在 note 说明原因。\n");
+                    sb.append("- 晚餐后只保留 1 个夜景景点，优先 id=").append(top.getId()).append("。\n");
                 }
             }
         }
-        boolean nightRequested = ItineraryValidator.nightRequested(pref, state.getRequirementSnapshot());
-        if (nightRequested) {
-            sb.append("- 用户要求夜间活动：当天行程可延伸至 23:00 以后，返程时间以最后活动结束为准。\n");
-        }
-        if (restSpots.isEmpty()) {
-            sb.append("- 高强度景点与低强度景点错开安排；无候选休息点，不插入 rest 节点。\n");
-        } else {
-            sb.append("- 高强度景点与低强度景点错开安排；如某天安排较满，可插入 1 个 rest 节点（候选休息点：")
-                    .append(restNames).append("）。\n");
-        }
-        sb.append("- 全程预算约 ").append(state.getPreference().getTotalBudget()).append(" 元，")
-                .append(state.getPreference().getPeopleCount() == null ? 2 : state.getPreference().getPeopleCount())
-                .append(" 人：餐费按人均价×人数计算，餐饮+门票+交通合计不得超过预算；超预算时优先选择人均价更低的餐厅。");
         if (state.getPreference().getSpecialRequests() != null
                 && !state.getPreference().getSpecialRequests().isBlank()) {
-            sb.append("\n- 用户特殊需求：「").append(state.getPreference().getSpecialRequests())
-                    .append("」，编排行程时尽量满足。");
+            sb.append("- 特殊需求只影响分天和顺序：「").append(state.getPreference().getSpecialRequests()).append("」。\n");
         }
         if (state.getExtraRequest() != null && !state.getExtraRequest().isBlank()) {
-            sb.append("\n- 用户在选点阶段额外提出：「").append(state.getExtraRequest())
-                    .append("」，安排行程时尽量兼顾。");
+            sb.append("- 选点补充要求：「").append(state.getExtraRequest()).append("」。\n");
         }
         if (state.getAdjustContext() != null && !state.getAdjustContext().isBlank()) {
             sb.append("\n\n【用户调整诉求与原行程】\n").append(state.getAdjustContext())
-                    .append("\n请在原行程基础上做局部调整（其余天数保持不变或仅微调），并同样遵守以上规则。")
-                    .append("如果调整诉求改变的是时间窗口（如返程时间推迟或提前），必须综合重排当天的节点时间与停留时长：")
-                    .append("把多出的时间合理分配给各节点（延长停留、更从容的用餐），并优先补回此前未安排的已选景点；不要只改动一个节点。");
+                    .append("\n只调整涉及的分天、地点顺序或餐次，仍只输出决策骨架；其他天保持原顺序。");
         }
-        return sb.toString();
+        return sb.toString().trim();
     }
 
     private static String renderMealRule(ResolvedPlanningPolicy.MealRule rule, String label, String window) {
@@ -1468,7 +1553,10 @@ public class ItineraryService {
             if (FatigueScorer.needsRest(FatigueScorer.combined(prev, base[i], next)) && !hasRestNode(day)) {
                 Attraction nearby = nearestRestSpot(day, restSpots, coords);
                 if (nearby != null) {
-                    injectedRests.add(injectRest(day, nearby));
+                    PlanNode injected = injectRest(day, nearby, attById);
+                    if (injected != null) {
+                        injectedRests.add(injected);
+                    }
                 }
             }
         }
@@ -1477,10 +1565,14 @@ public class ItineraryService {
         // 酒店是每天驻地、交通节点是行程骨架，不受此限；同一天内可重复）
         dedupAcrossDays(plan, attById, foodById, restById, attractions, restaurants, restSpots);
 
-        // 3.6 同一份策略确定性校正餐次：先去掉超额，再按范围补足；小吃永远不能补正餐。
+        // 3.6 同一份策略确定性校正餐次。默认小吃不能补正餐；用户明确餐食组成时，
+        // 午餐/晚餐只作为时间窗，小吃可占其中一个时间窗，餐食类型由逐需求验收单独检查。
         if (!planning.getMeal().isNoFood()) {
             reconcileMealPolicy(plan, planning, restaurants, foodById, coords);
         }
+
+        // 3.7 Agent 只返回地点决策；交通/酒店边界、缺省主题与景点说明由 Java 确定性补齐。
+        ItineraryDecisionSkeleton.complete(plan, hotels, Boolean.TRUE.equals(state.getNoHotelNeeded()));
 
         // 4. 时间轴确定性重算：通勤 + 停留时长 + 饭点锚定（LLM 时间仅作顺序参考；S10 起通勤走共享路线事实）
         int deadlineMin = ItineraryValidator.deadlineMinutes(state.getPreference());
@@ -1502,18 +1594,21 @@ public class ItineraryService {
             }
         }
 
-        // 4.5 注入的休息点（软性节点）不得把当天推到时间上限之外：越界则移除注入休息点并重算
+        // 4.5 注入的休息点（软性节点）不得超出自身开放时间，也不得把当天推到时间上限之外。
         for (DailyPlan d : plan.getDays()) {
             if (injectedRests.isEmpty() || d.getNodes().stream().noneMatch(injectedRests::contains)) {
                 continue;
             }
             int cap = ItineraryValidator.dayEndMin(d, state.getPreference(),
                     state.getRequirementSnapshot(), attById);
-            if (!dayEndsPast(d, cap)) {
+            boolean openingConflict = d.getNodes().stream()
+                    .filter(injectedRests::contains)
+                    .anyMatch(n -> !fitsOpeningHours(n, restById.get(n.getPlaceId())));
+            if (!openingConflict && !dayEndsPast(d, cap)) {
                 continue;
             }
             d.getNodes().removeIf(injectedRests::contains);
-            log.warn("[Itinerary] 第{}天注入休息点导致超出时间上限，已移除休息点并重算", d.getDayIndex());
+            log.warn("[Itinerary] 第{}天注入休息点不满足开放时间或时间上限，已移除并重算", d.getDayIndex());
             rescheduleDay(state, d, coords, attById, facts, returnAnchors.get(d), maxAnchorMin);
         }
 
@@ -1662,70 +1757,6 @@ public class ItineraryService {
         return max;
     }
 
-    /**
-     * 确定性预算修复（BUDGET_EXCEEDED）：用「未入行程的更便宜已选餐厅」替换行程中最贵的餐厅，
-     * 直至已核实费用不超过预算。只动用户已勾选的餐厅，不引入池外地点。返回修复后是否已在预算内。
-     */
-    private boolean budgetSwap(ItineraryPlan draft, List<Restaurant> restaurants, TravelPreference preference) {
-        BudgetBreakdown bill = draft.getBudgetBreakdown();
-        if (bill == null || bill.getKnownSubtotal() == null) {
-            return true;
-        }
-        BigDecimal budget = bill.getTotalBudget() == null ? preference.getTotalBudget() : bill.getTotalBudget();
-        if (budget == null) {
-            return true;
-        }
-        BigDecimal known = bill.getKnownSubtotal();
-        if (known.compareTo(budget) <= 0) {
-            return true;
-        }
-        int people = preference.getPeopleCount() == null ? 2 : preference.getPeopleCount();
-        Map<Long, Restaurant> byId = restaurants.stream().collect(Collectors.toMap(Restaurant::getId, r -> r));
-        // 可替换来源：已选但未入行程的餐厅
-        Set<Long> unused = new HashSet<>(byId.keySet());
-        for (DailyPlan d : draft.getDays()) {
-            for (PlanNode n : d.getNodes() == null ? List.<PlanNode>of() : d.getNodes()) {
-                if ("restaurant".equals(n.getType()) && n.getPlaceId() != null) {
-                    unused.remove(n.getPlaceId());
-                }
-            }
-        }
-        while (known.compareTo(budget) > 0) {
-            PlanNode priciest = null;
-            Restaurant priciestR = null;
-            for (DailyPlan d : draft.getDays()) {
-                for (PlanNode n : d.getNodes() == null ? List.<PlanNode>of() : d.getNodes()) {
-                    if ("restaurant".equals(n.getType()) && n.getPlaceId() != null) {
-                        Restaurant r = byId.get(n.getPlaceId());
-                        if (r != null && r.getAvgPrice() != null
-                                && (priciestR == null || r.getAvgPrice().compareTo(priciestR.getAvgPrice()) > 0)) {
-                            priciest = n;
-                            priciestR = r;
-                        }
-                    }
-                }
-            }
-            if (priciest == null) {
-                break;
-            }
-            final Restaurant target = priciestR;
-            Restaurant cheaper = unused.stream().map(byId::get)
-                    .filter(r -> r != null && r.getAvgPrice() != null
-                            && r.getAvgPrice().compareTo(target.getAvgPrice()) < 0)
-                    .min(Comparator.comparing(Restaurant::getAvgPrice))
-                    .orElse(null);
-            if (cheaper == null) {
-                break;
-            }
-            known = known.subtract(priciestR.getAvgPrice().multiply(BigDecimal.valueOf(people)))
-                    .add(cheaper.getAvgPrice().multiply(BigDecimal.valueOf(people)));
-            priciest.setPlaceId(cheaper.getId());
-            priciest.setName(cheaper.getName());
-            unused.remove(cheaper.getId());
-        }
-        return known.compareTo(budget) <= 0;
-    }
-
     /** 预算超支金额（已核实费用 − 预算；仅在已判定超预算的草稿上调用） */
     private BigDecimal budgetOverAmount(ItineraryPlan draft) {
         BudgetBreakdown bill = draft.getBudgetBreakdown();
@@ -1740,11 +1771,35 @@ public class ItineraryService {
                                              List<ItineraryRepairEngine.RepairViolation> violations) {
         List<String> parts = new ArrayList<>();
         for (ItineraryRepairEngine.RepairViolation v : violations) {
-            String label = violationLabel(v.code());
+            String label = requirementViolationLabel(v);
             List<String> names = nodeNamesOf(draft, v);
             parts.add(names.isEmpty() ? label : "第" + v.day() + "天「" + String.join("、", names) + "」" + label);
         }
         return parts.isEmpty() ? "存在未满足的发布条件" : String.join("；", parts);
+    }
+
+    private static String requirementViolationLabel(ItineraryRepairEngine.RepairViolation violation) {
+        if (violation == null || !("REQUIREMENT_VIOLATED".equals(violation.code())
+                || "REQUIREMENT_UNVERIFIABLE".equals(violation.code()))) {
+            return violationLabel(violation == null ? null : violation.code());
+        }
+        String detail = violation.detail() == null ? "" : violation.detail();
+        if (detail.contains("requirement=DEFAULT-LUNCH")) {
+            return "午餐数量不符合要求（小吃只有在用户明确指定餐食组成时才能占用午餐时段）";
+        }
+        if (detail.contains("requirement=DEFAULT-DINNER")) {
+            return "晚餐数量不符合要求（小吃只有在用户明确指定餐食组成时才能占用晚餐时段）";
+        }
+        if (detail.contains("reason=SNACK_COUNT_MISMATCH")) {
+            return "小吃数量不符合用户要求";
+        }
+        if (detail.contains("reason=MAIN_MEAL_COUNT_MISMATCH")) {
+            return "正餐数量不符合用户要求";
+        }
+        if (detail.contains("reason=RESTAURANT_FACT_MISSING")) {
+            return "餐厅类型信息缺失，无法核实餐食要求";
+        }
+        return violationLabel(violation.code());
     }
 
     private static String violationLabel(String code) {
@@ -1756,9 +1811,38 @@ public class ItineraryService {
             case "MEAL_WINDOW_UNSATISFIABLE" -> "缺用餐安排";
             case "DEPARTURE_ORDER" -> "返程位置不正确";
             case "HARD_CONSTRAINT_VIOLATED" -> "违反硬性要求";
-            case "BUDGET_EXCEEDED" -> "餐饮费用超预算";
+            case "BUDGET_EXCEEDED" -> "预计总费用超预算";
             default -> code;
         };
+    }
+
+    /** 比较 Agent 真正能修改的决策骨架，忽略确定性补齐的交通、时间、费用等字段。 */
+    static List<String> decisionSignature(ItineraryPlan plan) {
+        if (plan == null || plan.getDays() == null) {
+            return List.of();
+        }
+        List<String> signature = new ArrayList<>();
+        for (DailyPlan day : plan.getDays()) {
+            signature.add("day:" + day.getDayIndex());
+            if (day.getNodes() == null) {
+                continue;
+            }
+            for (PlanNode node : day.getNodes()) {
+                if (node == null || !("attraction".equals(node.getType())
+                        || "restaurant".equals(node.getType()))) {
+                    continue;
+                }
+                String meal = "";
+                String note = node.getNote() == null ? "" : node.getNote();
+                if (note.contains("午餐") || note.contains("午饭") || note.contains("中饭")) {
+                    meal = "LUNCH";
+                } else if (note.contains("晚餐") || note.contains("晚饭")) {
+                    meal = "DINNER";
+                }
+                signature.add(node.getType() + ":" + node.getPlaceId() + ":" + meal);
+            }
+        }
+        return signature;
     }
 
     /** 违规节点引用 → 节点名称（refs 与 PlanNodeRef.refs 同口径） */
@@ -1831,14 +1915,15 @@ public class ItineraryService {
     private void reconcileMealPolicy(ItineraryPlan plan, ResolvedPlanningPolicy planning,
                                      List<Restaurant> foods, Map<Long, Restaurant> foodById,
                                      Map<PlaceKey, double[]> coords) {
-        reconcileMealRule(plan, planning.getMeal().getLunch(), foods, foodById, coords);
-        reconcileMealRule(plan, planning.getMeal().getDinner(), foods, foodById, coords);
+        boolean allowSnackInWindow = planning.getMeal().isExplicitMealComposition();
+        reconcileMealRule(plan, planning.getMeal().getLunch(), foods, foodById, coords, allowSnackInWindow);
+        reconcileMealRule(plan, planning.getMeal().getDinner(), foods, foodById, coords, allowSnackInWindow);
     }
 
     /** 对一个餐次执行“去超额 → 补不足”，scope 与 operator 均来自统一策略。 */
     private void reconcileMealRule(ItineraryPlan plan, ResolvedPlanningPolicy.MealRule rule,
                                    List<Restaurant> foods, Map<Long, Restaurant> foodById,
-                                   Map<PlaceKey, double[]> coords) {
+                                   Map<PlaceKey, double[]> coords, boolean allowSnackInWindow) {
         if (rule == null) {
             return;
         }
@@ -1848,14 +1933,14 @@ public class ItineraryService {
                 if (!MealPolicySupport.eligible(day, rule.getSubject())) {
                     continue;
                 }
-                List<PlanNode> matches = mainMealNodes(day, rule.getSubject(), foodById);
+                List<PlanNode> matches = mealWindowNodes(day, rule.getSubject(), foodById, allowSnackInWindow);
                 if (operator == RequirementOperator.EQ || operator == RequirementOperator.AT_MOST) {
                     removeMealExcess(day, matches, rule.getCount());
-                    matches = mainMealNodes(day, rule.getSubject(), foodById);
+                    matches = mealWindowNodes(day, rule.getSubject(), foodById, allowSnackInWindow);
                 }
                 if (operator != RequirementOperator.AT_MOST) {
                     injectMealShortage(plan, day, rule.getSubject(), rule.getCount() - matches.size(),
-                            foods, foodById, coords);
+                            foods, foodById, coords, allowSnackInWindow);
                 }
             }
             return;
@@ -1866,7 +1951,7 @@ public class ItineraryService {
             if (!MealPolicySupport.eligible(day, rule.getSubject())) {
                 continue;
             }
-            for (PlanNode node : mainMealNodes(day, rule.getSubject(), foodById)) {
+            for (PlanNode node : mealWindowNodes(day, rule.getSubject(), foodById, allowSnackInWindow)) {
                 matches.add(new MealNodeLocation(day, node));
             }
         }
@@ -1886,27 +1971,28 @@ public class ItineraryService {
                 break;
             }
             if (!MealPolicySupport.eligible(day, rule.getSubject())
-                    || !mainMealNodes(day, rule.getSubject(), foodById).isEmpty()) {
+                    || !mealWindowNodes(day, rule.getSubject(), foodById, allowSnackInWindow).isEmpty()) {
                 continue;
             }
-            int before = mainMealNodes(day, rule.getSubject(), foodById).size();
-            injectMealShortage(plan, day, rule.getSubject(), 1, foods, foodById, coords);
-            int after = mainMealNodes(day, rule.getSubject(), foodById).size();
+            int before = mealWindowNodes(day, rule.getSubject(), foodById, allowSnackInWindow).size();
+            injectMealShortage(plan, day, rule.getSubject(), 1, foods, foodById, coords, allowSnackInWindow);
+            int after = mealWindowNodes(day, rule.getSubject(), foodById, allowSnackInWindow).size();
             if (after > before) {
                 missing--;
             }
         }
     }
 
-    private static List<PlanNode> mainMealNodes(DailyPlan day, RequirementSubject subject,
-                                                 Map<Long, Restaurant> foodById) {
+    private static List<PlanNode> mealWindowNodes(DailyPlan day, RequirementSubject subject,
+                                                  Map<Long, Restaurant> foodById,
+                                                  boolean allowSnackInWindow) {
         if (day.getNodes() == null) {
             return List.of();
         }
         return day.getNodes().stream()
                 .filter(n -> MealPolicySupport.isMealNode(n, subject))
                 .filter(n -> n.getPlaceId() != null && foodById.containsKey(n.getPlaceId()))
-                .filter(n -> !MealPolicySupport.isSnack(foodById.get(n.getPlaceId())))
+                .filter(n -> allowSnackInWindow || !MealPolicySupport.isSnack(foodById.get(n.getPlaceId())))
                 .toList();
     }
 
@@ -1918,7 +2004,7 @@ public class ItineraryService {
 
     private void injectMealShortage(ItineraryPlan plan, DailyPlan day, RequirementSubject subject, int missing,
                                     List<Restaurant> foods, Map<Long, Restaurant> foodById,
-                                    Map<PlaceKey, double[]> coords) {
+                                    Map<PlaceKey, double[]> coords, boolean allowSnackInWindow) {
         if (missing <= 0) {
             return;
         }
@@ -1929,7 +2015,7 @@ public class ItineraryService {
         for (int i = 0; i < missing; i++) {
             List<Restaurant> available = foods.stream()
                     .filter(r -> !used.contains(r.getId()))
-                    .filter(r -> !MealPolicySupport.isSnack(r))
+                    .filter(r -> allowSnackInWindow || !MealPolicySupport.isSnack(r))
                     .toList();
             if (available.isEmpty()) {
                 return;
@@ -1972,17 +2058,64 @@ public class ItineraryService {
                 && n.getNote() != null && n.getNote().contains(window));
     }
 
-    private PlanNode injectRest(DailyPlan d, Attraction restSpot) {
+    private PlanNode injectRest(DailyPlan d, Attraction restSpot, Map<Long, Attraction> attById) {
+        int insertionIndex = restInsertionIndex(d, attById);
+        if (insertionIndex < 0) {
+            return null;
+        }
         PlanNode rest = new PlanNode();
         rest.setType("rest");
         rest.setPlaceId(restSpot.getId());
         rest.setName(restSpot.getName());
-        rest.setTime("15:30");
         rest.setNote("休息点（缓解疲劳）");
-        d.getNodes().add(rest);
-        // S04：休息点插入导致疲劳的活动之间，按时间落位；每天最多自动补一次（调用方 hasRestNode 保证）
-        d.getNodes().sort(Comparator.comparing(n -> n.getTime() == null ? "99:99" : n.getTime()));
+        // Agent 的决策节点没有时间，不能用虚构的 15:30 与 null 时间排序，否则休息点会被排到早晨首站。
+        // 先按活动负荷选择插入位置，之后由 ScheduleBuilder 与其他节点一起计算真实到达时间。
+        d.getNodes().add(insertionIndex, rest);
         return rest;
+    }
+
+    /**
+     * 把自动休息放在一天的实质游览之间：至少完成一个景点，且后面仍有景点可游览。
+     * 以景点强度×建议时长的约 55% 为目标，在不越过最后一个景点的前提下选择最近的落点。
+     * 少于两个景点时不跨地点注入休息，避免出现“抵达后先休息”或“全部玩完再休息”。
+     */
+    private static int restInsertionIndex(DailyPlan d, Map<Long, Attraction> attById) {
+        if (d == null || d.getNodes() == null) {
+            return -1;
+        }
+        List<Integer> attractionIndexes = new ArrayList<>();
+        double totalLoad = 0;
+        for (int i = 0; i < d.getNodes().size(); i++) {
+            PlanNode node = d.getNodes().get(i);
+            if (node != null && "attraction".equals(node.getType())) {
+                attractionIndexes.add(i);
+                totalLoad += attractionLoad(node, attById);
+            }
+        }
+        if (attractionIndexes.size() < 2) {
+            return -1;
+        }
+
+        double targetLoad = totalLoad * 0.55;
+        double accumulated = 0;
+        // 最后一个景点不作为插入锚点，保证休息之后仍有实质游览。
+        for (int i = 0; i < attractionIndexes.size() - 1; i++) {
+            int nodeIndex = attractionIndexes.get(i);
+            accumulated += attractionLoad(d.getNodes().get(nodeIndex), attById);
+            if (accumulated >= targetLoad || i == attractionIndexes.size() - 2) {
+                return nodeIndex + 1;
+            }
+        }
+        return -1;
+    }
+
+    private static double attractionLoad(PlanNode node, Map<Long, Attraction> attById) {
+        Attraction attraction = node == null || attById == null ? null : attById.get(node.getPlaceId());
+        double hours = attraction == null || attraction.getSuggestHours() == null
+                ? 2.0 : Math.max(0.5, attraction.getSuggestHours());
+        int intensity = attraction == null || attraction.getIntensity() == null
+                ? 2 : Math.max(1, attraction.getIntensity());
+        return hours * intensity;
     }
 
     /** 距当天活动地点最近的休息点候选；全部超过 REST_MAX_KM 返回 null（宁可不注入，不为休息绕远路） */
@@ -2037,6 +2170,21 @@ public class ItineraryService {
         }
         int end = toMin(last.getTime()) + (last.getDurationMinutes() == null ? 0 : last.getDurationMinutes());
         return end > capMin;
+    }
+
+    private static boolean fitsOpeningHours(PlanNode node, Attraction attraction) {
+        if (node == null || attraction == null || node.getTime() == null) {
+            return true;
+        }
+        int arrive;
+        try {
+            arrive = toMin(node.getTime());
+        } catch (RuntimeException e) {
+            return false;
+        }
+        int duration = node.getDurationMinutes() == null ? 60 : node.getDurationMinutes();
+        return OpeningHoursParser.covers(attraction.getOpenTime(), arrive, arrive + duration)
+                != OpeningHoursParser.Status.CONFLICT;
     }
 
     /**

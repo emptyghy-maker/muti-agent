@@ -135,6 +135,20 @@ class ScheduleBuilderTest {
         assertThat(d.getNodes().get(0).getTime()).isEqualTo("10:00");
     }
 
+    @Test
+    void 早到景点时等待至开放时间再进入() {
+        Attraction lateOpen = attraction(2L, 2.0);
+        lateOpen.setOpenTime("10:00-17:30");
+        DailyPlan d = dayOf(List.of(
+                node("hotel", 1L, null),
+                node("attraction", 2L, null)));
+
+        ScheduleBuilder.schedule(d, Map.of(), Map.of(2L, lateOpen));
+
+        assertThat(d.getNodes().get(1).getTime()).isEqualTo("10:00");
+        assertThat(d.getNodes().get(1).getDurationMinutes()).isEqualTo(120);
+    }
+
     /** 夜景时段（18:30 后）到访的夜景标签景点按 2 小时封顶（用户口径：晚餐后约 20:00-22:00 夜景） */
     @Test
     void 夜景时段到访的夜景景点时长两小时封顶() {

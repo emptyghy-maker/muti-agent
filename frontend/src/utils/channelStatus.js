@@ -1,4 +1,4 @@
-const TERMINAL_CHANNEL_STATUSES = new Set(['READY', 'SKIPPED'])
+const TERMINAL_CHANNEL_STATUSES = new Set(['READY', 'SKIPPED', 'FALLBACK'])
 
 /**
  * 候选预热轮询只允许读取 channelStatus，不能把轮询快照的候选、阶段或已选项写回页面。
@@ -13,4 +13,9 @@ export function channelStatusFromSnapshot(snapshot) {
 /** READY 表示候选已生成；SKIPPED 表示用户明确不需要。两者都会终止该通道轮询。 */
 export function isChannelTerminal(status) {
   return TERMINAL_CHANNEL_STATUSES.has(status)
+}
+
+/** 只有 READY 才代表预生成结果已经持久化，能够直接进入下一候选框。 */
+export function isChannelReady(status) {
+  return status === 'READY'
 }

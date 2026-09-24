@@ -81,6 +81,7 @@ public final class ScheduleBuilder {
             PlaceKey key = PlaceKeyResolver.fromNode(n).orElse(null);
             if (i == 0) {
                 // 首节点（抵达交通/起点酒店）：09:00 开始，无出发信息；停留时长同样推进 cursor
+                cursor = alignToOpening(n, attById, cursor);
                 int dur = durationOf(n, attById, cursor);
                 n.setTime(toHm(cursor));
                 n.setDepartTime(null);
@@ -97,6 +98,7 @@ public final class ScheduleBuilder {
                     travel = travelMinutes(prevCoord, coord);
                 }
                 int arrival = cursor + travel;
+                arrival = alignToOpening(n, attById, arrival);
                 String meal = mealWindowOf(n);
                 if (meal != null) {
                     String winFrom = "午餐".equals(meal) ? MealTimeChecker.LUNCH_FROM : MealTimeChecker.DINNER_FROM;
@@ -153,6 +155,28 @@ public final class ScheduleBuilder {
             case "rest" -> REST_MIN;
             default -> 0;
         };
+    }
+
+    /** 到得过早时等到当天第一个可容纳该节点的开放区间；到得过晚交给发布校验处理。 */
+    private static int alignToOpening(PlanNode n, Map<Long, Attraction> attById, int arrivalMin) {
+        if (n == null || attById == null
+                || !("attraction".equals(n.getType()) || "rest".equals(n.getType()))) {
+            return arrivalMin;
+        }
+        Attraction a = attById.get(n.getPlaceId());
+        if (a == null) return arrivalMin;
+        int required = "rest".equals(n.getType()) ? REST_MIN
+                : Math.max(MIN_ATTRACTION_MIN, (int) Math.round(
+                        (a.getSuggestHours() == null ? 2.0 : a.getSuggestHours()) * 60));
+        for (int[] interval : OpeningHoursParser.parse(a.getOpenTime())) {
+            if (arrivalMin < interval[0] && interval[0] + required <= interval[1]) {
+                return interval[0];
+            }
+            if (arrivalMin >= interval[0] && arrivalMin + required <= interval[1]) {
+                return arrivalMin;
+            }
+        }
+        return arrivalMin;
     }
 
     /** 相邻节点通勤分钟：S10 起统一走 RouteFactEstimator（单一估算口径），无坐标段固定 30 分钟 */

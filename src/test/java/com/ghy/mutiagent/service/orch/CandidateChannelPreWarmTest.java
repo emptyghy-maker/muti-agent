@@ -36,6 +36,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -87,10 +88,10 @@ class CandidateChannelPreWarmTest {
                 preferenceAgent, requirementAgent, candidateService, itineraryService, usageService,
                 traceService, objectMapper, taskExecutor, operationService);
         orchestrator.generationRegistry = new GenerationRegistry();
-        when(traceService.newTrace(anyString(), anyString()))
+        org.mockito.Mockito.lenient().when(traceService.newTrace(anyString(), anyString()))
                 .thenAnswer(inv -> new TraceContext(inv.getArgument(0, String.class),
                         inv.getArgument(1, String.class)));
-        when(requirementAgent.analyze(anyString())).thenReturn(
+        org.mockito.Mockito.lenient().when(requirementAgent.analyze(anyString())).thenReturn(
                 Result.<String>builder().content(
                         "{\"mode\":\"agent\",\"focus\":[\"情侣约会\"],\"brief\":\"围绕约会定制。\","
                                 + "\"needs\":{\"path\":3,\"cost\":2,\"sightseeing\":4,\"food\":5},"
@@ -106,6 +107,8 @@ class CandidateChannelPreWarmTest {
             st.setFoodCandidates(List.of(batch));
             return 0;
         }).when(candidateService).nextFoodBatch(anyStateArg());
+        org.mockito.Mockito.lenient().when(coordinator.putResult(anyString(), anyString(), any()))
+                .thenReturn(true);
         actor = new AuthenticatedUser(1L, "admin", "ADMIN");
     }
 
@@ -228,6 +231,59 @@ class CandidateChannelPreWarmTest {
                 eq(CandidateChannelCoordinator.STATUS_READY));
         verify(coordinator, never()).putResult(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD),
                 org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void 预热结果写缓存失败时不得对前端声明已就绪() {
+        enableParallel();
+        TravelState s = state();
+        when(coordinator.putResult(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD), any()))
+                .thenReturn(false);
+
+        ReflectionTestUtils.invokeMethod(orchestrator, "doCompletePreference", s);
+
+        verify(coordinator).markReady(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD),
+                eq(CandidateChannelCoordinator.STATUS_FALLBACK));
+        verify(coordinator, never()).markReady(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD),
+                eq(CandidateChannelCoordinator.STATUS_READY));
+    }
+
+    @Test
+    void 美食缓存载荷损坏时确认景点应同步重建而不是系统错误() {
+        enableParallel();
+        TravelState s = state();
+        s.setStage(TravelStage.ATTRACTIONS);
+        when(sessionService.loadOwned("s-pre", 1L)).thenReturn(s);
+        when(coordinator.getResult(eq("s-pre"), eq(CandidateChannelCoordinator.CHANNEL_FOOD),
+                eq(CandidateChannelCoordinator.FoodChannelResult.class)))
+                .thenReturn(new CandidateChannelCoordinator.FoodChannelResult(
+                        null, 0, null, null, null));
+
+        ChatStepResult result = orchestrator.confirmCandidates(
+                actor, "s-pre", "ATTRACTION", List.of(1L), false);
+
+        assertThat(result.getStage()).isEqualTo(TravelStage.FOODS);
+        verify(candidateService).generateFoods(s);
+        verify(coordinator).markReady("s-pre", CandidateChannelCoordinator.CHANNEL_FOOD,
+                CandidateChannelCoordinator.STATUS_FALLBACK);
+    }
+
+    @Test
+    void 旧会话只有就绪标记却没有美食结果时应纠正假就绪并同步重建() {
+        enableParallel();
+        TravelState s = state();
+        s.setStage(TravelStage.ATTRACTIONS);
+        when(sessionService.loadOwned("s-pre", 1L)).thenReturn(s);
+        when(coordinator.ready("s-pre")).thenReturn(Map.of(
+                CandidateChannelCoordinator.CHANNEL_FOOD, CandidateChannelCoordinator.STATUS_READY));
+
+        ChatStepResult result = orchestrator.confirmCandidates(
+                actor, "s-pre", "ATTRACTION", List.of(1L), false);
+
+        assertThat(result.getStage()).isEqualTo(TravelStage.FOODS);
+        verify(candidateService).generateFoods(s);
+        verify(coordinator).markReady("s-pre", CandidateChannelCoordinator.CHANNEL_FOOD,
+                CandidateChannelCoordinator.STATUS_FALLBACK);
     }
 
     private static TravelState anyStateArg() {

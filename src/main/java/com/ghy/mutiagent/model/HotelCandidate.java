@@ -24,4 +24,6 @@ public class HotelCandidate {
     private String tags;
     /** 标签评分明细（如「+1.2 情侣/氛围 · −0.6 热闹」），前端悬浮说明 */
     private String tagNote;
+    /** 距用户指定位置锚点的距离（公里）；未指定或无法核实时为空。 */
+    private Double distanceToAnchor;
 }

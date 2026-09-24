@@ -2,6 +2,7 @@ package com.ghy.mutiagent.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ghy.mutiagent.config.FailoverChatModel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,8 +15,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 阿里云百炼联网检索客户端（阶段2）：直接调 OpenAI 兼容端点 + enable_search。
@@ -39,21 +42,63 @@ public class DashScopeSearchClient {
     /** 联网搜索模型（需支持 enable_search，如 qwen-plus/qwen-max/qwen3 系列） */
     @Value("${llm.search-model:qwen3.8-max}")
     private String searchModel;
+    @Value("${llm.search-fallbacks:}")
+    private String searchFallbacks;
+    @Value("${llm.routing.mode:FAILOVER}")
+    private String routingMode;
+    @Value("${llm.routing.cooldown-ms:1800000}")
+    private long cooldownMs;
+    @Value("${llm.routing.failover-on-timeout:false}")
+    private boolean failoverOnTimeout;
     @Value("${llm.search-timeout-ms:90000}")
     private long timeoutMs;
+
+    private final Map<String, Long> blockedUntil = new ConcurrentHashMap<>();
 
     public DashScopeSearchClient(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
     }
 
     /** 一次联网检索的原始结果（内容 + 用量） */
-    public record SearchResult(String content, Integer promptTokens, Integer completionTokens) {
+    public record SearchResult(String content, Integer promptTokens, Integer completionTokens, String model) {
+        /** 测试替身/旧调用兼容：未提供模型名时由调用方回退到配置主模型。 */
+        public SearchResult(String content, Integer promptTokens, Integer completionTokens) {
+            this(content, promptTokens, completionTokens, null);
+        }
     }
 
     /** 发起一次带联网搜索的对话；非 2xx 抛 IOException（调用方降级） */
     public SearchResult search(String systemPrompt, String userPrompt) throws IOException, InterruptedException {
+        List<String> models = availableModels();
+        Exception last = null;
+        for (int i = 0; i < models.size(); i++) {
+            String model = models.get(i);
+            try {
+                SearchResult result = searchOnce(model, systemPrompt, userPrompt);
+                blockedUntil.remove(model);
+                return result;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw e;
+            } catch (IOException e) {
+                last = e;
+                boolean hasNext = i + 1 < models.size();
+                if (!hasNext || "FIXED".equalsIgnoreCase(routingMode)
+                        || !FailoverChatModel.isFailoverEligible(e, failoverOnTimeout)) {
+                    throw e;
+                }
+                blockedUntil.put(model, System.currentTimeMillis() + Math.max(1_000L, cooldownMs));
+                log.warn("[LLM_ROUTE] route=search model={} failed; switching to {} reason={}",
+                        model, models.get(i + 1), UsageService.clip(e.getMessage(), 300));
+            }
+        }
+        throw last instanceof IOException io ? io : new IOException("联网检索没有可用模型", last);
+    }
+
+    private SearchResult searchOnce(String model, String systemPrompt, String userPrompt)
+            throws IOException, InterruptedException {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("model", searchModel);
+        body.put("model", model);
         body.put("temperature", 0.2);
         // 扩充检索：一次尽可能多返回（提示词上限 20 条），token 预算相应放宽
         body.put("max_tokens", 4096);
@@ -86,7 +131,24 @@ public class DashScopeSearchClient {
         JsonNode usage = root.path("usage");
         Integer pt = usage.path("prompt_tokens").isMissingNode() ? null : usage.path("prompt_tokens").asInt();
         Integer ct = usage.path("completion_tokens").isMissingNode() ? null : usage.path("completion_tokens").asInt();
-        log.info("[DashScopeSearch] model={} promptTokens={} completionTokens={}", searchModel, pt, ct);
-        return new SearchResult(content, pt, ct);
+        log.info("[DashScopeSearch] model={} promptTokens={} completionTokens={}", model, pt, ct);
+        return new SearchResult(content, pt, ct, model);
+    }
+
+    private List<String> availableModels() {
+        LinkedHashSet<String> configured = new LinkedHashSet<>();
+        configured.add(searchModel.trim());
+        if (!"FIXED".equalsIgnoreCase(routingMode) && searchFallbacks != null) {
+            for (String value : searchFallbacks.split(",")) {
+                if (!value.isBlank()) {
+                    configured.add(value.trim());
+                }
+            }
+        }
+        long now = System.currentTimeMillis();
+        List<String> available = configured.stream()
+                .filter(model -> blockedUntil.getOrDefault(model, 0L) <= now)
+                .toList();
+        return available.isEmpty() ? List.of(searchModel.trim()) : available;
     }
 }

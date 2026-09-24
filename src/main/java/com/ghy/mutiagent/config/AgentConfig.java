@@ -32,8 +32,9 @@ import java.nio.charset.StandardCharsets;
  * 输出格式的固定标准与解析规则见 docs/agent-io-spec.md（唯一规范文档）。
  *
  * 模型分层：
- * - 小任务（偏好解析/需求分析/候选重筛）：defaultChatModel（qwen3.7-flash，快且便宜）；
- * - 重任务（行程规划）：sqlChatModel（qwen3.8-max，多约束编排质量最关键）。
+ * - 小任务（偏好解析/需求分析/候选重筛）：defaultChatModel 快模型池；
+ * - 重任务（行程规划）：sqlChatModel 规划模型池；
+ * - 生产只对额度/限流/不可用故障切换，评测模式固定单一模型。
  */
 @Configuration
 public class AgentConfig {

@@ -62,4 +62,13 @@ class ChunkPlanningTest {
         assertNotNull(ok);
         assertEquals(1, ok.getDays().size());
     }
+
+    @Test
+    void repairOutputTruncatedInsideBudgetLineReturnsParseFailureInsteadOfSystemError() {
+        String truncated = "{\"days\":[{\"dayIndex\":1,\"theme\":\"新街口约会\",\"nodes\":[]}]"
+                + ",\"budgetBreakdown\":{\"lines\":[{\"label\":\"门票\"},{\"item";
+
+        assertNull(ItineraryService.parsePlanJson(truncated),
+                "修复输出被 max_tokens 截断时应返回解析失败，让状态机进入下一轮，而不是抛出系统异常");
+    }
 }

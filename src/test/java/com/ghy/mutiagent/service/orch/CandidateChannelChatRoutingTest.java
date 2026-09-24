@@ -3,7 +3,9 @@ package com.ghy.mutiagent.service.orch;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ghy.mutiagent.agent.PreferenceAgent;
 import com.ghy.mutiagent.agent.RequirementAgent;
+import com.ghy.mutiagent.model.AttractionCandidate;
 import com.ghy.mutiagent.model.ChatStepResult;
+import com.ghy.mutiagent.model.LocationConstraint;
 import com.ghy.mutiagent.model.TravelPreference;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.enums.TravelStage;
@@ -28,6 +30,7 @@ import org.springframework.core.task.TaskExecutor;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -168,5 +171,51 @@ class CandidateChannelChatRoutingTest {
         // 覆盖预热旧结果：确认环节命中缓存拿到的是本次最新酒店池
         verify(coordinator).putResult(eq("s-route"), eq(CandidateChannelCoordinator.CHANNEL_HOTEL),
                 any(CandidateChannelCoordinator.HotelChannelResult.class));
+    }
+
+    @Test
+    void 景点太少触发扩充而不是把反馈写成旅行需求() {
+        TravelState s = state(TravelStage.ATTRACTIONS);
+        s.setExtraRequest("三牌楼附近的网红打卡景点");
+        s.setWebAttractionSearchKey("confirm:old");
+        LocationConstraint location = new LocationConstraint();
+        location.setAnchorName("南京邮电大学三牌楼校区");
+        location.setLng(118.770844);
+        location.setLat(32.081113);
+        location.setRadiusKm(3);
+        location.setStatus(LocationConstraint.RESOLVED);
+        location.setScopes(List.of("ATTRACTION"));
+        s.setLocationConstraint(location);
+        s.setAttractionPool(List.of(attractionCandidate(1), attractionCandidate(2), attractionCandidate(3)));
+
+        ChatStepResult result = refine(s, "景点太少了，我怎么挑选？");
+
+        verify(candidateService).generateAttractions(s);
+        verify(candidateService, never()).generateFoods(any());
+        assertThat(s.getWebAttractionSearchKey()).isNull();
+        assertThat(s.channelRequestOf(CandidateChannelCoordinator.CHANNEL_ATTRACTION))
+                .isEqualTo("三牌楼附近的网红打卡景点");
+        assertThat(result.getMessage()).contains("只有 3 个", "扩大到5公里");
+        assertThat(s.getRequirementSnapshot()).isNull();
+    }
+
+    @Test
+    void 用户确认扩大到五公里会更新既有地点半径并重筛() {
+        TravelState s = state(TravelStage.ATTRACTIONS);
+        s.setExtraRequest("南京邮电大学三牌楼校区附近的网红景点");
+
+        refine(s, "扩大到5公里");
+
+        verify(candidateService).generateAttractions(s);
+        assertThat(s.getLocationConstraint()).isNotNull();
+        assertThat(s.getLocationConstraint().getAnchorName()).isEqualTo("南京邮电大学三牌楼校区");
+        assertThat(s.getLocationConstraint().getRadiusKm()).isEqualTo(5.0);
+    }
+
+    private static AttractionCandidate attractionCandidate(long id) {
+        AttractionCandidate candidate = new AttractionCandidate();
+        candidate.setAttractionId(id);
+        candidate.setName("景点" + id);
+        return candidate;
     }
 }

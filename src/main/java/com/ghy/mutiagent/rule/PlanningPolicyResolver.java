@@ -42,6 +42,8 @@ public final class PlanningPolicyResolver {
         boolean structuredLunch = false;
         boolean structuredDinner = false;
         boolean structuredSnacks = false;
+        boolean structuredSnackCount = false;
+        boolean structuredMainMealCount = false;
         boolean explicitMealStructure = false;
         List<ConstraintEntry> entries = snapshot == null || snapshot.getConstraints() == null
                 ? List.of() : snapshot.getConstraints();
@@ -91,6 +93,16 @@ public final class PlanningPolicyResolver {
                 meal.setDinner(ruleOf(e));
                 structuredDinner = true;
                 explicitMealStructure = true;
+            } else if (e.getSubject() == RequirementSubject.SNACK) {
+                meal.setSnack(ruleOf(e));
+                meal.setSnacksAllowed(e.getCount() > 0);
+                structuredSnacks = true;
+                structuredSnackCount = true;
+                explicitMealStructure = true;
+            } else if (e.getSubject() == RequirementSubject.MAIN_MEAL) {
+                meal.setMainMeal(ruleOf(e));
+                structuredMainMealCount = true;
+                explicitMealStructure = true;
             } else if (e.getSubject() == RequirementSubject.BREAKFAST && e.getCount() > 0) {
                 out.getBlockingRequirementIds().add(idOf(e));
             }
@@ -126,6 +138,7 @@ public final class PlanningPolicyResolver {
             // 用户明确给出正餐数量时，未提小吃不允许用小吃凑正餐数量。
             meal.setSnacksAllowed(false);
         }
+        meal.setExplicitMealComposition(structuredSnackCount || structuredMainMealCount);
 
         if (!structuredLunch) {
             meal.setLunch(ResolvedPlanningPolicy.MealRule.defaultPerDay(RequirementSubject.LUNCH));
@@ -153,6 +166,8 @@ public final class PlanningPolicyResolver {
         int days = preference == null || preference.getDays() == null ? 0 : preference.getDays();
         validateRule(meal.getLunch(), days, out);
         validateRule(meal.getDinner(), days, out);
+        validateRule(meal.getSnack(), days, out);
+        validateRule(meal.getMainMeal(), days, out);
     }
 
     private static void validateRule(ResolvedPlanningPolicy.MealRule rule, int days,
@@ -164,10 +179,12 @@ public final class PlanningPolicyResolver {
             out.getConflictCodes().add(rule.getSubject() + "_NEGATIVE_COUNT");
         }
         // 当前节点模型一天只有一个午餐窗和一个晚餐窗；大于 1 必须让用户改成全程口径或放宽。
-        if (rule.getScope() == RequirementScope.PER_DAY && rule.getCount() > 1) {
+        if ((rule.getSubject() == RequirementSubject.LUNCH || rule.getSubject() == RequirementSubject.DINNER)
+                && rule.getScope() == RequirementScope.PER_DAY && rule.getCount() > 1) {
             out.getConflictCodes().add(rule.getSubject() + "_PER_DAY_LIMIT_EXCEEDED");
         }
-        if (days > 0 && rule.getScope() == RequirementScope.TRIP && rule.getCount() > days) {
+        if ((rule.getSubject() == RequirementSubject.LUNCH || rule.getSubject() == RequirementSubject.DINNER)
+                && days > 0 && rule.getScope() == RequirementScope.TRIP && rule.getCount() > days) {
             out.getConflictCodes().add(rule.getSubject() + "_TRIP_EXCEEDS_AVAILABLE_DAYS");
         }
     }

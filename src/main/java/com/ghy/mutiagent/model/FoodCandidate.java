@@ -31,5 +31,7 @@ public class FoodCandidate {
         private String reason;
         /** 来源：KB=知识库种子 / WEB_SEARCH=联网检索（前端徽章区分） */
         private String source;
+        /** 距用户指定位置锚点的距离（公里）；未指定或无法核实时为空。 */
+        private Double distanceToAnchor;
     }
 }

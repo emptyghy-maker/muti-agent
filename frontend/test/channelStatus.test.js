@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { channelStatusFromSnapshot, isChannelTerminal } from '../src/utils/channelStatus.js'
+import { channelStatusFromSnapshot, isChannelReady, isChannelTerminal } from '../src/utils/channelStatus.js'
 
 test('轮询快照只提取通道状态，不携带服务端旧的景点选择', () => {
   const snapshot = {
@@ -19,11 +19,19 @@ test('轮询快照只提取通道状态，不携带服务端旧的景点选择',
   assert.equal(snapshot.channelStatus.FOOD, 'READY')
 })
 
-test('READY 与 SKIPPED 都是轮询终态，RUNNING 和缺失状态不是', () => {
+test('READY、SKIPPED 与 FALLBACK 都是轮询终态，RUNNING 和缺失状态不是', () => {
   assert.equal(isChannelTerminal('READY'), true)
   assert.equal(isChannelTerminal('SKIPPED'), true)
+  assert.equal(isChannelTerminal('FALLBACK'), true)
   assert.equal(isChannelTerminal('RUNNING'), false)
   assert.equal(isChannelTerminal(undefined), false)
+})
+
+test('只有 READY 可以显示并打开已准备好的候选框', () => {
+  assert.equal(isChannelReady('READY'), true)
+  assert.equal(isChannelReady('FALLBACK'), false)
+  assert.equal(isChannelReady('SKIPPED'), false)
+  assert.equal(isChannelReady(undefined), false)
 })
 
 test('没有合法 channelStatus 时不更新页面状态', () => {

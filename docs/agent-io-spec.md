@@ -34,7 +34,7 @@
 
 | Agent | 格式 |
 |---|---|
-| 行程规划 | `{"days":[{"dayIndex":1,"theme":"一句话","nodes":[{"type":"transport","placeId":null,"time":"10:00","note":"抵达"}]}]}`；节点只输出 type/placeId/time/note 四个字段，theme/note ≤15 字 |
+| 行程规划 | `{"days":[{"dayIndex":1,"theme":"一句话","nodes":[{"type":"attraction","placeId":7},{"type":"restaurant","placeId":17,"note":"午餐"}]}]}`；Agent 只输出 attraction/restaurant 的分天、顺序与餐次，交通/酒店/休息点/时间/费用由 Java 补齐 |
 | 偏好解析 | `{"updates":{"字段":"值"},"conflict":null}`；updates 只包含用户明确提到的字段 |
 | 需求分析 | `{"mode":"workflow"或"agent","focus":["关注点"],"brief":"一句话","needs":{"path":3,"cost":3,"sightseeing":3,"food":3}}`；needs 取值 1~5 |
 

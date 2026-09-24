@@ -14,7 +14,7 @@ import java.util.List;
  */
 @Data
 public class ResolvedPlanningPolicy {
-    public static final String VERSION = "meal-policy-v1";
+    public static final String VERSION = "meal-policy-v2";
 
     private String policyVersion = VERSION;
     private int requirementSnapshotRevision;
@@ -30,6 +30,12 @@ public class ResolvedPlanningPolicy {
     public static class MealPolicy {
         private MealRule lunch;
         private MealRule dinner;
+        /** 用户明确要求的小吃数量。 */
+        private MealRule snack;
+        /** 用户明确要求的正餐数量。 */
+        private MealRule mainMeal;
+        /** true 时午餐/晚餐只表示时间窗，小吃可以占用其中一个时间窗。 */
+        private boolean explicitMealComposition;
         private Integer lunchCandidateCount;
         private Integer dinnerCandidateCount;
         private boolean snacksAllowed = true;

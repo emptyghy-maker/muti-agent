@@ -15,20 +15,38 @@ llm:
   api-key: ${QWEN_API_KEY}
   # 强制 JSON 输出（DashScope 兼容模式支持 json_object）；如接口报不支持，置空回滚
   response-format: ${QWEN_RESPONSE_FORMAT:json_object}
+  # 生产默认 FAILOVER：仅额度/限流/服务不可用时切换；评测必须设 FIXED，保证一个样本只跑指定模型。
+  routing:
+    mode: ${LLM_ROUTING_MODE:FAILOVER}
+    cooldown-ms: ${LLM_ROUTING_COOLDOWN_MS:1800000}
+    # 超时可能已产生费用且继续换模型会拉长尾延迟，默认不因超时切换。
+    failover-on-timeout: ${LLM_FAILOVER_ON_TIMEOUT:false}
   models:
-    default: ${QWEN_MODEL_DEFAULT:qwen3.8-flash}
-    # 行程规划模型：qwen3.8-max 开启思考时实测 300s 超时（O7 核实），默认降级为 qwen3.7-flash；
-    # 需要高质量时可环境变量 QWEN_MODEL_SQL=qwen3.8-max 覆盖
-    sql: ${QWEN_MODEL_SQL:qwen3.7-flash}
-  # 阶段2 联网检索（enable_search）：qwen3.7-flash 已实测支持联网+关思考（约12s 返回），
-  # 原默认 qwen3.8-max 开启思考时实测稳定超时（90s 无产出）
-  search-model: ${QWEN_SEARCH_MODEL:qwen3.7-flash}
+    # 快任务优先消耗较早到期的独立免费桶；别名 qwen3.7-flash 的免费桶已耗尽，不再使用。
+    default: ${QWEN_MODEL_DEFAULT:qwen3.7-flash-2026-07-15}
+    default-fallbacks: ${QWEN_MODEL_DEFAULT_FALLBACKS:qwen3.8-flash}
+    # 行程规划以 27B 平衡质量和速度；Max 仅在额度/限流故障时接管，不因质量差自动换模型。
+    sql: ${QWEN_MODEL_SQL:qwen3.8-27b}
+    sql-fallbacks: ${QWEN_MODEL_SQL_FALLBACKS:qwen3.8-max-0902,qwen3.8-flash}
+    # Qwen3.8 默认 xhigh 思考；规划 Agent 只负责分天/排序/餐次，普通调用显式关闭隐藏推理。
+    sql-reasoning-effort: ${QWEN_PLAN_REASONING_EFFORT:none}
+    sql-max-tokens: ${QWEN_PLAN_MAX_TOKENS:1024}
+    # 修复使用快模型，避免一次修复等待 300 秒；强修复仍复用 sql 模型池。
+    repair: ${QWEN_MODEL_REPAIR:qwen3.8-flash}
+    repair-fallbacks: ${QWEN_MODEL_REPAIR_FALLBACKS:qwen3.7-flash-2026-07-15,qwen3.8-27b}
+  # 阶段2 联网检索（enable_search）：客户端显式关闭思考并按同一故障类型切换模型。
+  search-model: ${QWEN_SEARCH_MODEL:qwen3.7-flash-2026-07-15}
+  search-fallbacks: ${QWEN_SEARCH_FALLBACKS:qwen3.8-flash}
   search-timeout-ms: ${QWEN_SEARCH_TIMEOUT_MS:90000}
   # 模型计费单价（元/百万 token，输入/输出），用于用量审计台的费用估算
   pricing:
-    qwen3.7-flash: { in: 0.225, out: 0.974 }
-    qwen3.8-flash: { in: 1.094, out: 3.427 }
+    # 华北2（北京）公开价；免费额度内仍记录等价成本，便于不同模型横向比较。
+    qwen3.7-flash: { in: 0.2, out: 0.8 }
+    qwen3.7-flash-2026-07-15: { in: 0.2, out: 0.8 }
+    qwen3.8-flash: { in: 0.8, out: 2.7 }
+    qwen3.8-27b: { in: 3, out: 12 }
     qwen3.8-max: { in: 12, out: 36 }
+    qwen3.8-max-0902: { in: 12, out: 36 }
     deepseek-v4-flash-0731: { in: 1.5, out: 4.5 }
     glm-5.2: { in: 8, out: 28 }
     kimi-k3: { in: 20, out: 100 }
@@ -90,4 +108,3 @@ food-promotion:
   recommend-threshold: 3
   select-threshold: 2
   reuse-freshness-days: 90
-

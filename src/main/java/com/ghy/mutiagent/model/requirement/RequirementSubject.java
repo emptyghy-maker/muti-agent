@@ -5,6 +5,10 @@ public enum RequirementSubject {
     BREAKFAST,
     LUNCH,
     DINNER,
+    /** 餐食类型：小吃/夜宵，与午餐、晚餐时间窗正交。 */
+    SNACK,
+    /** 餐食类型：非小吃的正餐，与午餐、晚餐时间窗正交。 */
+    MAIN_MEAL,
     SNACK_ALLOWED,
     NO_FOOD,
     LUNCH_RESTAURANT,

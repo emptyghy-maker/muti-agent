@@ -32,16 +32,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
  * 预算知情放行守卫回归（S08 修复循环内的预算分支）：
- * 1. 预算超支是当前唯一违规 → 确定性换店失败后进入「待确认」知情放行（不走模型修复耗到 422）；
- * 2. 预算超支与其他违规（如开放时间冲突）并存 → 修复耗尽后仍进入「待确认」知情放行（预算绝不硬拦），
- *    但用户「确认发布」时 publishPending 复验必须拦截其余违规（26:30 事故根修不因预算放行而失守）。
+ * 1. 预算超支是当前唯一违规 → 立即进入「待确认」知情放行（不走模型修复耗到 422）；
+ * 2. 预算超支与其他违规（如开放时间冲突）并存 → 立即进入「待确认」并返回具体阻断，
+ *    不调用 RepairAgent；publishPending 复验仍必须拦截其余违规。
  * 回归背景：BUDGET_EXCEEDED 在统一层标记为 repairable=true，若用 repairableViolations.isEmpty()
  * 判断「唯一违规」会把知情放行彻底堵死（每次修复耗尽后 422）。
  */
@@ -184,11 +182,8 @@ class ItineraryBudgetGuardTest {
     void 预算与开放时间冲突并存时知情放行待确认且发布前复验拦截() {
         List<Long> ids = List.of(1L, 2L);
         Attraction a1 = attraction(1, "景点A", 2.0);
-        a1.setOpenTime("14:00-18:00"); // 排程落在 09:30-11:30 → OPENING_HOURS_CONFLICT
+        a1.setOpenTime("08:00-10:00"); // 09:30 到达后不足 2h，仍为 OPENING_HOURS_CONFLICT
         stubPlanEntities(List.of(a1, attraction(2, "景点B", 2.0)), planJson(ids));
-        // 修复无进展（返回原样输出）：预算超支不硬拦，修复耗尽后进入待确认知情放行
-        when(repairAgent.repair(anyString()))
-                .thenReturn(Result.<String>builder().content(planJson(ids)).build());
         TravelState st = state("s-budget-mixed", ids);
 
         svc.generate(st);
@@ -196,7 +191,9 @@ class ItineraryBudgetGuardTest {
         assertThat(st.getPendingBudgetConfirm()).isTrue();
         assertThat(st.getPendingPlan()).isNotNull();
         assertThat(st.getPendingBudgetOver()).isPositive();
-        verify(repairAgent, times(2)).repair(anyString());
+        assertThat(st.getPendingPlanIssues()).singleElement().asString()
+                .contains("景点A", "超出开放时间");
+        verifyNoInteractions(repairAgent);
 
         // 用户「确认发布」必须复验：开放时间冲突仍在 → 拒绝发布（26:30 事故根修不因预算放行而失守），
         // 且拒绝消息指向具体节点（第1天「景点A」超出开放时间）

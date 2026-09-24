@@ -9,6 +9,7 @@ import com.ghy.mutiagent.model.FoodCandidate;
 import com.ghy.mutiagent.model.TravelPreference;
 import com.ghy.mutiagent.model.TravelState;
 import com.ghy.mutiagent.model.enums.TravelStage;
+import com.ghy.mutiagent.repository.entity.Attraction;
 import com.ghy.mutiagent.repository.entity.Restaurant;
 import com.ghy.mutiagent.repository.mapper.AttractionMapper;
 import com.ghy.mutiagent.repository.mapper.HotelMapper;
@@ -38,6 +39,7 @@ import static org.mockito.Mockito.when;
  */
 class CandidateServiceTest {
 
+    private AttractionMapper attractionMapper;
     private RestaurantMapper restaurantMapper;
     private FoodAgent foodAgent;
     private TraceService traceService;
@@ -45,13 +47,14 @@ class CandidateServiceTest {
 
     @BeforeEach
     void setUp() {
+        attractionMapper = mock(AttractionMapper.class);
         restaurantMapper = mock(RestaurantMapper.class);
         foodAgent = mock(FoodAgent.class);
         traceService = mock(TraceService.class);
         TraceContext ctx = mock(TraceContext.class);
         when(traceService.newTrace(anyString(), anyString())).thenReturn(ctx);
         svc = new CandidateService(
-                mock(AttractionMapper.class), restaurantMapper, mock(HotelMapper.class),
+                attractionMapper, restaurantMapper, mock(HotelMapper.class),
                 mock(AttractionAgent.class), foodAgent, mock(HotelAgent.class),
                 traceService, mock(UsageService.class),
                 new ObjectMapper(), new CandidateFoodConfig());
@@ -236,5 +239,35 @@ class CandidateServiceTest {
         svc.generateFoods(st);
 
         assertThat(st.getFoodPool().stream().map(FoodCandidate::getCuisine)).doesNotContain("小吃");
+    }
+
+    @Test
+    void 已选联网景点缺少坐标时仍能生成美食候选() {
+        Attraction webAttraction = new Attraction();
+        webAttraction.setId(99L);
+        webAttraction.setName("新街口德基广场");
+        webAttraction.setAddress("南京市新街口商圈");
+        webAttraction.setSource("WEB_SEARCH");
+        // 联网结果允许只有名称和地址，经纬度尚未补齐。
+        webAttraction.setLng(null);
+        webAttraction.setLat(null);
+        when(attractionMapper.selectBatchIds(any())).thenReturn(List.of(webAttraction));
+        when(restaurantMapper.selectList(any())).thenReturn(List.of(
+                r(1, "本地菜", 4.8), r(2, "西餐", 4.6)));
+
+        TravelState st = new TravelState();
+        st.setSessionId("web-attraction-without-coordinate");
+        st.setUserId(1L);
+        st.setDestinationId(1L);
+        st.setDestinationName("南京");
+        st.setStage(TravelStage.FOODS);
+        st.setSelectedAttractionIds(List.of(99L));
+
+        svc.generateFoods(st);
+
+        assertThat(st.getFoodPool())
+                .flatExtracting(FoodCandidate::getRestaurants)
+                .extracting(FoodCandidate.FoodItem::getRestaurantId)
+                .containsExactlyInAnyOrder(1L, 2L);
     }
 }

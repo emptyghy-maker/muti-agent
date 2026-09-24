@@ -106,6 +106,8 @@ public class TravelState {
     private int planRevision;
     /** Agent 针对特殊要求给出的「推荐方法」建议文本（展示在前端候选区） */
     private String candidateAdvice;
+    /** 各候选阶段的推荐方法快照；用户返回上一步时恢复对应文案，避免被下游阶段覆盖。 */
+    private Map<String, String> candidateAdvices = new LinkedHashMap<>();
     /** 阶段2：联网检索的美食候选（知识库外，仅参考展示，未经审核不入知识库、暂不进行程） */
     private List<WebFoodCandidate> webFoodCandidates;
     /** 联网检索的景点候选（知识库外补充；经校验入库后进入备选池） */
@@ -131,6 +133,8 @@ public class TravelState {
     private Boolean planQuizAnswered;
     /** 需求关键字（确定性规则 + RequirementAgent 输出合并）：候选匹配加权用 */
     private List<String> needTags;
+    /** “某地附近”结构化约束：解析一次，景点/餐厅/酒店候选和最终验收共同执行。 */
+    private LocationConstraint locationConstraint;
     /** AHP 评分权重快照（path/cost/sightseeing/food），需求分析后计算，各阶段评分共用 */
     private Map<String, Double> weights;
 
@@ -154,6 +158,8 @@ public class TravelState {
     private Boolean pendingBudgetConfirm;
     /** 预算超支待确认的超支金额（展示文案用） */
     private BigDecimal pendingBudgetOver;
+    /** 预算待确认草稿中除预算外的发布阻断；非空时前端只允许返回修改。 */
+    private List<String> pendingPlanIssues = new ArrayList<>();
     /** 用户确认发布过超预算行程（审计标记，发布后留存） */
     private Boolean budgetOverrideAccepted;
     /** ADJUST 调整模式上下文（原行程 JSON + 用户诉求），仅调整流程使用 */
@@ -168,6 +174,28 @@ public class TravelState {
             restartResults = new LinkedHashMap<>();
         }
         return restartResults;
+    }
+
+    public Map<String, String> candidateAdvices() {
+        if (candidateAdvices == null) {
+            candidateAdvices = new LinkedHashMap<>();
+        }
+        return candidateAdvices;
+    }
+
+    public void rememberCandidateAdvice(String channel) {
+        if (channel == null) {
+            return;
+        }
+        if (candidateAdvice == null || candidateAdvice.isBlank()) {
+            candidateAdvices().remove(channel);
+        } else {
+            candidateAdvices().put(channel, candidateAdvice);
+        }
+    }
+
+    public String candidateAdviceOf(String channel) {
+        return channel == null ? null : candidateAdvices().get(channel);
     }
 
     // ============ 本轮对话的临时用量归集（仅内存，不序列化进 Redis） ============

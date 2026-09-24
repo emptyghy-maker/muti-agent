@@ -100,6 +100,19 @@ class ItineraryRestInjectionTest {
         return d;
     }
 
+    /** P4 决策协议：Agent 只返回地点顺序，不返回交通节点和时间。 */
+    private static DailyPlan decisionOnlyDay() {
+        DailyPlan d = new DailyPlan();
+        d.setDayIndex(1);
+        d.setNodes(new ArrayList<>(List.of(
+                node("attraction", 5L, null, null),
+                node("restaurant", 86L, null, "午餐"),
+                node("attraction", 44L, null, null),
+                node("restaurant", 85L, null, "晚餐"),
+                node("attraction", 1L, null, null))));
+        return d;
+    }
+
     private TravelState state(String deadline) {
         TravelState s = new TravelState();
         s.setSessionId("s-rest");
@@ -175,5 +188,59 @@ class ItineraryRestInjectionTest {
         PlanNode last = nodes.get(nodes.size() - 1);
         assertThat(last.getType()).isEqualTo("transport");
         assertThat(last.getTime()).isNotNull().isLessThan("22:31");
+    }
+
+    @Test
+    void 注入休息点超过自身开放时间时自动移除() {
+        List<Attraction> attractions = List.of(
+                attraction(1, "夫子庙秦淮风光带", 3.0, 2, "夜景,游船,街区", 120.68, 31.29),
+                attraction(44, "1912街区", 2.0, 1, "街区,夜景,酒吧", 120.62, 31.30),
+                attraction(5, "玄武湖", 3.0, 2, "自然风光,湖景", 120.63, 31.31));
+        List<Restaurant> restaurants = List.of(
+                restaurant(86, "小厨娘淮扬菜（鼓楼广场店）", 120.61, 31.30),
+                restaurant(85, "芳婆糕团店（莫愁路总店）", 120.60, 31.29));
+        Attraction earlyClosing = attraction(97, "瞻园", 1.0, 1, "园林,休闲", 120.615, 31.305);
+        earlyClosing.setOpenTime("08:00-17:30");
+
+        ItineraryPlan plan = new ItineraryPlan();
+        plan.setDays(new ArrayList<>(List.of(userLikeDay())));
+        postProcess(state(null), plan, attractions, restaurants, List.of(earlyClosing));
+
+        assertThat(plan.getDays().get(0).getNodes())
+                .as("闭馆后的自动休息点必须移除")
+                .noneMatch(n -> "rest".equals(n.getType()) && Long.valueOf(97L).equals(n.getPlaceId()));
+    }
+
+    @Test
+    void 决策节点无时间时休息点不得成为早晨首个活动() {
+        List<Attraction> attractions = List.of(
+                attraction(1, "夫子庙秦淮风光带", 2.0, 2, "夜景,游船,街区", 120.68, 31.29),
+                attraction(44, "1912街区", 2.0, 1, "街区,夜景,酒吧", 120.62, 31.30),
+                attraction(5, "熙南里", 2.0, 2, "街区,拍照", 120.63, 31.31));
+        List<Restaurant> restaurants = List.of(
+                restaurant(86, "午餐店", 120.61, 31.30),
+                restaurant(85, "晚餐店", 120.60, 31.29));
+        Attraction restSpot = attraction(98, "城市休闲花园", 1.0, 1,
+                "休闲,公园", 120.615, 31.305);
+
+        ItineraryPlan plan = new ItineraryPlan();
+        plan.setDays(new ArrayList<>(List.of(decisionOnlyDay())));
+        postProcess(state(null), plan, attractions, restaurants, List.of(restSpot));
+
+        List<PlanNode> nodes = plan.getDays().get(0).getNodes();
+        int restIndex = -1;
+        List<Integer> attractionIndexes = new ArrayList<>();
+        for (int i = 0; i < nodes.size(); i++) {
+            if ("rest".equals(nodes.get(i).getType())) restIndex = i;
+            if ("attraction".equals(nodes.get(i).getType())) attractionIndexes.add(i);
+        }
+
+        assertThat(restIndex).as("高疲劳日应保留一个附近休息点").isGreaterThanOrEqualTo(0);
+        assertThat(nodes.get(1).getType()).as("抵达后的首个活动必须是实质游览").isEqualTo("attraction");
+        assertThat(restIndex).as("休息点应位于游览过程之中")
+                .isGreaterThan(attractionIndexes.get(0))
+                .isLessThan(attractionIndexes.get(attractionIndexes.size() - 1));
+        assertThat(nodes.get(restIndex).getTime()).as("休息点应由统一时间轴计算真实到达时间")
+                .isNotNull().isGreaterThanOrEqualTo("14:00");
     }
 }

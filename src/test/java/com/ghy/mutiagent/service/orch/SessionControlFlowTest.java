@@ -6,6 +6,8 @@ import com.ghy.mutiagent.agent.RequirementAgent;
 import com.ghy.mutiagent.common.BizException;
 import com.ghy.mutiagent.common.ResultCode;
 import com.ghy.mutiagent.model.ChatStepResult;
+import com.ghy.mutiagent.model.AttractionCandidate;
+import com.ghy.mutiagent.model.CandidateSnapshot;
 import com.ghy.mutiagent.model.FoodCandidate;
 import com.ghy.mutiagent.model.HotelCandidate;
 import com.ghy.mutiagent.model.ItineraryPlan;
@@ -30,6 +32,8 @@ import org.springframework.core.task.TaskExecutor;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -84,13 +88,24 @@ class SessionControlFlowTest {
     }
 
     @Test
-    void 返回景点阶段只保留偏好并清除该阶段及下游结果() {
+    void 返回景点阶段保留已就绪美食池和景点推荐并清除下游行程() {
         TravelState s = state(TravelStage.DONE);
         s.setSelectedAttractionIds(new ArrayList<>(List.of(1L)));
         s.setSelectedFoodIds(new ArrayList<>(List.of(2L)));
         s.setSelectedHotelIds(new ArrayList<>(List.of(3L)));
         s.setFoodPool(List.of(new FoodCandidate()));
         s.setHotelPool(List.of(new HotelCandidate()));
+        AttractionCandidate attraction = new AttractionCandidate();
+        attraction.setAttractionId(1L);
+        attraction.setName("玄武湖");
+        s.setAttractionCandidates(List.of(attraction));
+        CandidateSnapshot snapshot = new CandidateSnapshot();
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("acceptedByOrigin", Map.of("AI", List.of("ATTRACTION:1")));
+        snapshot.setEvidence(evidence);
+        s.candidateSnapshots().put("ATTRACTION", snapshot);
+        s.setCandidateAdvice("优先选择湖景与低强度景点");
+        s.rememberCandidateAdvice("ATTRACTION");
         s.setPlan(new ItineraryPlan());
         s.setItineraryId(99L);
         s.setItineraryText("旧行程");
@@ -102,8 +117,13 @@ class SessionControlFlowTest {
         assertThat(s.getSelectedAttractionIds()).isEmpty();
         assertThat(s.getSelectedFoodIds()).isEmpty();
         assertThat(s.getSelectedHotelIds()).isEmpty();
-        assertThat(s.getFoodPool()).isNull();
+        assertThat(s.getFoodPool()).isNotNull();
         assertThat(s.getHotelPool()).isNull();
+        assertThat(result.getCandidateAdvice()).isEqualTo("优先选择湖景与低强度景点");
+        assertThat(result.getCandidateAdviceRefs()).singleElement().satisfies(ref -> {
+            assertThat(ref.getId()).isEqualTo(1L);
+            assertThat(ref.getName()).isEqualTo("玄武湖");
+        });
         assertThat(result.getPlan()).isNull();
         assertThat(result.getItineraryId()).isNull();
         assertThat(s.getPreference().getDestinationId()).isEqualTo(1L);
